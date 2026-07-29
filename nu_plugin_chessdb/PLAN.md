@@ -170,9 +170,57 @@ Architecture notes (still current)
 - The coach pipeline says "this was unusual *for you*" via per-player z-score baselines
   (`chess-derive` → `chessdb derive-coach-signals`, see `chessdb/derive.nu`).
 
-Terms-bag → typed SensorReport migration (scoped 2026-07-28)
+Terms-bag → typed SensorReport migration (scoped and completed 2026-07-28)
 
-Finding: `build_sensor_report` (`src/eval/position.rs:2723-2842`) assembles two parallel
+Status: DONE. `extract_concepts` now takes `&SensorReport` and reads typed fields for every
+concept except the handful of legitimately-scalar `GroupValue` magnitudes noted below (those
+were never part of the tag-bag problem). `EvalGroups.terms` is now purely an internal
+scratch representation inside `position.rs` — nothing outside that file (or outside
+`build_sensor_report`'s own boundary conversion) reads a `.terms.get("...")` key anymore.
+
+What changed:
+- `concept_types.rs`: added `PawnMajority`, `RookOnSeventh`, `CenterControl`.
+- `sensor.rs`: `PositionalReport` gained `pawn_majority`, `rook_on_seventh`, `center_control`;
+  `SensorReport` gained a top-level `in_check: bool`.
+- `position.rs`: added `extract_pawn_majority`/`extract_rook_on_seventh` (read the now-verified-correct
+  `groups.pawn_structure.terms.get("majority_us"/"majority_them")` and
+  `groups.piece_activity.terms.get("rook_on_seventh")`/nested `opp_terms.rook_on_seventh` —
+  this is the one place `.terms` is still read, as the designed conversion boundary) and
+  `extract_center_control` (self-contained, reuses the existing `center_control_score` fn
+  directly against the board, no `.terms` involved). `build_sensor_report` now computes
+  `in_check` once via `chess.is_check()` and shares one partial `SensorReport` between
+  `encode_state` and `extract_concepts` instead of building two.
+- `concepts.rs::extract_concepts` rewritten to filter typed `Vec`s by `PieceRef.color` /
+  struct `color` fields instead of doing paired `_us`/`_them` string lookups. Also added a
+  `hanging_piece` concept block — the tier/confidence system (`tier_for_concept`,
+  `rank_issues_for_position`'s confidence match) already had `"hanging_piece"` wired in, but
+  no block ever emitted one; `sensor.tactical.hanging` was sitting right there unused.
+- `hugm_eval_cmd.rs`: both call sites updated to pass `&record.sensor_report` alongside
+  `&record.groups`.
+
+Bugs found and fixed along the way (verified with `analyze_fen_with_engine_score` directly,
+not just `cargo test` — see `tests/motif_canonical.rs::discovered_negative_starting_position`):
+- Several `extract_concepts` blocks were querying **keys that never existed** in `groups.*.terms`
+  (`rook_open_file_us`, `rook_seventh_us`, `passed_us`, `passed_them` — the real keys were
+  `open_files_controlled`/`rook_on_seventh`/`passed_count`, mostly unsuffixed, `_us`-only).
+  Those concepts silently never fired in `gated_issues`, ever — no compiler error, because a
+  string map doesn't have one. This is the exact failure mode the CLAUDE.md "typed structs, not
+  string-keyed bags" convention describes, now with a concrete before/after: `rook_open_file`
+  and `rook_seventh` fire correctly now via the typed `open_files`/`rook_on_seventh` fields.
+- `detect_discovered` (`position.rs`) flagged a "discovered attack" whenever removing *any* own
+  piece opened *any* slider's line to *any* enemy piece, with no defended/material-significance
+  check — so it fired 3-per-side on the plain starting position (e.g. Ra1 "discovering" an
+  attack on a7 if the a2 pawn moved). This was pre-existing and already reachable through the
+  correctly-keyed `discovered_us`/`discovered_them` terms, but nothing had ever run the full
+  pipeline output through `gated_issues` and looked at it before. Fixed: a reveal only counts
+  if the target is undefended or worth more than the attacking slider. Regression test added.
+
+Not touched: `rank_issues_for_player` (delta-based gating) is unused anywhere in the codebase —
+left as-is, out of scope. The starting-position `king_exposed` concept still fires at severity
+217 (threshold is 40) — that's a `king_safety_score` calibration question, unrelated to this
+migration; noted here in case it's confusing when next seen.
+
+Original finding (for context): `build_sensor_report` (`src/eval/position.rs:2723-2842`) assembles two parallel
 representations of the same evaluation in the same call — a typed one (`TacticalReport`,
 `PositionalReport`, `MaterialConceptReport` in `src/eval/sensor.rs` / `concept_types.rs`,
 built by dedicated `extract_*`/`*_to_typed` functions) and an untyped one (`EvalGroups`,
@@ -206,15 +254,12 @@ Per-concept audit (12 blocks in `extract_concepts`):
   as part of the migration (typed `IsolatedPawn`/`DoubledPawn.color` sidesteps the bug entirely
   since it's a real color, not a relative `_us`/`_them` key).
 
-Scope if undertaken: touches `concept_types.rs` (2-3 new structs: pawn majority, rook-on-7th,
-center control — or extend existing structs), `sensor.rs` (new `PositionalReport` fields),
-`position.rs::build_sensor_report` (populate them — the raw values already exist as locals
-inside `compute_groups`, this is routing, not new computation), and a rewrite of `extract_concepts`
-to take `&SensorReport` (plus `&EvalGroups` only for the handful of scalar magnitudes like
-`material_total.value`/`king_safety.blended` that aren't tag-keyed and don't need to move).
-Regression safety: snapshot `gated_issues` output for the 7 `motif_canonical.rs` FENs before
-and after, diff for unintended changes beyond the isolated/doubled-pawn label fix.
-Not started — this is a scoping note, not yet scheduled.
+All of the above is now done — see "Status: DONE" at the top of this section for what actually
+landed (it diverged a bit from this original scope: `king_exposed`/`development` turned out to
+already be scalar `GroupValue.blended` reads, not tag lookups, so they needed no migration;
+`king_in_check` became a new typed `SensorReport.in_check` field rather than reusing
+`PositionRecord.legal.is_check`, since `extract_concepts` only had a `SensorReport` in scope at
+its call site inside `build_sensor_report`).
 
 Known Bugs (last reviewed 2026-07-28)
 
@@ -229,5 +274,11 @@ RESOLVED:
   `STOCKFISH_BIN` no longer exists because there's no live path to be inconsistent with.
 - BUG-7: FIXED — critter_eval_cmd.rs deleted; use `chessdb hugm-eval` instead
 - BUG-8: ALREADY FIXED — help text uses "chessdb.nu"
+- BUG-9: FIXED (2026-07-28) — `extract_concepts` queried nonexistent `groups.*.terms` keys for
+  `rook_open_file`/`rook_seventh`/`passed_pawn` (real keys were unsuffixed/differently named);
+  those concepts never fired in `gated_issues`. Fixed by the terms→typed migration above.
+- BUG-10: FIXED (2026-07-28) — `detect_discovered` had no defended/material-significance check,
+  so it flagged 3 false-positive "discovered attacks" per side on the plain starting position.
+  Fixed in `position.rs::detect_discovered`; regression test in `motif_canonical.rs`.
 
 OPEN: none currently tracked.

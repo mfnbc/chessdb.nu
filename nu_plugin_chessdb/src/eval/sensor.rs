@@ -21,6 +21,9 @@ pub struct SensorReport {
     /// Side to move has at least one legal move that delivers checkmate
     #[serde(default)]
     pub mate_in_1_exists: bool,
+    /// Side to move is in check
+    #[serde(default)]
+    pub in_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -47,6 +50,9 @@ pub struct PositionalReport {
     pub pawn_islands: Vec<PawnIsland>,
     pub pawn_breaks: Vec<PawnBreak>,
     pub minority_attack: Option<MinorityAttack>,
+    pub pawn_majority: Vec<PawnMajority>,
+    pub rook_on_seventh: Vec<RookOnSeventh>,
+    pub center_control: Option<CenterControl>,
     pub king_exposure: Option<KingExposure>,
     pub development: Option<DevelopmentInfo>,
 }

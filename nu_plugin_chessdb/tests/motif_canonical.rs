@@ -110,6 +110,23 @@ fn discovered_negative_no_target() {
 }
 
 #[test]
+fn discovered_negative_starting_position() {
+    // Regression: detect_discovered previously flagged 3 "discovered attacks" per side on the
+    // plain starting position (e.g. Ra1 "attacking" a7 if the a2 pawn moves). That's just
+    // ordinary blocked-slider geometry mirrored on both sides, not a tactical discovered
+    // attack — the revealed target (a7/d7/h7 pawn) is adequately defended and worth no more
+    // than the attacking rook/queen. Found via the terms-bag -> typed SensorReport migration
+    // (see PLAN.md), which was the first time this concept actually reached gated_issues output.
+    let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    let disc_us = rec.groups.tactical.terms.get("discovered_us").and_then(|v| v.as_i64()).unwrap_or(0);
+    let disc_them = rec.groups.tactical.terms.get("discovered_them").and_then(|v| v.as_i64()).unwrap_or(0);
+    assert_eq!(disc_us, 0, "expected no discovered attack detected for white in the starting position");
+    assert_eq!(disc_them, 0, "expected no discovered attack detected for black in the starting position");
+    assert!(rec.sensor_report.tactical.discovered.is_empty(), "typed SensorReport should agree with groups.terms");
+}
+
+#[test]
 fn outpost_negative_attacked_by_pawn() {
     // Knight on d5 but attacked by an enemy pawn on c4 -> not an outpost
     let fen = "k7/8/8/3N4/2p5/8/8/4K3 w - - 0 1";

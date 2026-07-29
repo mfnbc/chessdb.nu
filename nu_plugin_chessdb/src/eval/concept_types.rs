@@ -150,6 +150,24 @@ pub struct MinorityAttack {
     pub strength: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PawnMajority {
+    pub color: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RookOnSeventh {
+    pub color: String,
+    pub count: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CenterControl {
+    pub color: String,
+    pub strength: i64,
+}
+
 /// A ranked concept extracted from a SensorReport.
 /// This is what the Concept Filter layer produces for the LLM Coach.
 #[derive(Debug, Clone, Serialize)]

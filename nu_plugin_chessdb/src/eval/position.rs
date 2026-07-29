@@ -1530,6 +1530,15 @@ fn detect_skewers(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, S
     (skewers, examples)
 }
 
+/// Rough piece values for the discovered-attack "is this actually significant" filter below.
+/// Not the tuned eval-material table — just enough to tell a winning reveal from a trivial one.
+fn discovered_attack_piece_value(role: Role) -> i64 {
+    match role {
+        Role::Pawn => 100, Role::Knight => 320, Role::Bishop => 330,
+        Role::Rook => 500, Role::Queen => 900, Role::King => 20000,
+    }
+}
+
 fn detect_discovered(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, Square, Square)>) {
     // returns (count, vec![(blocker_sq, slider_sq, target_sq), ...])
     let occ = board.occupied();
@@ -1556,12 +1565,25 @@ fn detect_discovered(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square
                 after |= attacks::bishop_attacks(s, occ_minus);
             }
             let newly = (after & enemy_bb) & !before;
-            if newly.any() {
+            if !newly.any() {
+                continue;
+            }
+            // Reject trivial reveals: a slider seeing an adequately-defended enemy piece of
+            // equal-or-lesser value through a now-open file/diagonal (e.g. a rook behind its
+            // own pawn "attacking" the enemy's mirrored pawn) isn't a tactical discovered
+            // attack — it's just normal blocked-slider geometry that exists in nearly every
+            // position. Only count it when the target is undefended or worth more than the
+            // attacker, i.e. actually winning something.
+            let attacker_role = if is_queen { Role::Queen } else if is_rook { Role::Rook } else { Role::Bishop };
+            let attacker_value = discovered_attack_piece_value(attacker_role);
+            let significant = newly.into_iter().find(|&t| {
+                let defended = board.attacks_to(t, color.other(), occ_minus).any();
+                let target_value = board.piece_at(t).map(|p| discovered_attack_piece_value(p.role)).unwrap_or(0);
+                !defended || target_value > attacker_value
+            });
+            if let Some(t) = significant {
                 discovered += 1;
-                // pick one target square as example
-                if let Some(t) = newly.into_iter().next() {
-                    examples.push((blocker, s, t));
-                }
+                examples.push((blocker, s, t));
                 break;
             }
         }
@@ -1805,6 +1827,50 @@ fn extract_minority_attack(groups: &EvalGroups, us: Color) -> Option<MinorityAtt
         .and_then(|v| v.as_i64()).unwrap_or(0);
     let color = if us.is_white() { "white" } else { "black" };
     Some(MinorityAttack { color: color.into(), strength })
+}
+
+fn extract_pawn_majority(groups: &EvalGroups, us: Color, them: Color) -> Vec<PawnMajority> {
+    let mut results = Vec::new();
+    let majority_us = groups.pawn_structure.terms.get("majority_us").and_then(|v| v.as_i64()).unwrap_or(0);
+    let majority_them = groups.pawn_structure.terms.get("majority_them").and_then(|v| v.as_i64()).unwrap_or(0);
+    if majority_us > 0 {
+        results.push(PawnMajority { color: (if us.is_white() { "white" } else { "black" }).into(), count: majority_us });
+    }
+    if majority_them > 0 {
+        results.push(PawnMajority { color: (if them.is_white() { "white" } else { "black" }).into(), count: majority_them });
+    }
+    results
+}
+
+/// Rooks on the 7th (relative) rank, both sides. `piece_activity.terms` carries only the
+/// "us" side's raw counters directly; the opponent's live under the nested `opp_terms` object.
+fn extract_rook_on_seventh(groups: &EvalGroups, us: Color, them: Color) -> Vec<RookOnSeventh> {
+    let mut results = Vec::new();
+    let us_count = groups.piece_activity.terms.get("rook_on_seventh").and_then(|v| v.as_i64()).unwrap_or(0);
+    let them_count = groups.piece_activity.terms.get("opp_terms")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("rook_on_seventh"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if us_count > 0 {
+        results.push(RookOnSeventh { color: (if us.is_white() { "white" } else { "black" }).into(), count: us_count as u8 });
+    }
+    if them_count > 0 {
+        results.push(RookOnSeventh { color: (if them.is_white() { "white" } else { "black" }).into(), count: them_count as u8 });
+    }
+    results
+}
+
+fn extract_center_control(board: &shakmaty::Board) -> Option<CenterControl> {
+    let cc_white = center_control_score(board, Color::White);
+    let cc_black = center_control_score(board, Color::Black);
+    let diff = cc_white - cc_black;
+    if diff.abs() <= 15 { return None; }
+    if diff > 0 {
+        Some(CenterControl { color: "white".into(), strength: diff })
+    } else {
+        Some(CenterControl { color: "black".into(), strength: -diff })
+    }
 }
 
 fn extract_development_info(board: &shakmaty::Board) -> Vec<DevelopmentInfo> {
@@ -2761,6 +2827,9 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         pawn_islands: extract_pawn_islands(board),
         pawn_breaks: extract_pawn_breaks(groups),
         minority_attack: extract_minority_attack(groups, us),
+        pawn_majority: extract_pawn_majority(groups, us, them),
+        rook_on_seventh: extract_rook_on_seventh(groups, us, them),
+        center_control: extract_center_control(board),
         king_exposure: {
             let exposures = extract_king_exposure(board);
             if exposures.len() >= 2 {
@@ -2782,21 +2851,24 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         MaterialConceptReport { balance }
     };
 
-    // Build state_id from components before assembling SensorReport
-    let state_id = {
-        // Temporary SensorReport for state encoding only
-        let tmp = SensorReport {
-            fen: fen.to_string(), state_id: 0,
-            material: material.clone(), tactical: tactical.clone(), positional: positional.clone(),
-            aggregated: AggregatedScores::default(),
-            evaluated_forks: evaluated_forks.clone(),
-            ..Default::default()
-        };
-        crate::eval::concepts::encode_state(&tmp, groups, phase).state_id
+    let in_check = chess.is_check();
+
+    // Partial SensorReport — everything typed downstream consumers (encode_state,
+    // extract_concepts) need is already built above. Reused for both rather than
+    // re-deriving each from EvalGroups.terms independently.
+    let partial = SensorReport {
+        fen: fen.to_string(), state_id: 0,
+        material: material.clone(), tactical: tactical.clone(), positional: positional.clone(),
+        aggregated: AggregatedScores::default(),
+        evaluated_forks: evaluated_forks.clone(),
+        in_check,
+        ..Default::default()
     };
+    let state_id = crate::eval::concepts::encode_state(&partial, groups, phase).state_id;
 
     let gated_issues = if let Some(elo) = player_elo {
-        let concepts = crate::eval::concepts::extract_concepts(groups, if us.is_white() { "white" } else { "black" });
+        let side = if us.is_white() { "white" } else { "black" };
+        let concepts = crate::eval::concepts::extract_concepts(&partial, groups, side);
         crate::eval::concepts::rank_issues_for_position(&concepts, elo)
     } else { Vec::new() };
 
@@ -2813,6 +2885,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
             total_cp: groups.material_total.value + groups.positional_total.value + groups.tactical_total.value,
             chaos: chaos_coefficient(groups),
         },
+        in_check,
         evaluated_forks,
         gated_issues,
         mate_in_1_exists: false,

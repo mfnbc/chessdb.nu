@@ -89,7 +89,7 @@ impl PluginCommand for HugmEval {
                 }
 
                 if let Some(elo) = player_elo {
-                    let concepts = crate::eval::concepts::extract_concepts(&record.groups, &record.side_to_move);
+                    let concepts = crate::eval::concepts::extract_concepts(&record.sensor_report, &record.groups, &record.side_to_move);
                     let issues = crate::eval::concepts::rank_issues_for_position(&concepts, elo);
                     if let serde_json::Value::Object(ref mut map) = json_val {
                         map.insert("gated_issues".to_string(), serde_json::to_value(&issues).unwrap_or_default());
@@ -129,7 +129,7 @@ impl PluginCommand for HugmEval {
                                     }
                                 }
                                 if let Some(elo) = player_elo {
-                                    let concepts = crate::eval::concepts::extract_concepts(&record.groups, &record.side_to_move);
+                                    let concepts = crate::eval::concepts::extract_concepts(&record.sensor_report, &record.groups, &record.side_to_move);
                                     let issues = crate::eval::concepts::rank_issues_for_position(&concepts, elo);
                                     if let serde_json::Value::Object(ref mut map) = json_val {
                                         map.insert("gated_issues".to_string(), serde_json::to_value(&issues).unwrap_or_default());
