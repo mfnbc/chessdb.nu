@@ -170,6 +170,52 @@ Architecture notes (still current)
 - The coach pipeline says "this was unusual *for you*" via per-player z-score baselines
   (`chess-derive` → `chessdb derive-coach-signals`, see `chessdb/derive.nu`).
 
+Terms-bag → typed SensorReport migration (scoped 2026-07-28)
+
+Finding: `build_sensor_report` (`src/eval/position.rs:2723-2842`) assembles two parallel
+representations of the same evaluation in the same call — a typed one (`TacticalReport`,
+`PositionalReport`, `MaterialConceptReport` in `src/eval/sensor.rs` / `concept_types.rs`,
+built by dedicated `extract_*`/`*_to_typed` functions) and an untyped one (`EvalGroups`,
+`src/eval/position.rs:225-266`, whose 9 named groups each hold a `terms: serde_json::Map<String, Value>`
+grab-bag). `extract_concepts` (`concepts.rs:14-138`) — the function that produces `gated_issues`,
+i.e. everything the ELO-gated coach pipeline shows a player — reads from the **untyped**
+`groups.*.terms.get("some_key")` side, not the typed structs sitting right next to it.
+Both get serialized onto every `PositionRecord`, so they're duplicate sources of truth that
+only agree because they're computed from the same board in the same call.
+
+Per-concept audit (12 blocks in `extract_concepts`):
+- **Direct typed equivalent already exists — straightforward to migrate:**
+  bishop_pair (`sensor.material.balance.bishop_pair_white/black` — already `bool`, no
+  re-derivation needed), forks/pins/skewers/discovered (`sensor.tactical.{forks,pins,skewers,discovered}`,
+  filter by `PieceRef.color` instead of separate `_us`/`_them` keys), isolated/doubled pawns
+  (`sensor.positional.{isolated_pawns,doubled_pawns}`, each carries a real `color` field),
+  outposts (`sensor.positional.outposts`, filter by piece color), passed pawns
+  (`sensor.positional.passed_pawns`, filter by color), king_in_check (`record.legal.is_check`
+  on `PositionRecord.legal`, not even part of `SensorReport` — already typed and unused here).
+- **No typed field exists yet — needs a new struct/field before its `terms.get()` can retire:**
+  pawn_majority (no `PawnMajority` concept type), rook_seventh (`OpenFile` only models open
+  files, not 7th-rank occupation), king_exposed-by-magnitude (`KingExposure` is attacker/shelter-count
+  based; the current concept uses `groups.king_safety.blended`, a different centipawn-magnitude
+  metric — semantics need reconciling, not just a field rename), development-by-magnitude
+  (`DevelopmentInfo.space_advantage` vs `groups.development.blended` — same kind of metric
+  mismatch as king_exposed), center_control (no typed field anywhere).
+- **Latent bug found during this audit**: the isolated/doubled-pawn loop (`concepts.rs:55-62`)
+  hardcodes labels `"white"`/`"black"` to the `_us`/`_them` keys rather than using `us_color`/`them_color`
+  like every other block in the function does. This is only correct when `side_to_move == white`;
+  for black-to-move positions it likely mislabels which side the concept applies to. Worth fixing
+  as part of the migration (typed `IsolatedPawn`/`DoubledPawn.color` sidesteps the bug entirely
+  since it's a real color, not a relative `_us`/`_them` key).
+
+Scope if undertaken: touches `concept_types.rs` (2-3 new structs: pawn majority, rook-on-7th,
+center control — or extend existing structs), `sensor.rs` (new `PositionalReport` fields),
+`position.rs::build_sensor_report` (populate them — the raw values already exist as locals
+inside `compute_groups`, this is routing, not new computation), and a rewrite of `extract_concepts`
+to take `&SensorReport` (plus `&EvalGroups` only for the handful of scalar magnitudes like
+`material_total.value`/`king_safety.blended` that aren't tag-keyed and don't need to move).
+Regression safety: snapshot `gated_issues` output for the 7 `motif_canonical.rs` FENs before
+and after, diff for unintended changes beyond the isolated/doubled-pawn label fix.
+Not started — this is a scoping note, not yet scheduled.
+
 Known Bugs (last reviewed 2026-07-28)
 
 RESOLVED:

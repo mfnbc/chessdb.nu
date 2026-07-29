@@ -91,6 +91,31 @@ let sign = match $row.color { "black" => -1, _ => 1 }
 Use `match` when branching on a string/int/enum. Reserve `if/else` for boolean
 conditions or range checks.
 
+## Model data as typed structs, not string-keyed bags
+
+When a piece of evaluation/domain data needs a name, give it a real field on a struct
+named for the service or function that produced it — not a string key read out of a
+generic `Map<String, Value>` / `HashMap<String, Value>`. A `.get("some_tag")` call on a
+loosely-typed map is a signal the value should be a named field instead: the compiler
+can no longer tell you the key is missing, misspelled, or has drifted from what actually
+produces it, and nothing stops a second representation of the same data growing up next
+to the first.
+
+Concretely: `nu_plugin_chessdb/src/eval/position.rs`'s `EvalGroups` holds 9 named groups,
+but each group's real data lives in a `terms: serde_json::Map<String, Value>` grab-bag —
+while `nu_plugin_chessdb/src/eval/sensor.rs`'s `SensorReport` models the same evaluation as
+typed structs (`TacticalReport { forks: Vec<Fork>, pins: Vec<Pin>, ... }`) organized by what
+computed them. Both get built from the same board in the same call
+(`build_sensor_report`, `position.rs:2723`), but `concepts::extract_concepts` — which drives
+the entire ELO-gated coaching output — reads from the untyped `terms` side even though the
+typed data is sitting right next to it unused. That's not a naming nitpick; it's two sources
+of truth that only agree by coincidence of both being computed in the same function. See
+`nu_plugin_chessdb/PLAN.md`'s "Terms-bag → typed SensorReport migration" section for the
+scoped fix.
+
+The same principle applies on the Nu side: prefer a record with named fields over a
+generic key-value table when the shape is known ahead of time.
+
 ## SQL string construction in db-merge
 
 `db-merge` (in `chessdb/db.nu`) builds INSERT statements by concatenating
