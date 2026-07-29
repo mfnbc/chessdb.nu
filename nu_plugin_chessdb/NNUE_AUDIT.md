@@ -1,15 +1,16 @@
-NNUE Audit & Plan — nuchessdb
+NNUE Audit & Plan — chessdb.nu
 
-## 2026-05-13 Update: Re-scoped
+## 2026-05-13 Decision (still current as of 2026-07-28): Re-scoped
 
-**Decision**: Full NNUE training is deferred. The project will import an existing NNUE (Stockfish 18's built-in net, or potentially black-marlin) rather than training one. Bullet-based training pipeline (dataset builder, NPZ shards) is paused.
+Full NNUE training is deferred. The project imports Stockfish's built-in NNUE
+via UCI rather than training a custom net. The bullet-based training pipeline
+(dataset builder, NPZ shards) is paused, though the position encoder that would
+feed it is still present and buildable (see below).
 
-**New approach**: Stockfish UCI eval via the `chessdb nnue-eval` plugin command (src/nnue_eval_cmd.rs). This spawns Stockfish, sends FENs, parses NNUE evaluation scores, and returns centipawns. Uses `$STOCKFISH_BIN` env var (default: `/usr/sbin/stockfish`).
-
-**Next focus**: HUGM calibration — linear regression of HUGM component scores against NNUE centipawn scores to tune HUGM weights. The `hugm_harness` binary (src/bin/hugm_harness.rs) already has the regression scaffolding and can be extended.
-
-**Questions answered** (from original plan):
-- Q1-Q3 (label scaling, dataset format, clipping): N/A — training deferred.
+**Current focus**: HUGM calibration — regressing HUGM component scores against
+Stockfish centipawn scores to tune HUGM weights. `hugm_harness` (`src/bin/hugm_harness.rs`,
+348 lines) reads `{fen, engine_score}` JSONL and has the regression scaffolding; it
+is not yet wired into an automated tuning loop (see PLAN.md Phase B/D).
 
 ## Current inference command: `chessdb nnue-eval`
 
@@ -21,31 +22,38 @@ Returns: `{fen, nnue_score}` record with centipawn evaluation.
 
 Supports lists of FENs for batch processing.
 
+Implementation: `src/nnue_eval_cmd.rs` spawns Stockfish as a subprocess (UCI),
+resolving the binary from `$STOCKFISH_BIN` (default: `/usr/sbin/stockfish`).
+
 ### Remaining open items
-- BUG-6: Stockfish path inconsistency (sf_batch_eval hardcodes `/usr/sbin/stockfish`; nnue-eval reads STOCKFISH_BIN). The standalone binary is dead code.
-- Long-term: if direct .nnue file loading is needed (faster than UCI), implement a Rust NNUE parser. Not required now.
+- Long-term: if direct `.nnue` file loading is needed (faster than UCI), implement a Rust NNUE parser. Not required now.
+
+### Resolved since last audit
+- The old BUG-6 (Stockfish path inconsistency between `nnue-eval` and `sf_batch_eval`)
+  is gone: `src/bin/sf_batch_eval.rs` is now a 3-line stub
+  (`eprintln!("sf_batch_eval removed: use the external labeling pipeline described in NNUE_AUDIT.md")`)
+  with no hardcoded path left to be inconsistent. Labeling-corpus generation now goes
+  through `src/bin/lichess_to_jsonl.rs` / `src/bin/pgn_to_jsonl.rs` → `hugm_harness`.
 
 ---
 
-## Original Audit (archived below)
+## Original Audit (archived; background/history)
 
 Purpose
-- Quick research & scoping (Phase 0) for adding NNUE training/inference support to nuchessdb.
+- Quick research & scoping (Phase 0) for adding NNUE training/inference support.
 - Map what already exists in the repository that we can reuse, identify gaps, and propose next concrete tasks.
 
 Background (short)
 - NNUE (Efficiently Updatable Neural Network) is a lightweight, high-performance neural evaluator widely used in chess engines.
 - Key idea: a sparse, piece-list-friendly input encoding and a small dense network (feature transformer + hidden layers) that can be cheaply updated as pieces move.
 
-Current reusable pieces (surviving after cleanup):
-- Position encoder (src/position_encoder.rs): 1024-element f32 vector, 768 piece-square one-hot. Ready for training or inference.
-- HUGM eval (src/eval/position.rs): ~2800 lines of handcrafted heuristics with tunable weights.
-- NNUE eval (src/nnue_eval_cmd.rs): UCI-based Stockfish wrapper (new in 2026-05-13).
-
-Removed (2026-05-13 cleanup):
-- Old nnue_eval_cmd.rs (chess-vector-engine JSON loader)
-- Standalone nnue_dataset_builder binary (duplicated plugin dataset_builder_cmd)
-- --with-stockfish flag from process_corpus
+Current reusable pieces
+- Position encoder (`src/position_encoder.rs`): 1024-element f32 vector (793 meaningful
+  features: 768 piece-square one-hot + game-state + material balance + king position +
+  tactical summary, zero-padded). Still present, still compiles, unused by any active
+  training pipeline — ready if training is picked back up.
+- HUGM eval (`src/eval/position.rs`): ~3400 lines of handcrafted heuristics with tunable weights (grew from ~2800 lines at last audit; see PLAN.md for feature status).
+- NNUE eval (`src/nnue_eval_cmd.rs`): UCI-based Stockfish wrapper.
 
 Policy: Stockfish evaluation handling (unchanged)
 - Do NOT persist Stockfish numeric evaluations as canonical fields in the positions table.
