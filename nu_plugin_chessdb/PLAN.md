@@ -1748,3 +1748,55 @@ Verified: `cargo check --all-targets` clean; `cargo test` green (39 tests, up fr
 --all-targets` reports **zero warnings** crate-wide (down from the ~15 documented as
 pre-existing/left-alone throughout this file); STS smoke test (1499-position corpus)
 passes.
+
+Re-audit 2026-07-30 (4): chessdb/*.nu revisit + Cargo.toml
+
+Continued auditing at the user's request ("okay keep auditing"). Read `chessdb/db.nu`
+and `chessdb/mod.nu` fully for the first time this session (previously only partially
+reviewed) — both already clean (migrations are idempotent via `IF NOT EXISTS`/try-catch
+`ALTER TABLE`, `move_anomalies`'s unique index makes re-derive safe, `mod.nu`'s exports
+match README's command list exactly). Two real findings elsewhere:
+
+**Fixed — `chessdb/derive.nu`'s `chess-validate` ran an N-query loop instead of one
+batched query.** It read the unconsumed anomalies for `(username, game_id)`, then looped
+`for id in (anomalies | get alert_id) { UPDATE ... WHERE alert_id = ? }` — one SQL
+round-trip per anomaly. Since nothing else can write to `move_anomalies` between the
+SELECT and the loop (single-threaded Nu script, no concurrent writer), a single `UPDATE
+move_anomalies SET consumed = 1 WHERE username = ? AND game_id = ? AND consumed = 0`
+(same predicate as the SELECT) marks exactly the same rows in one query. Verified against
+a real seeded SQLite table (not just `nu-check`): confirmed the first call returns
+`status: shut` with the correct 2 rows for `(alice, game 1)`, only those exact rows flip
+to `consumed = 1` (a sibling `(alice, game 2)` row and a `(bob, game 1)` row are
+untouched), and a second call on the same args correctly returns `status: open` with an
+empty list.
+
+**Fixed — small, low-value dedup:** `chessdb/sync.nu`'s `review-game` wrote the same
+11-element `[0 0 0 0 0 0 0 0 0 0 0]` fallback array twice (the first-row case and the
+JSON-parse-failure catch) — pulled into one `let zero_arr = [...]`. (Noted in passing:
+`review-game`'s `$d | get 0` through `get 7` is a fourth consumer of `hugm_eval_arr`'s
+positional-index contract, alongside `process_corpus.rs`/`coach_derive_cmd.rs`/
+`profile.nu` already documented above — reinforces that deferred finding, not a new one.)
+
+**Fixed — dead Cargo.toml config:** the explicit `[[bin]] name = "nu_plugin_chessdb" path
+= "src/main.rs"` block declared exactly what Cargo's default binary-target discovery
+already produces for a package named `nu_plugin_chessdb` with a `src/main.rs` (confirmed
+via `cargo metadata`: identical target — same name, same path — with the block removed,
+and `cargo build --bin nu_plugin_chessdb` still produces the same binary at the same
+path). Removed as dead configuration.
+
+**Reviewed, no findings:** `main.rs`/`lib.rs` (all 8 registered commands match
+`README.md`'s table exactly, `PLUGIN_CATEGORY` used consistently), `stockfish.rs`
+(well-tested, already carries its own extraction rationale doc comment — noted in passing
+that `nnue-eval`'s score is White-relative per Stockfish's own `eval` output, not
+mover-relative like the rest of this codebase's HUGM convention, but `nnue_score` isn't
+consumed anywhere downstream yet, so there's no live inconsistency to fix, just something
+to keep in mind if it's ever wired into a pipeline that assumes mover-relative scores),
+`sf_batch_eval.rs` (already a 3-line documented stub), the `tests/*.rs` integration test
+files (no cross-file helper duplication — each file's helpers are appropriately scoped
+to that file, and Rust compiles each integration test as its own crate anyway).
+
+Verified: `cargo check --all-targets` clean; `cargo test` unaffected (39 tests, still
+green — none of this round's fixes touched Rust test-covered code); `cargo clippy
+--all-targets` still zero warnings; STS smoke test passes; both edited `.nu` files pass
+`nu-check`; `chess-validate`'s fix additionally verified against a real seeded SQLite
+database (not just static checks), described above.

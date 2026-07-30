@@ -70,10 +70,11 @@ def review-game [game_id: int, db: string] {
     # relative to opposite sides, the per-component swing from the mover's
     # own perspective is -(arr + prev_arr), not arr - prev_arr. See
     # PLAN.md's "hugm_score/hugm_eval_arr sign bug" entry.
+    let zero_arr = [0 0 0 0 0 0 0 0 0 0 0]
     $raw | enumerate | each { |item|
         let row      = $item.item
-        let prev_arr = if $item.index == 0 { [0 0 0 0 0 0 0 0 0 0 0] } else {
-            try { ($raw | get ($item.index - 1)).hugm_eval_arr | from json } catch { [0 0 0 0 0 0 0 0 0 0 0] }
+        let prev_arr = if $item.index == 0 { $zero_arr } else {
+            try { ($raw | get ($item.index - 1)).hugm_eval_arr | from json } catch { $zero_arr }
         }
         let arr  = try { $row.hugm_eval_arr | from json } catch { $prev_arr }
         let d    = ($arr | zip $prev_arr | each { |p| ($p.0 + $p.1) * -1 })

@@ -91,9 +91,13 @@ export def "chess-validate" [
         return {status: "open", game_id: $game_id, anomalies: []}
     }
 
-    for id in ($anomalies | get alert_id) {
-        open $db | query db "UPDATE move_anomalies SET consumed = 1 WHERE alert_id = ?" --params [$id]
-    }
+    # Same predicate as the SELECT above (no concurrent writer to race
+    # against here), so one UPDATE marks exactly the rows just read —
+    # avoids an N-query round-trip loop over individual alert_ids.
+    open $db | query db "
+        UPDATE move_anomalies SET consumed = 1
+        WHERE username = ? AND game_id = ? AND consumed = 0
+    " --params [$username, $game_id]
 
     {status: "shut", game_id: $game_id, anomalies: ($anomalies | reject alert_id)}
 }
