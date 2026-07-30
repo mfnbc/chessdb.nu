@@ -8,6 +8,34 @@ use crate::eval::{
     build_sensor_report, compute_groups, compute_phase, decode_state_id, encode_state, StateVector,
 };
 
+/// The three tiers a per-move eval swing passes through before it becomes a
+/// stored anomaly, smallest gate first:
+///
+/// 1. `NOISE_FLOOR_CP` — too small to tell from engine jitter; not even fed
+///    into a baseline (`compute_baselines`).
+/// 2. `ANOMALY_CANDIDATE_CP` — big enough to check against a baseline at all
+///    (`detect_anomalies`'s `delta >= ...` gate) — well below "blunder," just
+///    "worth comparing."
+/// 3. `ANOMALY_Z_THRESHOLD` standard deviations above that baseline's own
+///    mean, and only once the baseline itself has `count >= min_games`
+///    samples (the `--min-games` CLI flag) — is what actually gets stored as
+///    an anomaly.
+const NOISE_FLOOR_CP: f64 = 1.0;
+const ANOMALY_CANDIDATE_CP: f64 = 30.0;
+const ANOMALY_Z_THRESHOLD: f64 = 2.0;
+/// Floor on a Welford baseline's own standard deviation (see `Welford::std_dev`)
+/// — without it, a remarkably consistent player/concept/phase combination
+/// could have a near-zero std dev and turn any swing into an absurd z-score.
+const STD_DEV_FLOOR_CP: f64 = 1.0;
+
+/// A single transition's own, unrelated threshold: this many centipawns lost
+/// in one ply, regardless of any baseline, counts as a blunder for
+/// `compute_transitions`'s risk-rate tracking.
+const BLUNDER_LOSS_CP: i64 = 200;
+/// Blunder rate above which a (state_from, state_to) transition is flagged
+/// risky — same `min_games` sample-size gate as the anomaly baselines above.
+const RISKY_TRANSITION_RATE: f64 = 0.25;
+
 pub struct DeriveCoachSignals;
 
 impl PluginCommand for DeriveCoachSignals {
@@ -134,7 +162,11 @@ impl Welford {
         self.m2 += delta * delta2;
     }
     fn std_dev(&self) -> f64 {
-        if self.count < 2.0 { 1.0 } else { (self.m2 / (self.count - 1.0)).sqrt().max(1.0) }
+        // Sample variance needs at least 2 points; floor the result so a
+        // near-zero-variance baseline (a player who's remarkably consistent
+        // in this concept/phase) can't blow up z-scores by dividing by
+        // something tiny.
+        if self.count < 2.0 { STD_DEV_FLOOR_CP } else { (self.m2 / (self.count - 1.0)).sqrt().max(STD_DEV_FLOOR_CP) }
     }
 }
 
@@ -151,7 +183,7 @@ fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(St
         } else { (0.0, 0) };
         prev_score.insert(game_key.clone(), row.hugm_score);
 
-        if delta >= 1.0 {
+        if delta >= NOISE_FLOOR_CP {
             // Overall eval swing baseline
             baselines.entry((row.player.clone(), phase_bucket, "hugm_delta".into()))
                 .or_insert_with(Welford::new).update(delta);
@@ -183,7 +215,7 @@ fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(St
                     let curr = arr.get(idx).copied().unwrap_or(0);
                     let prv  = prev.get(idx).copied().unwrap_or(0);
                     let comp_delta = (curr - prv).abs() as f64;
-                    if comp_delta >= 1.0 {
+                    if comp_delta >= NOISE_FLOOR_CP {
                         baselines.entry((row.player.clone(), phase_bucket, name.to_string()))
                             .or_insert_with(Welford::new).update(comp_delta);
                     }
@@ -213,7 +245,7 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
         let state_id = s.state_id as i64;
 
         // Binary state-vector anomalies (eval swing when pattern was present)
-        if delta >= 30.0 {
+        if delta >= ANOMALY_CANDIDATE_CP {
             let check_concepts: [(&str, bool); 10] = [
                 ("hugm_delta",        true),
                 ("fork",              s.has_fork),
@@ -236,7 +268,7 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
                     // its z-scores aren't meaningful yet.
                     if *count < min_games { continue; }
                     let z = (delta - mean) / std;
-                    if z > 2.0 {
+                    if z > ANOMALY_Z_THRESHOLD {
                         // signed_delta compares this player's own hugm_score
                         // across two of their own consecutive moves, so both
                         // terms are relative to the same side: their
@@ -260,12 +292,12 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
                     let prv  = prev.get(idx).copied().unwrap_or(0);
                     let comp_delta = (curr - prv).abs() as f64;
                     let comp_signed = (curr - prv) as f64;
-                    if comp_delta >= 30.0 {
+                    if comp_delta >= ANOMALY_CANDIDATE_CP {
                         let key = (row.player.clone(), phase_bucket, name.to_string());
                         if let Some((mean, std, count)) = baselines.get(&key) {
                             if *count < min_games { continue; }
                             let z = (comp_delta - mean) / std;
-                            if z > 2.0 {
+                            if z > ANOMALY_Z_THRESHOLD {
                                 // Same reasoning as signed_delta above: both
                                 // terms are this player's own consecutive
                                 // rows, so comp_signed > 0 always means the
@@ -310,7 +342,7 @@ fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], min_games: i
                 let delta = row.hugm_score - pscore;
                 let entry = transitions.entry((prev_state, state_id)).or_insert((0, 0));
                 entry.0 += 1;
-                if delta < -200 { entry.1 += 1; } // blunder: lost > 200cp
+                if delta < -BLUNDER_LOSS_CP { entry.1 += 1; }
             }
         }
         prev = Some((row.game_id.clone(), state_id, row.hugm_score));
@@ -329,7 +361,7 @@ fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], min_games: i
             "blunder_risk" => Value::float(risk, span),
         }, span));
 
-        if risk > 0.25 && *total >= min_games {
+        if risk > RISKY_TRANSITION_RATE && *total >= min_games {
             trans_anomalies.push(Value::record(nu_protocol::record! {
                 "state_from" => Value::int(*from, span),
                 "state_to" => Value::int(*to, span),

@@ -1402,3 +1402,45 @@ Verified: full suite green (32 tests), clippy clean, STS smoke test passes, and
 `cargo-modules`'s own graph now matches reality without hand-editing — the actual goal,
 per the user's framing, being that the code expresses its own true structure rather than
 needing documentation (or a diagram's footnote) to explain what it really does.
+
+Fifth pass: expressiveness — does the code read as the one right way to do this? (2026-07-30)
+
+Five areas, one real fix landed, one large finding deferred (needs a decision, see below),
+the rest checked clean:
+
+- **FIXED**: `coach_derive_cmd.rs` had six unexplained magic-number thresholds scattered
+  through `compute_baselines`/`detect_anomalies`/`compute_transitions`/`Welford::std_dev`
+  (`1.0`, `30.0`, `2.0`, `-200`, `0.25`, the `std_dev` floor) — each meaningful, none named,
+  so the actual three-tier design (noise floor -> anomaly-candidate size -> z-score,
+  entirely separate from the blunder/transition-risk thresholds) was invisible without
+  tracing every call site. Named all six (`NOISE_FLOOR_CP`, `ANOMALY_CANDIDATE_CP`,
+  `ANOMALY_Z_THRESHOLD`, `STD_DEV_FLOOR_CP`, `BLUNDER_LOSS_CP`, `RISKY_TRANSITION_RATE`)
+  with a doc comment laying out the tiers, right at the top of the file.
+- **DEFERRED — large, needs a decision**: color is a bare `String` ("white"/"black")
+  everywhere in the eval engine's output types — 13 struct fields in `concept_types.rs`,
+  ~51 literal `"white"`/`"black"` constructions across `position.rs`/`concepts.rs`/
+  `threat_graph.rs`/`canonical.rs`. This is the same class of thing that caused several
+  real bugs this session (hardcoded-color bugs, the `unflip_color` string-swap, BUG-13/15's
+  sign confusion) — an actual `Color` enum (serializing to the same "white"/"black" JSON
+  strings, so zero external/schema impact) would make a mismatched or mistyped color a
+  compile error instead of a silent bug. Not attempted in this pass: meaningfully bigger
+  and riskier than anything else fixed this session (100+ call sites across 5+ files, not
+  a mechanical rename), so it needs an explicit go-ahead rather than being bundled in.
+- **Checked, clean**: `position.rs`'s ~70 functions consistently follow the documented
+  `detect_X`/`extract_X`/`X_score`/`X_to_typed` naming families; `get_term_i64` (the one
+  place still reading a `terms` bag) is the sanctioned conversion boundary itself, not a
+  violation. `chessdb/*.nu` follows its own documented idioms throughout; the one repeated
+  SQL fragment (`CASE WHEN white = ? THEN 'white' ELSE 'black' END`, in 3-4 profile.nu
+  queries) is left inline deliberately — CLAUDE.md already says not to over-engineer literal
+  SQL, and each query stays independently readable/copy-pasteable for manual use, which a
+  Nu-side string-composed helper would work against. Error handling: zero `.unwrap()` calls
+  in any production code path crate-wide (confirmed by scanning every file up to its own
+  `#[cfg(test)]` boundary); the two `.expect()` calls are both `RwLock::read().expect("weights
+  lock")` — the standard, correct way to handle lock poisoning, not a shortcut.
+- **FIXED in passing**: `src/bin/hugm_harness.rs`'s `gen_weights` used three bare
+  `.unwrap()`s because it returned `()` instead of `anyhow::Result<()>`, the convention
+  every other function in that file already follows. Propagated `Result` through it and
+  its caller `run_multivariate_regression` so the one inconsistency in the file's error
+  handling is gone.
+
+Verified: full suite green (32 tests), clippy clean, STS smoke test passes.

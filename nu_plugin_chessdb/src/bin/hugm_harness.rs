@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     wtr.flush()?;
 
     if rows.len() >= 10 {
-        run_multivariate_regression(&rows, weights_out);
+        run_multivariate_regression(&rows, weights_out)?;
     } else {
         println!("Not enough records with engine scores (need >= 10, have {})", rows.len());
     }
@@ -139,7 +139,7 @@ struct RegressionRow {
     engine_score: i64,
 }
 
-fn run_multivariate_regression(rows: &[RegressionRow], weights_out: Option<&str>) {
+fn run_multivariate_regression(rows: &[RegressionRow], weights_out: Option<&str>) -> Result<()> {
     let n = rows.len();
     let k = 10;
     let mut xtx = vec![0.0f64; k * k];
@@ -178,7 +178,8 @@ fn run_multivariate_regression(rows: &[RegressionRow], weights_out: Option<&str>
     three_feature_regression(rows);
 
     phase_grouped_regression(rows);
-    if let Some(path) = weights_out { gen_weights(&best_beta, &names, path); }
+    if let Some(path) = weights_out { gen_weights(&best_beta, &names, path)?; }
+    Ok(())
 }
 
 fn three_feature_regression(rows: &[RegressionRow]) {
@@ -293,11 +294,11 @@ fn univariate_calibration(rows: &[RegressionRow]) -> (f64,f64) {
     if vx.abs()>1e-12 { let a=(sxy/nf-mx*my)/vx; (a,my-a*mx) } else { (0.0,my) }
 }
 
-fn gen_weights(beta: &[f64], _names: &[&str], path: &str) {
+fn gen_weights(beta: &[f64], _names: &[&str], path: &str) -> Result<()> {
     let comps: [(usize,&str);8] = [(2,"material"),(3,"pawn_structure"),(4,"piece_activity"),(5,"king_safety"),(6,"passed_pawns"),(7,"development"),(8,"vector_features"),(9,"strategic")];
     let coeffs: Vec<f64> = comps.iter().map(|(i,_)| beta[*i]).collect();
     let mean = coeffs.iter().sum::<f64>() / coeffs.len() as f64;
-    if mean.abs()<1e-12 { eprintln!("zero mean coeff"); return; }
+    if mean.abs()<1e-12 { eprintln!("zero mean coeff"); return Ok(()); }
     let mut scales: Vec<(String,f64)> = Vec::new();
     for (i,n) in &comps { scales.push((n.to_string(), beta[*i]/mean)); }
     println!("\n=== Scale factors (mean={:.4}) ===", mean);
@@ -334,7 +335,8 @@ fn gen_weights(beta: &[f64], _names: &[&str], path: &str) {
         }
     }
     if beta[1].abs() > 0.001 { w.insert("phase_factor_den".into(), serde_json::json!(((40.0*beta[1].signum()).max(10.0)).round() as i64)); }
-    let mut f = File::create(path).unwrap();
-    f.write_all(serde_json::to_string_pretty(&w).unwrap().as_bytes()).unwrap();
+    let mut f = File::create(path)?;
+    f.write_all(serde_json::to_string_pretty(&w)?.as_bytes())?;
     println!("\nWrote weights to {}", path);
+    Ok(())
 }
