@@ -12,7 +12,7 @@ impl PluginCommand for HugmEval {
     }
 
     fn description(&self) -> &str {
-        "Evaluate a chess position or list of positions (FEN from pipeline) and return full HUGM (Human GM) decomposed record(s). Use --explain to include human-readable explanations." 
+        "Evaluate a chess position or list of positions (FEN from pipeline) and return full HUGM (Human GM) decomposed record(s). Use --explain to include human-readable explanations."
     }
 
     fn signature(&self) -> Signature {
@@ -71,35 +71,10 @@ impl PluginCommand for HugmEval {
 
         match input_value {
             Value::String { val, .. } => {
-                // Single FEN string
                 let record = crate::eval::analyze_fen_with_engine_score(&val, engine_score, player_elo)
                     .map_err(|e| LabeledError::new(e.to_string()).with_label("eval error", span))?;
-
-                let mut json_val = serde_json::to_value(&record).map_err(|e| {
-                    LabeledError::new(e.to_string()).with_label("serialization error", span)
-                })?;
-
-                if include_verbose {
-                    let expl = crate::eval::render_explanations(&record);
-                    if let serde_json::Value::Object(ref mut map) = json_val {
-                        map.insert("explanations".to_string(), serde_json::Value::Array(expl.into_iter().map(serde_json::Value::String).collect()));
-                        let structured = crate::eval::render_structured_explanations(&record);
-                        map.insert("explanations_structured".to_string(), serde_json::Value::Array(structured));
-                    }
-                }
-
-                if let Some(elo) = player_elo {
-                    let concepts = crate::eval::concepts::extract_concepts(&record.sensor_report, &record.groups, &record.side_to_move);
-                    let issues = crate::eval::concepts::rank_issues_for_position(&concepts, elo);
-                    if let serde_json::Value::Object(ref mut map) = json_val {
-                        map.insert("gated_issues".to_string(), serde_json::to_value(&issues).unwrap_or_default());
-                    }
-                }
-
-                Ok(PipelineData::Value(
-                    crate::utils::json_to_nu_value(json_val, span),
-                    None,
-                ))
+                let value = build_output_value(&record, include_verbose, player_elo, span)?;
+                Ok(PipelineData::Value(value, None))
             }
             Value::List { vals, .. } => {
                 // List of FEN strings - process in parallel using Rayon but surface deterministic errors
@@ -117,28 +92,9 @@ impl PluginCommand for HugmEval {
                 let results_res: Vec<Result<Value, LabeledError>> = fens
                     .par_iter()
                     .map(|fen| {
-                        match crate::eval::analyze_fen_with_engine_score(fen, engine_score, player_elo) {
-                            Ok(record) => {
-                                let mut json_val = serde_json::to_value(&record).map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-                                if include_verbose {
-                                    let expl = crate::eval::render_explanations(&record);
-                                    if let serde_json::Value::Object(ref mut map) = json_val {
-                                        map.insert("explanations".to_string(), serde_json::Value::Array(expl.into_iter().map(serde_json::Value::String).collect()));
-                                        let structured = crate::eval::render_structured_explanations(&record);
-                                        map.insert("explanations_structured".to_string(), serde_json::Value::Array(structured));
-                                    }
-                                }
-                                if let Some(elo) = player_elo {
-                                    let concepts = crate::eval::concepts::extract_concepts(&record.sensor_report, &record.groups, &record.side_to_move);
-                                    let issues = crate::eval::concepts::rank_issues_for_position(&concepts, elo);
-                                    if let serde_json::Value::Object(ref mut map) = json_val {
-                                        map.insert("gated_issues".to_string(), serde_json::to_value(&issues).unwrap_or_default());
-                                    }
-                                }
-                                Ok(crate::utils::json_to_nu_value(json_val, span))
-                            }
-                            Err(e) => Err(LabeledError::new(e.to_string()).with_label("eval error", span)),
-                        }
+                        let record = crate::eval::analyze_fen_with_engine_score(fen, engine_score, player_elo)
+                            .map_err(|e| LabeledError::new(e.to_string()).with_label("eval error", span))?;
+                        build_output_value(&record, include_verbose, player_elo, span)
                     })
                     .collect();
 
@@ -157,4 +113,38 @@ impl PluginCommand for HugmEval {
                 .with_label("invalid input type", span)),
         }
     }
+}
+
+/// Serialize a `PositionRecord` to the plugin's output shape, optionally adding
+/// verbose explanations and a top-level `gated_issues` key. Shared by both the
+/// single-FEN and list-of-FEN branches above.
+///
+/// `gated_issues` is copied from `record.sensor_report.gated_issues` — already
+/// computed by `build_sensor_report` with this same `player_elo` — rather than
+/// recomputed via `extract_concepts`/`rank_issues_for_position` a second time.
+fn build_output_value(
+    record: &crate::eval::PositionRecord,
+    include_verbose: bool,
+    player_elo: Option<i32>,
+    span: nu_protocol::Span,
+) -> Result<Value, LabeledError> {
+    let mut json_val = serde_json::to_value(record)
+        .map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
+
+    if include_verbose {
+        let expl = crate::eval::render_explanations(record);
+        let structured = crate::eval::render_structured_explanations(record);
+        if let serde_json::Value::Object(ref mut map) = json_val {
+            map.insert("explanations".to_string(), serde_json::Value::Array(expl.into_iter().map(serde_json::Value::String).collect()));
+            map.insert("explanations_structured".to_string(), serde_json::Value::Array(structured));
+        }
+    }
+
+    if player_elo.is_some() {
+        if let serde_json::Value::Object(ref mut map) = json_val {
+            map.insert("gated_issues".to_string(), serde_json::to_value(&record.sensor_report.gated_issues).unwrap_or_default());
+        }
+    }
+
+    Ok(crate::utils::json_to_nu_value(json_val, span))
 }

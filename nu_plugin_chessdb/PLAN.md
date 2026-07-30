@@ -261,6 +261,155 @@ already be scalar `GroupValue.blended` reads, not tag lookups, so they needed no
 `PositionRecord.legal.is_check`, since `extract_concepts` only had a `SensorReport` in scope at
 its call site inside `build_sensor_report`).
 
+External test-position corpora (added 2026-07-28)
+
+We were validating detectors against hand-picked canonical positions only
+(`tests/motif_canonical.rs`) — no real, independently-authored positions to
+check against. Researched chessprogramming.org's Test-Positions page and
+picked the **Strategic Test Suite (STS)** by Dann Corbit & Swaminathan
+Natarajan: 15 themed sub-suites, 100 positions each, including STS12 "Center
+Control" and STS13 "Pawn Play in the Center" — directly on-theme for the
+pawn_majority/center_control accuracy scoping above. Vendored via
+`github.com/fsmosca/STS-Rating` (MIT-licensed repackaging; original authors'
+site is dead, so redistribution rests on that MIT grant plus 15+ years of
+open community reuse — reasonable confidence, not independently confirmed
+with the original authors).
+
+Not committed to the repo (`nu_plugin_chessdb/testdata/` is gitignored) —
+`scripts/prep-test-data.nu` fetches it on demand, with full source/license
+detail recorded in the script itself since the data directory it writes to
+isn't tracked. `tests/sts_positional.rs` holds `#[ignore]`'d dev-only tests
+that consume it (skip gracefully if the prep script hasn't been run; normal
+`cargo test` never depends on this or hits the network). Run via
+`cargo test --test sts_positional -- --ignored`.
+
+Important caveat carried into the tests themselves: STS grades *move choice*
+(bm + weighted alternatives), not concept presence/absence. It can't produce
+per-position pass/fail assertions the way the hand-labeled canonical suite
+does. What it can do is compare hit-rate on-theme vs. on an unrelated theme
+(STS1 "Undermine" used as baseline) — if a concept doesn't fire more often on
+positions themed around it than on unrelated ones, it has no discriminative
+power regardless of how correct its board logic looks in isolation.
+
+**STS calibration — first attempt was methodologically invalid (2026-07-28), retracted.**
+Raw numbers observed: `center_control` fired on 67/100 STS12 (center-control-
+themed) *pre-move* positions vs. 70/100 on an unrelated STS1 baseline;
+`pawn_majority` fired on 68/100 STS13 pre-move positions vs. 79/100 baseline.
+These were initially written up as "the detector has no discriminative
+power" — that conclusion doesn't follow from this data and has been
+retracted. STS positions are puzzles: the FEN given is deliberately the
+*undecided* moment before the thematic move, not a position that already
+embodies the theme (a "Center Control" puzzle exists because center control
+is contested and up for grabs — that's what makes it a puzzle rather than a
+foregone conclusion). Testing whether the raw pre-move FEN already trips the
+detector tests the wrong thing; the near-baseline hit rate is unsurprising
+and doesn't confirm or rule out a precision problem either way.
+
+Also considered and rejected: comparing our concept's score after STS's
+top-ranked move vs. its lower-ranked alternatives (using `c9`/`c8`). That
+still isn't valid ground truth for *our* purposes — STS's move ranking is
+itself an engine/human judgment call entangled with search and opponent
+response, a fundamentally different and much harder problem ("what's the
+best move here, accounting for everything") than what we're actually trying
+to validate ("does this position have property X, definitively"). Building
+a detector-accuracy test on top of someone else's best-move judgment just
+tests whether we agree with their full-strength evaluation, not whether our
+bitmask is right.
+
+**Definitive ground truth — the actual methodology going forward.** Only
+trust positions where the concept's presence/absence is unambiguous by
+construction:
+1. Hand-labeled canonical positions (chessprogramming.org-style, as already
+   done in `tests/motif_canonical.rs`) — a human states "this position has
+   a queenside pawn majority" or "does not," no engine judgment involved.
+2. Positions *derived* from a known-clear starting position by pushing our
+   own side's move(s) forward, with **no opponent-response search** — e.g.
+   start from a labeled-clear position, play 1 (or at most 2) of our own
+   candidate moves, and check the concept updates as expected. A 2-ply
+   forward push is allowed only as a hint that a tactic might be present
+   there — it is not itself an assertion, and anything it surfaces needs
+   independent hand-verification before being trusted as a labeled fixture.
+
+STS (and any future puzzle/engine-graded suite) stays limited to what it's
+actually good for: a crash-safety smoke test (`sts_full_suite_evaluates_without_error`)
+confirming `hugm-eval` doesn't panic across ~1500 real, diverse positions —
+not a source of accuracy ground truth for `pawn_majority`/`center_control`.
+Expanding the hand-labeled/derived corpus for those two concepts specifically
+is the next real step, not yet done here.
+
+Consistency pass: naming, duplication, documentation (2026-07-29)
+
+Executed the plan scoped the same day (via Ultraplan remote refinement,
+approved directly in-session since a browser wasn't available to click
+approve on the web — approval happened as plain-text plan review instead).
+
+Done:
+- `eval/mod.rs` now carries a module-level doc laying out the full pipeline
+  (`board` → `compute_groups`/`EvalGroups` → `build_sensor_report`/`SensorReport`
+  → `extract_concepts`/`Concept` → `rank_issues_for_position`/`GatedIssue`) and
+  explains why `detect_X`+`X_to_typed` (cached, tactical) and `extract_X`
+  (single-step, positional/material) coexist as two naming families —
+  deliberate, not sloppy.
+- `render_explanations`/`render_structured_explanations` (`position.rs`)
+  rewritten to read `record.sensor_report` instead of independently
+  re-deriving from `groups.*.terms` — the third/fourth large `.terms`
+  consumer (after `extract_concepts`, fixed last session) is gone. Also fixed
+  a real bug found while migrating: `render_structured_explanations`
+  hardcoded `"side": "white"` on every emitted explanation regardless of
+  which side was actually to move — now uses the real color. Four fields
+  with no typed `SensorReport` home (`tropism_us`, `doubled_rooks`,
+  `development_diff`, `initiative`) remain narrow, documented exceptions —
+  reading `.terms` for four specific whole-position/legacy scores that
+  aren't per-concept, not a regression back to the old pattern.
+- `coach_derive_cmd.rs`'s state_id bit layout: `concepts.rs` now has
+  `decode_state_id(sid: u16) -> StateVector` next to `encode_state`, sharing
+  one set of `BIT_*` constants so pack/unpack can't drift apart. The
+  previously-independent hand-decoded "fast path" in `coach_derive_cmd.rs`
+  now calls `decode_state_id`. `encode_move_states` returns `Vec<StateVector>`
+  (typed) instead of `Vec<Value>`; `compute_baselines`/`detect_anomalies`/
+  `compute_transitions` read typed fields directly; conversion to `Value`
+  happens once, in `format_results`, via one `state_vector_to_value` helper
+  (external field names — `phase_bucket`, `has_fork`, etc. — kept identical,
+  since `chessdb/sync.nu`/`chessdb/profile.nu` depend on them by name).
+  Added `fast_path_and_slow_path_agree_on_state_id` regression test.
+- `hugm_eval_cmd.rs`'s single-FEN and list-of-FEN branches deduped into one
+  `build_output_value` helper. Found real duplicate *work*, not just
+  duplicate code: both branches recomputed `gated_issues` via
+  `extract_concepts`+`rank_issues_for_position` even though
+  `record.sensor_report.gated_issues` already has it (computed inside
+  `build_sensor_report` with the same `player_elo`). Now just copied from
+  there — verified byte-identical to the old recompute before switching.
+- `core.rs`: the two inlined `pos.zobrist_hash(EnPassantMode::Legal)` +
+  manual hex-format call sites (`GameVisitor::san`, `pgn_to_batch_record`)
+  now call the existing `get_canonical_hash` helper instead of re-deriving.
+
+Found but explicitly not fixed here (same class of bug, different layer,
+outside this pass's approved scope — flagged for a future pass):
+- **`chessdb/sync.nu` and `chessdb/profile.nu` independently bit-shift raw
+  `state_id` in SQL** (`profile.nu:174-176,185-187,342-345`,
+  `sync.nu:33-40`) — the identical "bit layout duplicated outside its one
+  source of truth" problem just fixed in Rust, now found in the Nu/SQL
+  layer too. Some of it (`had_outpost`/`had_open_file`/`had_passed_pawn` at
+  `profile.nu:342-345`) is a genuine schema gap — the `move_states` table
+  has no columns for those three concepts, only `has_fork`/`has_pin`/
+  `has_hanging`/`king_exposed`/`phase_bucket`. But `profile.nu:174-176` and
+  `185-187` re-derive `had_fork`/`had_pin`/`had_hanging` by bit-shifting
+  `ms.state_id` even though the table already has `ms.has_fork`/`ms.has_pin`/
+  `ms.has_hanging` columns sitting right there unused — the exact same
+  "typed data ignored in favor of re-deriving from a raw encoding" pattern
+  as the Rust-side finding this pass just fixed. Not touched — different
+  layer (SQL/Nu vs Rust), different verification needs (DB-backed, not
+  `cargo test`), and wasn't part of what was surveyed when this plan was
+  scoped.
+
+Verification: `cargo check`/`cargo clippy --tests` clean (only pre-existing
+warnings remain, in untouched `src/bin/hugm_harness.rs`); full test suite
+27 passing (was 26 — the new fast/slow-path regression test), 0 failed, 1
+ignored (`sts_positional`, unaffected); manually confirmed
+`render_explanations`/`render_structured_explanations` produce sane,
+non-crashing output on real positions and `hugm_eval_cmd.rs`'s reused
+`gated_issues` is identical to a fresh recompute before switching.
+
 Known Bugs (last reviewed 2026-07-28)
 
 RESOLVED:

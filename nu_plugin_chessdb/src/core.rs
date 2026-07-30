@@ -183,8 +183,7 @@ impl Visitor for GameVisitor {
         };
 
         let fen = Fen::from_position(new_pos.clone(), EnPassantMode::Legal).to_string();
-        let zobrist: Zobrist64 = new_pos.zobrist_hash(EnPassantMode::Legal);
-        let zobrist = format!("{:016x}", zobrist.0);
+        let zobrist = get_canonical_hash(&new_pos);
         let move_number = (self.ply / 2) + 1;
         let color = if self.ply.is_multiple_of(2) { "white" } else { "black" };
         self.ply += 1;
@@ -637,8 +636,7 @@ pub fn pgn_to_fens(pgn_str: &str, span: Span) -> Result<Vec<MoveRow>, LabeledErr
 pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, LabeledError> {
     let initial_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     let initial_pos: Chess = Chess::default();
-    let initial_zobrist: Zobrist64 = initial_pos.zobrist_hash(EnPassantMode::Legal);
-    let initial_hash = format!("{:016x}", initial_zobrist.0);
+    let initial_hash = get_canonical_hash(&initial_pos);
 
     let mut reader = BufferedReader::new(pgn_str.as_bytes());
     let mut games = Vec::new();

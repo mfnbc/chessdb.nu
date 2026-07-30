@@ -232,6 +232,24 @@ pub struct StateVector {
 }
 
 /// Encode a position into a compact state ID from the sensor report and groups.
+// Bit layout for StateVector::state_id — the single definition shared by
+// encode_state (pack) and decode_state_id (unpack) below, so a future change
+// to the layout can't silently desync a hand-rolled decoder elsewhere in the
+// crate (coach_derive_cmd.rs previously had exactly that: its own inline
+// copy of these shifts, agreeing with this by coincidence, not by sharing).
+const BIT_PHASE: u32 = 0;         // bits 0-1 (2 bits)
+const BIT_MATERIAL_SIGN: u32 = 2; // bits 2-4 (3 bits)
+const BIT_KING_EXPOSED: u32 = 5;
+const BIT_IN_CHECK: u32 = 6;
+const BIT_FORK: u32 = 7;
+const BIT_PIN: u32 = 8;
+const BIT_HANGING: u32 = 9;
+const BIT_OUTPOST: u32 = 10;
+const BIT_OPEN_FILE: u32 = 11;
+const BIT_PASSED_PAWN: u32 = 12;
+const BIT_SKEWER: u32 = 13;
+const BIT_DISCOVERED: u32 = 14;
+
 pub fn encode_state(sensor: &crate::eval::sensor::SensorReport, groups: &crate::eval::position::EvalGroups, phase: u8) -> StateVector {
     let phase_bits = match phase {
         0..=8 => 0u8,      // deep endgame
@@ -258,18 +276,18 @@ pub fn encode_state(sensor: &crate::eval::sensor::SensorReport, groups: &crate::
 
     // Pack into u16 bitfield
     let mut id: u16 = 0;
-    id |= (phase_bits as u16) & 0x3;               // bits 0-1
-    id |= ((material_sign + 2) as u16 & 0x7) << 2; // bits 2-4
-    id |= (king_exposed as u16) << 5;               // bit 5
-    id |= (in_check as u16) << 6;                   // bit 6
-    id |= (has_fork as u16) << 7;                   // bit 7
-    id |= (has_pin as u16) << 8;                    // bit 8
-    id |= (has_hanging as u16) << 9;                // bit 9
-    id |= (has_outpost as u16) << 10;               // bit 10
-    id |= (open_file as u16) << 11;                 // bit 11
-    id |= (has_passed_pawn as u16) << 12;           // bit 12
-    id |= (has_skewer as u16) << 13;                // bit 13
-    id |= (has_discovered as u16) << 14;            // bit 14
+    id |= (phase_bits as u16 & 0x3) << BIT_PHASE;
+    id |= ((material_sign + 2) as u16 & 0x7) << BIT_MATERIAL_SIGN;
+    id |= (king_exposed as u16) << BIT_KING_EXPOSED;
+    id |= (in_check as u16) << BIT_IN_CHECK;
+    id |= (has_fork as u16) << BIT_FORK;
+    id |= (has_pin as u16) << BIT_PIN;
+    id |= (has_hanging as u16) << BIT_HANGING;
+    id |= (has_outpost as u16) << BIT_OUTPOST;
+    id |= (open_file as u16) << BIT_OPEN_FILE;
+    id |= (has_passed_pawn as u16) << BIT_PASSED_PAWN;
+    id |= (has_skewer as u16) << BIT_SKEWER;
+    id |= (has_discovered as u16) << BIT_DISCOVERED;
 
     StateVector {
         state_id: id,
@@ -285,6 +303,29 @@ pub fn encode_state(sensor: &crate::eval::sensor::SensorReport, groups: &crate::
         has_passed_pawn,
         has_skewer,
         has_discovered,
+    }
+}
+
+/// Unpack a previously-encoded `state_id` back into a `StateVector`. Shares
+/// the `BIT_*` constants above with `encode_state`, so this and the packer
+/// can never disagree about the layout — unlike the ad hoc bit-shifting that
+/// used to live independently in `coach_derive_cmd.rs`'s "fast path".
+pub fn decode_state_id(sid: u16) -> StateVector {
+    let bit = |b: u32| (sid >> b) & 1 != 0;
+    StateVector {
+        state_id: sid,
+        phase: (sid >> BIT_PHASE) as u8 & 0x3,
+        material_sign: (((sid >> BIT_MATERIAL_SIGN) & 0x7) as i8) - 2,
+        king_exposed: bit(BIT_KING_EXPOSED),
+        in_check: bit(BIT_IN_CHECK),
+        has_fork: bit(BIT_FORK),
+        has_pin: bit(BIT_PIN),
+        has_hanging: bit(BIT_HANGING),
+        has_outpost: bit(BIT_OUTPOST),
+        open_file: bit(BIT_OPEN_FILE),
+        has_passed_pawn: bit(BIT_PASSED_PAWN),
+        has_skewer: bit(BIT_SKEWER),
+        has_discovered: bit(BIT_DISCOVERED),
     }
 }
 

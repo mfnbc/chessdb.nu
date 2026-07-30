@@ -2949,9 +2949,10 @@ pub fn analyze_fen_with_engine_score(
 
 pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
-    let side_cap = if record.side_to_move == "white" { "White" } else { "Black" };
+    let us_color = record.side_to_move.as_str();
+    let side_cap = if us_color == "white" { "White" } else { "Black" };
+    let sensor = &record.sensor_report;
 
-    // Helper to create an explanation object
     let make_obj = |kind: &str, side_str: &str, severity: i64, phrase: String, details: serde_json::Map<String, serde_json::Value>| -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert("kind".into(), serde_json::Value::from(kind));
@@ -2963,273 +2964,152 @@ pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json
     };
 
     // Forks
-    if let Some(val) = record.groups.tactical.terms.get("forks_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let mut details = serde_json::Map::new();
-                if let Some(exs) = record.groups.tactical.terms.get("fork_examples_us") {
-                    details.insert("examples".into(), exs.clone());
-                } else if let Some(ex) = record.groups.tactical.terms.get("fork_example_us") {
-                    details.insert("examples".into(), serde_json::Value::Array(vec![ex.clone()]));
-                }
-                let phrase = details
-                    .get("examples")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|e| e.as_str())
-                    .map(|s| format!("{} has {} fork(s) detected (e.g. {}).", side_cap, n, s))
-                    .unwrap_or_else(|| format!("{} has {} fork(s) detected.", side_cap, n));
-                out.push(make_obj("fork", "white", n, phrase, details));
-            }
-        }
+    let forks_us: Vec<_> = sensor.tactical.forks.iter().filter(|f| f.attacker.color == us_color).collect();
+    if !forks_us.is_empty() {
+        let examples: Vec<serde_json::Value> = forks_us.iter().map(|f| {
+            let mut m = serde_json::Map::new();
+            m.insert("attacker".into(), serde_json::Value::from(f.attacker.notation()));
+            m.insert("targets".into(), serde_json::Value::from(f.targets.iter().map(|t| t.notation()).collect::<Vec<_>>()));
+            serde_json::Value::Object(m)
+        }).collect();
+        let phrase = format!("{} has {} fork(s) detected (e.g. {} -> {}).", side_cap, forks_us.len(),
+            forks_us[0].attacker.notation(), forks_us[0].targets.iter().map(|t| t.notation()).collect::<Vec<_>>().join(", "));
+        let mut details = serde_json::Map::new();
+        details.insert("examples".into(), serde_json::Value::Array(examples));
+        out.push(make_obj("fork", us_color, forks_us.len() as i64, phrase, details));
     }
 
     // Skewers
-    if let Some(val) = record.groups.tactical.terms.get("skewers_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let mut details = serde_json::Map::new();
-                if let Some(exs) = record.groups.tactical.terms.get("skewer_examples_us") {
-                    details.insert("examples".into(), exs.clone());
-                } else if let Some(ex) = record.groups.tactical.terms.get("skewer_example_us") {
-                    details.insert("examples".into(), serde_json::Value::Array(vec![ex.clone()]));
-                }
-                let phrase = details
-                    .get("examples")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|e| e.as_str())
-                    .map(|s| format!("{} has {} skewer(s) detected (e.g. {}).", side_cap, n, s))
-                    .unwrap_or_else(|| format!("{} has {} skewer(s) detected.", side_cap, n));
-                out.push(make_obj("skewer", "white", n, phrase, details));
-            }
-        }
+    let skewers_us: Vec<_> = sensor.tactical.skewers.iter().filter(|s| s.attacker.color == us_color).collect();
+    if !skewers_us.is_empty() {
+        let examples: Vec<serde_json::Value> = skewers_us.iter().map(|s| {
+            let mut m = serde_json::Map::new();
+            m.insert("attacker".into(), serde_json::Value::from(s.attacker.notation()));
+            m.insert("front".into(), serde_json::Value::from(s.front.notation()));
+            m.insert("back".into(), serde_json::Value::from(s.behind.notation()));
+            serde_json::Value::Object(m)
+        }).collect();
+        let phrase = format!("{} has {} skewer(s) detected (e.g. {}: {} -> {}).", side_cap, skewers_us.len(),
+            skewers_us[0].attacker.notation(), skewers_us[0].front.notation(), skewers_us[0].behind.notation());
+        let mut details = serde_json::Map::new();
+        details.insert("examples".into(), serde_json::Value::Array(examples));
+        out.push(make_obj("skewer", us_color, skewers_us.len() as i64, phrase, details));
     }
 
     // Pins
-    if let Some(val) = record.groups.tactical.terms.get("pins_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let mut details = serde_json::Map::new();
-                if let Some(exs) = record.groups.tactical.terms.get("pin_examples_us") {
-                    details.insert("examples".into(), exs.clone());
-                } else if let Some(ex) = record.groups.tactical.terms.get("pin_example_us") {
-                    details.insert("examples".into(), serde_json::Value::Array(vec![ex.clone()]));
-                }
-                let phrase = details
-                    .get("examples")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|e| e.as_str())
-                    .map(|s| format!("{} has {} pin(s) (e.g. {}).", side_cap, n, s))
-                    .unwrap_or_else(|| format!("{} has {} pin(s).", side_cap, n));
-                out.push(make_obj("pin", "white", n, phrase, details));
-            }
-        }
+    let pins_us: Vec<_> = sensor.tactical.pins.iter().filter(|p| p.attacker.color == us_color).collect();
+    if !pins_us.is_empty() {
+        let examples: Vec<serde_json::Value> = pins_us.iter().map(|p| {
+            let mut m = serde_json::Map::new();
+            m.insert("attacker".into(), serde_json::Value::from(p.attacker.notation()));
+            m.insert("pinned".into(), serde_json::Value::from(p.pinned.notation()));
+            m.insert("shielded".into(), serde_json::Value::from(p.shielded.notation()));
+            serde_json::Value::Object(m)
+        }).collect();
+        let phrase = format!("{} has {} pin(s) (e.g. {} pins {} to {}).", side_cap, pins_us.len(),
+            pins_us[0].attacker.notation(), pins_us[0].pinned.notation(), pins_us[0].shielded.notation());
+        let mut details = serde_json::Map::new();
+        details.insert("examples".into(), serde_json::Value::Array(examples));
+        out.push(make_obj("pin", us_color, pins_us.len() as i64, phrase, details));
     }
 
-    // Discovered
-    if let Some(val) = record.groups.tactical.terms.get("discovered_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let mut details = serde_json::Map::new();
-                if let Some(exs) = record.groups.tactical.terms.get("discovered_examples_us") {
-                    details.insert("examples".into(), exs.clone());
-                } else if let Some(ex) = record.groups.tactical.terms.get("discovered_example_us") {
-                    details.insert("examples".into(), serde_json::Value::Array(vec![ex.clone()]));
-                }
-                let phrase = details
-                    .get("examples")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|e| e.as_str())
-                    .map(|s| format!("{} has {} discovered-attack opportunity(ies) (e.g. {}).", side_cap, n, s))
-                    .unwrap_or_else(|| format!("{} has {} discovered-attack opportunity(ies).", side_cap, n));
-                out.push(make_obj("discovered", "white", n, phrase, details));
-            }
-        }
+    // Discovered attacks
+    let disc_us: Vec<_> = sensor.tactical.discovered.iter().filter(|d| d.attacker.color == us_color).collect();
+    if !disc_us.is_empty() {
+        let examples: Vec<serde_json::Value> = disc_us.iter().map(|d| {
+            let mut m = serde_json::Map::new();
+            m.insert("mover".into(), serde_json::Value::from(d.mover.notation()));
+            m.insert("attacker".into(), serde_json::Value::from(d.attacker.notation()));
+            m.insert("target".into(), serde_json::Value::from(d.target.notation()));
+            serde_json::Value::Object(m)
+        }).collect();
+        let phrase = format!("{} has {} discovered-attack opportunity(ies) (e.g. {} moves, {} attacks {}).", side_cap, disc_us.len(),
+            disc_us[0].mover.notation(), disc_us[0].attacker.notation(), disc_us[0].target.notation());
+        let mut details = serde_json::Map::new();
+        details.insert("examples".into(), serde_json::Value::Array(examples));
+        out.push(make_obj("discovered", us_color, disc_us.len() as i64, phrase, details));
     }
 
     // Outposts
-    if let Some(val) = record.groups.piece_activity.terms.get("outposts_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let mut details = serde_json::Map::new();
-                if let Some(exs) = record.groups.piece_activity.terms.get("outpost_examples_us") {
-                    details.insert("examples".into(), exs.clone());
-                } else if let Some(ex) = record.groups.piece_activity.terms.get("outpost_example_us") {
-                    details.insert("examples".into(), serde_json::Value::Array(vec![ex.clone()]));
-                }
-                let phrase = details
-                    .get("examples")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|e| e.as_str())
-                    .map(|s| format!("{} has {} outpost(s) (e.g. {}).", side_cap, n, s))
-                    .unwrap_or_else(|| format!("{} has {} outpost(s).", side_cap, n));
-                out.push(make_obj("outpost", "white", n, phrase, details));
-            }
-        }
+    let outposts_us: Vec<_> = sensor.positional.outposts.iter().filter(|o| o.piece.color == us_color).collect();
+    if !outposts_us.is_empty() {
+        let examples: Vec<serde_json::Value> = outposts_us.iter().map(|o| {
+            let mut m = serde_json::Map::new();
+            m.insert("square".into(), serde_json::Value::from(o.piece.notation()));
+            m.insert("support".into(), serde_json::Value::from(o.supported_by.notation()));
+            serde_json::Value::Object(m)
+        }).collect();
+        let phrase = format!("{} has {} outpost(s) (e.g. {} supported by {}).", side_cap, outposts_us.len(),
+            outposts_us[0].piece.notation(), outposts_us[0].supported_by.notation());
+        let mut details = serde_json::Map::new();
+        details.insert("examples".into(), serde_json::Value::Array(examples));
+        out.push(make_obj("outpost", us_color, outposts_us.len() as i64, phrase, details));
     }
 
-    // Rook activity examples
-    if let Some(val) = record.groups.piece_activity.terms.get("open_files_controlled") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let mut details = serde_json::Map::new();
-                details.insert("count".into(), serde_json::Value::from(n));
-                let phrase = format!("{} controls {} open file(s) with rooks.", side_cap, n);
-                out.push(make_obj("rook_open_files", "white", n, phrase, details));
-            }
-        }
+    // Rook activity
+    let open_files_us: Vec<_> = sensor.positional.open_files.iter().filter(|f| f.color == us_color && f.rook_count > 0).collect();
+    if !open_files_us.is_empty() {
+        let n = open_files_us.len() as i64;
+        let mut details = serde_json::Map::new();
+        details.insert("count".into(), serde_json::Value::from(n));
+        let phrase = format!("{} controls {} open file(s) with rooks.", side_cap, n);
+        out.push(make_obj("rook_open_files", us_color, n, phrase, details));
     }
 
     if out.is_empty() {
         let mut details = serde_json::Map::new();
         details.insert("msg".into(), serde_json::Value::from("none"));
-        out.push(make_obj("none", "white", 0, "No immediate human-readable issues detected by static HUGM heuristics.".to_string(), details));
+        out.push(make_obj("none", us_color, 0, "No immediate human-readable issues detected by static HUGM heuristics.".to_string(), details));
     }
 
     out
 }
 
+/// Two remaining fields have no typed `SensorReport` home (`tropism_us`,
+/// `doubled_rooks`) alongside two whole-position scores that aren't
+/// per-concept at all (`development_diff`, `initiative`) — these four are a
+/// deliberate, narrow exception to "read only `sensor_report`" below, not a
+/// gap in the migration. Everything else here reads typed data.
 pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let side = if record.side_to_move == "white" { "White" } else { "Black" };
+    let us_color = record.side_to_move.as_str();
+    let side = if us_color == "white" { "White" } else { "Black" };
     let opp = if side == "White" { "Black" } else { "White" };
+    let opp_color = if us_color == "white" { "black" } else { "white" };
+    let sensor = &record.sensor_report;
 
     // Tactical explanations with examples when available
-    if let Some(val) = record.groups.tactical.terms.get("forks_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                // try plural array first
-                let first_example = record
-                    .groups
-                    .tactical
-                    .terms
-                    .get("fork_examples_us")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first().cloned())
-                    .or_else(|| record.groups.tactical.terms.get("fork_example_us").cloned());
-
-                if let Some(ex) = first_example {
-                    if let Some(att) = ex.get("attacker").and_then(|v| v.as_str()) {
-                        if let Some(targets) = ex.get("targets").and_then(|v| v.as_array()) {
-                            let t_str = targets.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ");
-                            out.push(format!("{} has {} fork(s) detected (e.g. {} -> {}) — check for immediate tactical threats or trade opportunities.", side, n, att, t_str));
-                        } else {
-                            out.push(format!("{} has {} fork(s) detected (e.g. {}) — check for immediate tactical threats or trade opportunities.", side, n, att));
-                        }
-                    } else if let Some(s) = ex.as_str() {
-                        out.push(format!("{} has {} fork(s) detected (e.g. {}) — check for immediate tactical threats or trade opportunities.", side, n, s));
-                    } else {
-                        out.push(format!("{} has {} fork(s) detected — check for immediate tactical threats or trade opportunities.", side, n));
-                    }
-                } else {
-                    out.push(format!("{} has {} fork(s) detected — check for immediate tactical threats or trade opportunities.", side, n));
-                }
-            }
-        }
+    let forks_us: Vec<_> = sensor.tactical.forks.iter().filter(|f| f.attacker.color == us_color).collect();
+    if !forks_us.is_empty() {
+        let f = forks_us[0];
+        let t_str = f.targets.iter().map(|t| t.notation()).collect::<Vec<_>>().join(", ");
+        out.push(format!("{} has {} fork(s) detected (e.g. {} -> {}) — check for immediate tactical threats or trade opportunities.", side, forks_us.len(), f.attacker.notation(), t_str));
     }
-    if let Some(val) = record.groups.tactical.terms.get("skewers_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let first_example = record
-                    .groups
-                    .tactical
-                    .terms
-                    .get("skewer_examples_us")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first().cloned())
-                    .or_else(|| record.groups.tactical.terms.get("skewer_example_us").cloned());
-                if let Some(ex) = first_example {
-                    if let (Some(att), Some(front), Some(back)) = (ex.get("attacker").and_then(|v| v.as_str()), ex.get("front").and_then(|v| v.as_str()), ex.get("back").and_then(|v| v.as_str())) {
-                        out.push(format!("{} has {} skewer(s) detected (e.g. {}: {} -> {}) — high-value piece may be attacked in-line.", side, n, att, front, back));
-                    } else if let Some(s) = ex.as_str() {
-                        out.push(format!("{} has {} skewer(s) detected (e.g. {}) — high-value piece may be attacked in-line.", side, n, s));
-                    } else {
-                        out.push(format!("{} has {} skewer(s) detected — high-value piece may be attacked in-line.", side, n));
-                    }
-                } else {
-                    out.push(format!("{} has {} skewer(s) detected — high-value piece may be attacked in-line.", side, n));
-                }
-            }
-        }
+    let skewers_us: Vec<_> = sensor.tactical.skewers.iter().filter(|s| s.attacker.color == us_color).collect();
+    if !skewers_us.is_empty() {
+        let s = skewers_us[0];
+        out.push(format!("{} has {} skewer(s) detected (e.g. {}: {} -> {}) — high-value piece may be attacked in-line.", side, skewers_us.len(), s.attacker.notation(), s.front.notation(), s.behind.notation()));
     }
-    if let Some(val) = record.groups.tactical.terms.get("pins_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let first_example = record
-                    .groups
-                    .tactical
-                    .terms
-                    .get("pin_examples_us")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first().cloned())
-                    .or_else(|| record.groups.tactical.terms.get("pin_example_us").cloned());
-                if let Some(ex) = first_example {
-                    if let (Some(pinner), Some(pinned), Some(king)) = (ex.get("pinner").and_then(|v| v.as_str()), ex.get("pinned").and_then(|v| v.as_str()), ex.get("king").and_then(|v| v.as_str())) {
-                        out.push(format!("{} has {} pin(s) (e.g. {} pins {} to {}) — consider relieving pressure or trading pinned pieces.", side, n, pinner, pinned, king));
-                    } else if let Some(s) = ex.as_str() {
-                        out.push(format!("{} has {} pin(s) (e.g. {}) — consider relieving pressure or trading pinned pieces.", side, n, s));
-                    } else {
-                        out.push(format!("{} has {} pin(s) — consider relieving pressure or trading pinned pieces.", side, n));
-                    }
-                } else {
-                    out.push(format!("{} has {} pin(s) — consider relieving pressure or trading pinned pieces.", side, n));
-                }
-            }
-        }
+    let pins_us: Vec<_> = sensor.tactical.pins.iter().filter(|p| p.attacker.color == us_color).collect();
+    if !pins_us.is_empty() {
+        let p = pins_us[0];
+        out.push(format!("{} has {} pin(s) (e.g. {} pins {} to {}) — consider relieving pressure or trading pinned pieces.", side, pins_us.len(), p.attacker.notation(), p.pinned.notation(), p.shielded.notation()));
     }
-    if let Some(val) = record.groups.tactical.terms.get("discovered_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let first_example = record
-                    .groups
-                    .tactical
-                    .terms
-                    .get("discovered_examples_us")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first().cloned())
-                    .or_else(|| record.groups.tactical.terms.get("discovered_example_us").cloned());
-                if let Some(ex) = first_example {
-                    if let (Some(blocker), Some(slider), Some(target)) = (ex.get("blocker").and_then(|v| v.as_str()), ex.get("slider").and_then(|v| v.as_str()), ex.get("target").and_then(|v| v.as_str())) {
-                        out.push(format!("{} has {} discovered-attack opportunity(ies) (e.g. {} moves unveils {} attacking {}) — watch for moves that uncover attacks.", side, n, blocker, slider, target));
-                    } else if let Some(s) = ex.as_str() {
-                        out.push(format!("{} has {} discovered-attack opportunity(ies) (e.g. {}) — watch for moves that uncover attacks.", side, n, s));
-                    } else {
-                        out.push(format!("{} has {} discovered-attack opportunity(ies) — watch for moves that uncover attacks.", side, n));
-                    }
-                } else {
-                    out.push(format!("{} has {} discovered-attack opportunity(ies) — watch for moves that uncover attacks.", side, n));
-                }
-            }
-        }
+    let disc_us: Vec<_> = sensor.tactical.discovered.iter().filter(|d| d.attacker.color == us_color).collect();
+    if !disc_us.is_empty() {
+        let d = disc_us[0];
+        out.push(format!("{} has {} discovered-attack opportunity(ies) (e.g. {} moves, {} attacks {}) — watch for moves that uncover attacks.", side, disc_us.len(), d.mover.notation(), d.attacker.notation(), d.target.notation()));
     }
 
     // Opponent tactical warnings
-    if let Some(val) = record.groups.tactical.terms.get("forks_them") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                if let Some(ex) = record.groups.tactical.terms.get("fork_example_them") {
-                    if let Some(att) = ex.get("attacker").and_then(|v| v.as_str()) {
-                        if let Some(targets) = ex.get("targets").and_then(|v| v.as_array()) {
-                            let t_str = targets.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ");
-                            out.push(format!("{} has {} fork(s) (by opponent) (e.g. {} -> {}) — consider defensive resources.", opp, n, att, t_str));
-                        } else {
-                            out.push(format!("{} has {} fork(s) (by opponent) (e.g. {}) — consider defensive resources.", opp, n, att));
-                        }
-                    } else if let Some(s) = ex.as_str() {
-                        out.push(format!("{} has {} fork(s) (by opponent) (e.g. {}) — consider defensive resources.", opp, n, s));
-                    }
-                } else {
-                    out.push(format!("{} has {} fork(s) (by opponent) — consider defensive resources.", opp, n));
-                }
-            }
-        }
+    let forks_them: Vec<_> = sensor.tactical.forks.iter().filter(|f| f.attacker.color == opp_color).collect();
+    if !forks_them.is_empty() {
+        let f = forks_them[0];
+        let t_str = f.targets.iter().map(|t| t.notation()).collect::<Vec<_>>().join(", ");
+        out.push(format!("{} has {} fork(s) (by opponent) (e.g. {} -> {}) — consider defensive resources.", opp, forks_them.len(), f.attacker.notation(), t_str));
     }
 
-    // King safety / tropism
+    // King safety / tropism — no typed field yet, narrow exception (see doc comment above)
     if let Some(val) = record.groups.king_safety.terms.get("tropism_us") {
         if let Some(n) = val.as_i64() {
             if n > 0 {
@@ -3239,20 +3119,14 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     }
 
     // Rook activity
-    if let Some(val) = record.groups.piece_activity.terms.get("open_files_controlled") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} controls {} open file(s) with rooks — good rook activity.", side, n));
-            }
-        }
+    let open_files_us = sensor.positional.open_files.iter().filter(|f| f.color == us_color && f.rook_count > 0).count();
+    if open_files_us > 0 {
+        out.push(format!("{} controls {} open file(s) with rooks — good rook activity.", side, open_files_us));
     }
-    if let Some(val) = record.groups.piece_activity.terms.get("rook_on_seventh") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} has {} rook(s) on the 7th rank — strong pressure on enemy pawns and king.", side, n));
-            }
-        }
+    for r in sensor.positional.rook_on_seventh.iter().filter(|r| r.color == us_color) {
+        out.push(format!("{} has {} rook(s) on the 7th rank — strong pressure on enemy pawns and king.", side, r.count));
     }
+    // Doubled rooks — no typed field yet, narrow exception (see doc comment above)
     if let Some(val) = record.groups.piece_activity.terms.get("doubled_rooks") {
         if let Some(n) = val.as_i64() {
             if n > 0 {
@@ -3262,47 +3136,24 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     }
 
     // Pawn structure notes
-    if let Some(val) = record.groups.pawn_structure.terms.get("isolated") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} has {} isolated pawn(s) — structural weakness to address.", side, n));
-            }
-        }
+    let isolated_us = sensor.positional.isolated_pawns.iter().filter(|p| p.color == us_color).count();
+    if isolated_us > 0 {
+        out.push(format!("{} has {} isolated pawn(s) — structural weakness to address.", side, isolated_us));
     }
-    if let Some(val) = record.groups.pawn_structure.terms.get("passed") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} has {} passed pawn(s) — potential long-term advantage.", side, n));
-            }
-        }
+    let passed_us = sensor.positional.passed_pawns.iter().filter(|p| p.color == us_color).count();
+    if passed_us > 0 {
+        out.push(format!("{} has {} passed pawn(s) — potential long-term advantage.", side, passed_us));
     }
 
     // Outpost explanation
-    if let Some(val) = record.groups.piece_activity.terms.get("outposts_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                let first_example = record
-                    .groups
-                    .piece_activity
-                    .terms
-                    .get("outpost_examples_us")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first().cloned())
-                    .or_else(|| record.groups.piece_activity.terms.get("outpost_example_us").cloned());
-                if let Some(ex) = first_example {
-                    if let Some(s) = ex.as_str() {
-                        out.push(format!("{} has {} outpost(s) (e.g. {}) — strong squares often requiring specific plans to challenge.", side, n, s));
-                    } else {
-                        out.push(format!("{} has {} outpost(s) (e.g. <example>) — strong squares often requiring specific plans to challenge.", side, n));
-                    }
-                } else {
-                    out.push(format!("{} has {} outpost(s) — strong squares often requiring specific plans to challenge.", side, n));
-                }
-            }
-        }
+    let outposts_us: Vec<_> = sensor.positional.outposts.iter().filter(|o| o.piece.color == us_color).collect();
+    if !outposts_us.is_empty() {
+        let o = outposts_us[0];
+        out.push(format!("{} has {} outpost(s) (e.g. {} supported by {}) — strong squares often requiring specific plans to challenge.", side, outposts_us.len(), o.piece.notation(), o.supported_by.notation()));
     }
 
-    // Development/space/initiative
+    // Development/space/initiative — whole-position scores, no per-concept typed
+    // home; narrow exception (see doc comment above).
     if let Some(val) = record.groups.development.terms.get("development_diff") {
         if let Some(n) = val.as_i64() {
             if n > 0 {

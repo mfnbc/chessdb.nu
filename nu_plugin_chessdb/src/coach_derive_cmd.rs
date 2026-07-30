@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use shakmaty::Position;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
+use crate::eval::StateVector;
 
 pub struct DeriveCoachSignals;
 
@@ -31,11 +32,11 @@ impl PluginCommand for DeriveCoachSignals {
             _ => return Err(LabeledError::new("Expected list of records with game_id, ply, fen, hugm_score")),
         };
 
-        let states = encode_move_states(&rows, span);
+        let states = encode_move_states(&rows);
         let baselines = compute_baselines(&rows, &states);
         let anomalies = detect_anomalies(&rows, &states, &baselines, min_games, span);
         let (transitions, transition_anomalies) = compute_transitions(&rows, &states, min_games, span);
-        let (states_out, baselines_out) = format_results(&states, &baselines, &anomalies, span);
+        let (states_out, baselines_out) = format_results(&rows, &states, &baselines, span);
 
         Ok(PipelineData::Value(Value::record(nu_protocol::record! {
             "states" => states_out,
@@ -74,64 +75,50 @@ fn parse_move_record(v: &Value) -> Option<MoveRecord> {
 
 /// Encode move states, using pre-computed state_id from ingestion when available.
 /// Falls back to full FEN→shakmaty→eval→encode_state path only for rows missing state_id.
-fn encode_move_states(rows: &[MoveRecord], span: nu_protocol::Span) -> Vec<Value> {
+/// Returns typed `StateVector`s — converted to `Value` only at the Nu-output
+/// boundary in `format_results`, not round-tripped through a string-keyed
+/// record in between.
+fn encode_move_states(rows: &[MoveRecord]) -> Vec<StateVector> {
     rows.iter().map(|r| {
-        // Fast path: state_id already computed during process_corpus ingestion
+        // Fast path: state_id already computed during process_corpus ingestion.
+        // decode_state_id shares its bit layout with encode_state (concepts.rs),
+        // so this can't silently desync the way a hand-rolled decoder could.
         if let Some(sid) = r.state_id {
-            let phase = (sid & 0x3) as u8;
-            return Value::record(nu_protocol::record! {
-                "game_id"        => Value::string(&r.game_id, span),
-                "ply"            => Value::int(r.ply, span),
-                "state_id"       => Value::int(sid as i64, span),
-                "phase_bucket"   => Value::int(phase as i64, span),
-                "king_exposed"   => Value::bool((sid >> 5) & 1 != 0, span),
-                "has_fork"       => Value::bool((sid >> 7) & 1 != 0, span),
-                "has_pin"        => Value::bool((sid >> 8) & 1 != 0, span),
-                "has_hanging"    => Value::bool((sid >> 9) & 1 != 0, span),
-                "has_outpost"    => Value::bool((sid >> 10) & 1 != 0, span),
-                "has_open_file"  => Value::bool((sid >> 11) & 1 != 0, span),
-                "has_passed_pawn"=> Value::bool((sid >> 12) & 1 != 0, span),
-                "has_skewer"     => Value::bool((sid >> 13) & 1 != 0, span),
-                "has_discovered" => Value::bool((sid >> 14) & 1 != 0, span),
-            }, span);
+            return crate::eval::decode_state_id(sid);
         }
         // Slow path: re-parse FEN (fallback for rows without state_id)
         let fen = match shakmaty::fen::Fen::from_ascii(r.fen.as_bytes()) {
-            Ok(f) => f, Err(_) => return Value::record(nu_protocol::record! {
-                "game_id" => Value::string(&r.game_id, span),
-                "ply" => Value::int(r.ply, span),
-                "state_id" => Value::int(0, span),
-                "error" => Value::string("invalid FEN", span),
-            }, span),
+            Ok(f) => f, Err(_) => return StateVector::default(),
         };
         let chess: shakmaty::Chess = match fen.into_position(shakmaty::CastlingMode::Standard) {
-            Ok(c) => c, Err(_) => return Value::record(nu_protocol::record! {
-                "game_id" => Value::string(&r.game_id, span),
-                "ply" => Value::int(r.ply, span),
-                "state_id" => Value::int(0, span),
-                "error" => Value::string("invalid position", span),
-            }, span),
+            Ok(c) => c, Err(_) => return StateVector::default(),
         };
         let phase = crate::eval::compute_phase(chess.board());
         let groups = crate::eval::compute_groups(&chess, phase, 0);
         let sensor = crate::eval::build_sensor_report(chess.board(), &r.fen, &groups, &chess, phase, None);
-        let state = crate::eval::encode_state(&sensor, &groups, phase);
-        Value::record(nu_protocol::record! {
-            "game_id"         => Value::string(&r.game_id, span),
-            "ply"             => Value::int(r.ply, span),
-            "state_id"        => Value::int(state.state_id as i64, span),
-            "phase_bucket"    => Value::int(state.phase as i64, span),
-            "king_exposed"    => Value::bool(state.king_exposed, span),
-            "has_fork"        => Value::bool(state.has_fork, span),
-            "has_pin"         => Value::bool(state.has_pin, span),
-            "has_hanging"     => Value::bool(state.has_hanging, span),
-            "has_outpost"     => Value::bool(state.has_outpost, span),
-            "has_open_file"   => Value::bool(state.open_file, span),
-            "has_passed_pawn" => Value::bool(state.has_passed_pawn, span),
-            "has_skewer"      => Value::bool(state.has_skewer, span),
-            "has_discovered"  => Value::bool(state.has_discovered, span),
-        }, span)
+        crate::eval::encode_state(&sensor, &groups, phase)
     }).collect()
+}
+
+/// The one place a `StateVector` becomes a Nu `Value` — field names here are
+/// the external contract (`chessdb/sync.nu`, `chessdb/profile.nu` query these
+/// by name) and must not change independent of this refactor.
+fn state_vector_to_value(game_id: &str, ply: i64, state: &StateVector, span: nu_protocol::Span) -> Value {
+    Value::record(nu_protocol::record! {
+        "game_id"         => Value::string(game_id, span),
+        "ply"             => Value::int(ply, span),
+        "state_id"        => Value::int(state.state_id as i64, span),
+        "phase_bucket"    => Value::int(state.phase as i64, span),
+        "king_exposed"    => Value::bool(state.king_exposed, span),
+        "has_fork"        => Value::bool(state.has_fork, span),
+        "has_pin"         => Value::bool(state.has_pin, span),
+        "has_hanging"     => Value::bool(state.has_hanging, span),
+        "has_outpost"     => Value::bool(state.has_outpost, span),
+        "has_open_file"   => Value::bool(state.open_file, span),
+        "has_passed_pawn" => Value::bool(state.has_passed_pawn, span),
+        "has_skewer"      => Value::bool(state.has_skewer, span),
+        "has_discovered"  => Value::bool(state.has_discovered, span),
+    }, span)
 }
 
 #[derive(Debug, Clone)]
@@ -151,20 +138,12 @@ impl Welford {
     }
 }
 
-fn get_field_i64(v: &Value, key: &str) -> Option<i64> {
-    v.as_record().ok().and_then(|r| r.get(key)).and_then(|v| v.as_int().ok()).map(|x| x as i64)
-}
-
-fn get_field_bool(v: &Value, key: &str) -> bool {
-    v.as_record().ok().and_then(|r| r.get(key)).and_then(|v| v.as_bool().ok()).unwrap_or(false)
-}
-
-fn compute_baselines(rows: &[MoveRecord], states: &[Value]) -> HashMap<(String, u8, String), (f64, f64)> {
+fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(String, u8, String), (f64, f64)> {
     let mut prev_score: HashMap<(String, String), i64> = HashMap::new();
     let mut prev_eval_arr: HashMap<(String, String), Vec<i64>> = HashMap::new();
     let mut baselines: HashMap<(String, u8, String), Welford> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        let phase_bucket = states.get(i).and_then(|v| get_field_i64(v, "phase_bucket")).unwrap_or(1) as u8;
+        let phase_bucket = states.get(i).map(|s| s.phase).unwrap_or(1);
         let game_key = (row.player.clone(), row.game_id.clone());
         let (delta, _signed_delta) = if let Some(prev) = prev_score.get(&game_key).copied() {
             let sd = row.hugm_score - prev;
@@ -178,18 +157,18 @@ fn compute_baselines(rows: &[MoveRecord], states: &[Value]) -> HashMap<(String, 
                 .or_insert_with(Welford::new).update(delta);
             // Binary state-vector concepts: eval swing when pattern was present
             let s = &states[i];
-            for (concept, flag) in &[
-                ("fork",              "has_fork"),
-                ("pin",               "has_pin"),
-                ("hanging_piece",     "has_hanging"),
-                ("outpost",           "has_outpost"),
-                ("open_file",         "has_open_file"),
-                ("passed_pawn",       "has_passed_pawn"),
-                ("skewer",            "has_skewer"),
-                ("discovered_attack", "has_discovered"),
-                ("king_exposed",      "king_exposed"),
+            for (concept, flag) in [
+                ("fork",              s.has_fork),
+                ("pin",               s.has_pin),
+                ("hanging_piece",     s.has_hanging),
+                ("outpost",           s.has_outpost),
+                ("open_file",         s.open_file),
+                ("passed_pawn",       s.has_passed_pawn),
+                ("skewer",            s.has_skewer),
+                ("discovered_attack", s.has_discovered),
+                ("king_exposed",      s.king_exposed),
             ] {
-                if get_field_bool(s, flag) {
+                if flag {
                     baselines.entry((row.player.clone(), phase_bucket, concept.to_string()))
                         .or_insert_with(Welford::new).update(delta);
                 }
@@ -216,7 +195,7 @@ fn compute_baselines(rows: &[MoveRecord], states: &[Value]) -> HashMap<(String, 
     baselines.into_iter().map(|((p, ph, cn), w)| ((p, ph, cn), (w.mean, w.std_dev()))).collect()
 }
 
-fn detect_anomalies(rows: &[MoveRecord], states: &[Value], baselines: &HashMap<(String, u8, String), (f64, f64)>, min_games: i64, span: nu_protocol::Span) -> Vec<Value> {
+fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &HashMap<(String, u8, String), (f64, f64)>, min_games: i64, span: nu_protocol::Span) -> Vec<Value> {
     let _ = min_games;
     let mut prev_score: HashMap<(String, String), i64> = HashMap::new();
     let mut prev_eval_arr: HashMap<(String, String), Vec<i64>> = HashMap::new();
@@ -230,23 +209,23 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[Value], baselines: &HashMap<(
         } else { (0.0, 0) };
         prev_score.insert(game_key.clone(), row.hugm_score);
 
-        let phase_bucket = states.get(i).and_then(|v| get_field_i64(v, "phase_bucket")).unwrap_or(1) as u8;
-        let state_id = states.get(i).and_then(|v| get_field_i64(v, "state_id")).unwrap_or(0);
+        let s = &states[i];
+        let phase_bucket = s.phase;
+        let state_id = s.state_id as i64;
 
         // Binary state-vector anomalies (eval swing when pattern was present)
         if delta >= 30.0 {
-            let s = &states[i];
             let check_concepts: [(&str, bool); 10] = [
                 ("hugm_delta",        true),
-                ("fork",              get_field_bool(s, "has_fork")),
-                ("pin",               get_field_bool(s, "has_pin")),
-                ("hanging_piece",     get_field_bool(s, "has_hanging")),
-                ("outpost",           get_field_bool(s, "has_outpost")),
-                ("open_file",         get_field_bool(s, "has_open_file")),
-                ("passed_pawn",       get_field_bool(s, "has_passed_pawn")),
-                ("skewer",            get_field_bool(s, "has_skewer")),
-                ("discovered_attack", get_field_bool(s, "has_discovered")),
-                ("king_exposed",      get_field_bool(s, "king_exposed")),
+                ("fork",              s.has_fork),
+                ("pin",               s.has_pin),
+                ("hanging_piece",     s.has_hanging),
+                ("outpost",           s.has_outpost),
+                ("open_file",         s.open_file),
+                ("passed_pawn",       s.has_passed_pawn),
+                ("skewer",            s.has_skewer),
+                ("discovered_attack", s.has_discovered),
+                ("king_exposed",      s.king_exposed),
             ];
             for (concept, should_check) in &check_concepts {
                 if !should_check { continue; }
@@ -306,12 +285,12 @@ fn make_anomaly(player: &str, game_id: &str, ply: i64, state_id: i64, concept: &
     }, span)
 }
 
-fn compute_transitions(rows: &[MoveRecord], states: &[Value], _min_games: i64, span: nu_protocol::Span) -> (Vec<Value>, Vec<Value>) {
+fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], _min_games: i64, span: nu_protocol::Span) -> (Vec<Value>, Vec<Value>) {
     let mut transitions: HashMap<(i64, i64), (i64, i64)> = HashMap::new(); // (state_from, state_to) → (total, blunders)
     let mut prev: Option<(String, i64, i64)> = None; // (game_id, state_id, score)
 
     for (i, row) in rows.iter().enumerate() {
-        let state_id = states.get(i).and_then(|v| get_field_i64(v, "state_id")).unwrap_or(0);
+        let state_id = states.get(i).map(|s| s.state_id as i64).unwrap_or(0);
         if let Some((pg, prev_state, pscore)) = prev.take() {
             if pg == row.game_id {
                 let delta = row.hugm_score - pscore;
@@ -351,7 +330,10 @@ fn compute_transitions(rows: &[MoveRecord], states: &[Value], _min_games: i64, s
     (trans_list, trans_anomalies)
 }
 
-fn format_results(states: &[Value], baselines: &HashMap<(String, u8, String), (f64, f64)>, _anomalies: &[Value], span: nu_protocol::Span) -> (Value, Value) {
+fn format_results(rows: &[MoveRecord], states: &[StateVector], baselines: &HashMap<(String, u8, String), (f64, f64)>, span: nu_protocol::Span) -> (Value, Value) {
+    let states_out: Vec<Value> = rows.iter().zip(states.iter())
+        .map(|(row, state)| state_vector_to_value(&row.game_id, row.ply, state, span))
+        .collect();
     let bl: Vec<Value> = baselines.iter().map(|((player, ph, cn), (mean, std))| {
         Value::record(nu_protocol::record! {
             "player" => Value::string(player, span),
@@ -361,5 +343,37 @@ fn format_results(states: &[Value], baselines: &HashMap<(String, u8, String), (f
             "std" => Value::float(*std, span),
         }, span)
     }).collect();
-    (Value::list(states.to_vec(), span), Value::list(bl, span))
+    (Value::list(states_out, span), Value::list(bl, span))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_path_and_slow_path_agree_on_state_id() {
+        let fen = "rnb1kbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1qPP/RNBQKB1R w KQkq - 0 1";
+        let parsed = shakmaty::fen::Fen::from_ascii(fen.as_bytes()).unwrap();
+        let chess: shakmaty::Chess = parsed.into_position(shakmaty::CastlingMode::Standard).unwrap();
+        let phase = crate::eval::compute_phase(chess.board());
+        let groups = crate::eval::compute_groups(&chess, phase, 0);
+        let sensor = crate::eval::build_sensor_report(chess.board(), fen, &groups, &chess, phase, None);
+        let slow = crate::eval::encode_state(&sensor, &groups, phase);
+
+        let fast = crate::eval::decode_state_id(slow.state_id);
+
+        assert_eq!(fast.state_id, slow.state_id);
+        assert_eq!(fast.phase, slow.phase);
+        assert_eq!(fast.material_sign, slow.material_sign);
+        assert_eq!(fast.king_exposed, slow.king_exposed);
+        assert_eq!(fast.in_check, slow.in_check);
+        assert_eq!(fast.has_fork, slow.has_fork);
+        assert_eq!(fast.has_pin, slow.has_pin);
+        assert_eq!(fast.has_hanging, slow.has_hanging);
+        assert_eq!(fast.has_outpost, slow.has_outpost);
+        assert_eq!(fast.open_file, slow.open_file);
+        assert_eq!(fast.has_passed_pawn, slow.has_passed_pawn);
+        assert_eq!(fast.has_skewer, slow.has_skewer);
+        assert_eq!(fast.has_discovered, slow.has_discovered);
+    }
 }

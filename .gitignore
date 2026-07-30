@@ -1,6 +1,7 @@
 data/*.sqlite
 data/raw/
 nu_plugin_chessdb/target/
+nu_plugin_chessdb/testdata/
 tmp/
 chess.db
 chess.db-shm
