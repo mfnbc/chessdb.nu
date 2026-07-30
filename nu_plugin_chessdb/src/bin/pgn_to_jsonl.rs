@@ -61,7 +61,7 @@ fn process_game_block(current: &str, span: Span) {
                     "black_elo": black_elo,
                     "result": result_hdr
                 });
-                println!("{}", out.to_string());
+                println!("{}", out);
             }
         }
         Err(e) => eprintln!("pgn_to_batch_record error: {}", e),

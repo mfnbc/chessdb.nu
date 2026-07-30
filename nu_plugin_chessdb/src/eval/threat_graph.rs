@@ -168,7 +168,7 @@ impl ThreatGraph {
             for t_sq in attacked {
                 if let Some(tp) = self.pieces[Self::idx(t_sq)] {
                     let val = Self::piece_value(tp.role);
-                    total_val += val as i64;
+                    total_val += val;
                     targets.push(PieceRef {
                         role: role_name(tp.role),
                         color: Side::from(enemy),
@@ -278,7 +278,7 @@ impl ThreatGraph {
             for r in [Role::Pawn, Role::Knight, Role::Bishop, Role::Rook, Role::Queen, Role::King] {
                 if let Some(s) = (attackers & self.board.by_role(r)).into_iter().next() {
                     let v = Self::piece_value(r);
-                    if best.as_ref().map_or(true, |b| v < b.2) {
+                    if best.as_ref().is_none_or(|b| v < b.2) {
                         best = Some((s, r, v));
                     }
                 }

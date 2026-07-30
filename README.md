@@ -149,7 +149,10 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chessdb process-corpus` | Parse game JSON arrays → structured records with HUGM eval |
 | `chessdb derive-coach-signals` | Batch Welford baselines + z-score anomaly detection + state transitions |
 | `chessdb pgn-to-batch` | Multi-game PGN → batch records |
+| `chessdb pgn-to-fens` | Single-game PGN → table of per-move FEN/zobrist/SAN/UCI rows |
 | `chessdb zobrist` | Compute Zobrist hash from FEN |
+| `chessdb canonicalize-fen` | Normalize a FEN to the canonical White-always-to-move frame |
+| `chessdb nnue-eval` | Evaluate FEN(s) via Stockfish NNUE (UCI subprocess) |
 
 ## Database
 

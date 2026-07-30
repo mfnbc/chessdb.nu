@@ -151,7 +151,7 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
         concepts.push(Concept { name: "center_control".into(), severity: cc.strength, side: cc.color, phrase: format!("{} controls the center", cc.color), elo_min: 1800 });
     }
 
-    concepts.sort_by(|a, b| b.severity.cmp(&a.severity));
+    concepts.sort_by_key(|c| std::cmp::Reverse(c.severity));
     concepts
 }
 

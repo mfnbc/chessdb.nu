@@ -91,6 +91,16 @@ fn get_canonical_hash(pos: &Chess) -> String {
     format!("{:016x}", hash.0)
 }
 
+/// The standard starting position's FEN and its canonical zobrist hash — the
+/// one place both are computed, so `pgn_to_batch_record` and
+/// `process_corpus.rs`'s streaming ingest path (which needs "position zero"
+/// before any moves are replayed) can't silently drift apart on the value.
+pub fn initial_position() -> (String, String) {
+    let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string();
+    let hash = get_canonical_hash(&Chess::default());
+    (fen, hash)
+}
+
 struct GameVisitor {
     game_index: u32,
     headers: Vec<(String, String)>,
@@ -493,15 +503,13 @@ pub fn pgn_to_fens(pgn_str: &str, span: Span) -> Result<Vec<MoveRow>, LabeledErr
 }
 
 pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, LabeledError> {
-    let initial_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    let initial_pos: Chess = Chess::default();
-    let initial_hash = get_canonical_hash(&initial_pos);
+    let (initial_fen, initial_hash) = initial_position();
 
     let mut reader = BufferedReader::new(pgn_str.as_bytes());
     let mut games = Vec::new();
     let mut positions = Vec::new();
     let mut unique_map: BTreeMap<String, String> = BTreeMap::new();
-    unique_map.insert(initial_hash.clone(), initial_fen.to_string());
+    unique_map.insert(initial_hash, initial_fen);
     let mut game_index: u32 = 0;
 
     loop {

@@ -899,7 +899,7 @@ fn king_safety_score(board: &shakmaty::Board, color: Color, in_check: bool, _pha
     let enemy_pawns = board.by_color(color.other()) & board.by_role(Role::Pawn);
     let mut pawn_safe = !Bitboard::EMPTY; // all squares safe initially
     for sq in enemy_pawns {
-        pawn_safe = pawn_safe & !board.attacks_from(sq);
+        pawn_safe &= !board.attacks_from(sq);
     }
     if (Bitboard::from(king_sq) & pawn_safe).any() {
         score += 15; // king stands on pawn-protected square
@@ -1210,10 +1210,8 @@ fn piece_activity_score(
             if (enemy_king & Bitboard::from(eighth)).any() {
                 local += 13;
             }
-        } else if rook_rank == sixth {
-            if (enemy_king_or_pawns & enemy_back_ranks).any() {
-                local += 10;
-            }
+        } else if rook_rank == sixth && (enemy_king_or_pawns & enemy_back_ranks).any() {
+            local += 10;
         }
         rook_score += local;
     }
@@ -2565,10 +2563,10 @@ pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> Eval
                   "majority_queenside", "majority_center", "majority_kingside",
                   "minority_attack", "minority_attack_strength", "pawn_breaks"] {
         if let Some(v) = pawn_us_terms.get(*key) {
-            pawn_structure.terms.insert(format!("{}_us", key).into(), v.clone());
+            pawn_structure.terms.insert(format!("{}_us", key), v.clone());
         }
         if let Some(v) = pawn_them_terms.get(*key) {
-            pawn_structure.terms.insert(format!("{}_them", key).into(), v.clone());
+            pawn_structure.terms.insert(format!("{}_them", key), v.clone());
         }
     }
     // Synthesize aggregate majority counts

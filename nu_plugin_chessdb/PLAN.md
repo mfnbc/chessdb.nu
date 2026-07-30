@@ -1594,3 +1594,157 @@ documented idioms, since the Rust crate is now clean. Findings, fixed vs. deferr
 Verified overall: `nu-check` clean on all five touched/reviewed `.nu` files; Rust-side
 `cargo check --all-targets`/`cargo test`/`cargo clippy --all-targets` all green (unaffected
 by the Nu-side changes, listed for completeness since both were done in the same pass).
+
+Re-audit 2026-07-30 (2): remaining src/*.rs command files — reusability,
+reproducibility, clarity
+
+Continued the same pass over the 15 top-level `src/*.rs` files that hadn't had this
+specific lens applied yet (everything outside `src/eval/`, which was already clean).
+Explicitly evaluated against four facets per the user's own framing: reusability,
+reproducibility, clarity, crystal-clear expression.
+
+**Fixed:**
+- **Reusability** — `canonicalize_fen_cmd.rs`, `zobrist.rs`, and `pgn_to_fens.rs`'s
+  `PgnToBatch` each hand-rolled the identical `match input_value { Value::String{..} =>
+  single call; Value::List{..} => loop+push; _ => "Expected string or list of strings" }`
+  dispatch around a different core function. Extracted `utils::map_string_or_list(input,
+  span, f)` (`f: Fn(&str, Span) -> Result<Value, LabeledError>`); each command's `run` is
+  now the one-line call plus its own conversion closure. (`pgn_to_fens.rs`'s `PgnToFens`
+  keeps its own dispatch — it's a genuine one-to-many flatMap, a single PGN string expands
+  to many move rows, not the same shape.) Added 4 unit tests for the new helper
+  (`utils::tests`) since it had no direct coverage otherwise.
+- **Reusability / drift-risk** — `process_corpus.rs:86` hardcoded the starting position's
+  canonical hash as the literal `"463b96181691fc9c"` plus its FEN, duplicated from
+  `core.rs`'s `pgn_to_batch_record`, which computed the equivalent value via
+  `get_canonical_hash(&Chess::default())`. If the hash computation ever changed, the
+  literal would silently go stale with no compiler check. Added `pub fn
+  initial_position() -> (String, String)` to `core.rs` (the one place both are now
+  computed) and had both call sites use it — also moved it out of `process_corpus.rs`'s
+  per-game loop, where it was being recomputed once per game for no reason.
+- **Reproducibility (real bug)** — `coach_derive_cmd.rs`'s `format_results` (baselines
+  output) and `compute_transitions` (transition-events output) built their emitted row
+  lists straight off `HashMap` iteration, whose order Rust randomizes per hasher instance.
+  Identical input to `chessdb derive-coach-signals` could legitimately come back with
+  `player_baselines`/`transition_events` rows in a different order on every invocation —
+  harmless for correctness (SQLite storage doesn't care about insertion order, and
+  `profile.nu`'s queries all have explicit `ORDER BY`), but a real reproducibility gap:
+  anyone diffing raw command output across two runs of the same input would see spurious
+  differences. Sorted both by key (`(player, phase_bucket, concept)` and `(state_from,
+  state_to)` respectively) before building the output `Vec`. Added two regression tests
+  (`baseline_output_rows_are_sorted_deterministically`,
+  `transition_output_rows_are_sorted_deterministically`) using inputs whose HashMap
+  insertion order would not coincidentally already be sorted.
+- **Clarity** — `compute_baselines` and `detect_anomalies` each independently wrote out
+  the same `[(0usize, "material"), (1, "pawn_structure"), (2, "activity"), (3,
+  "king_safety")]` index-to-name list for reading `hugm_eval_arr`'s first four components.
+  Named it once as `EVAL_ARR_COMPONENTS`, with a comment pointing at `process_corpus.rs`
+  (where the array is actually built) and `profile.nu`'s `json_extract(...,'$[N]')` reads
+  (which must stay in the same order) — doesn't eliminate the cross-language index
+  contract, just stops it from also being duplicated within the Rust side.
+
+**Deferred (documented, not fixed — real, but a schema-level change, not a local
+refactor):** `process_corpus.rs` builds `hugm_eval_arr` as an 11-element positional JSON
+array (material, pawn_structure, piece_activity, king_safety, passed_pawns, development,
+vector_features, strategic, scaling, drawishness, override_); `coach_derive_cmd.rs` reads
+the first four back by bare index, and `chessdb/profile.nu` reads three of them directly
+via `json_extract(p.hugm_eval_arr, '$[1]')` etc. This is exactly the "typed struct, not
+index/string-keyed bag" antipattern CLAUDE.md already calls out elsewhere — reordering the
+`arr` vec in `process_corpus.rs` would silently corrupt every downstream reader with no
+compiler error on the Rust side and no error at all on the SQL side. Not fixed here
+because a real fix (e.g. storing `hugm_eval_arr` as a named JSON object instead of a
+positional array) changes the on-disk schema of every existing `chess.db`, and touches
+three files across two languages plus their `--params`/`json_extract` call sites — a
+migration, not a dedup. Worth its own scoped pass, with an explicit before/after check
+that `chess-profile`'s numeric output is unchanged for a real database, if the user wants
+it done.
+- Also lower-priority, same root cause, not fixed: `compute_baselines` and
+  `detect_anomalies` re-derive nearly identical `prev_score`/`prev_eval_arr`/delta
+  scaffolding (~90 lines each) — a real "one loop computing two things" opportunity, but
+  entangled with the eval-component-baseline vs. anomaly-detection control flow enough
+  that merging them safely would want its own dedicated pass rather than a mechanical
+  extraction.
+
+**Confirmed already clean, no findings:** `src/chess.rs`, `src/canonical.rs`,
+`src/game_parse.rs`, `src/stockfish.rs`, `src/main.rs`, `src/lib.rs`, `hugm_eval_cmd.rs`
+(its dispatch differs enough from the three deduped above — Rayon-parallel with
+verbose/player_elo threading and fail-fast error handling — that folding it into
+`map_string_or_list` would obscure more than it'd save).
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (38 tests, up from 32 —
+4 new `utils::tests` for `map_string_or_list`, 2 new `coach_derive_cmd::tests` for the
+ordering fix); `cargo clippy --all-targets` — confirmed via line-range diffing that every
+warning still present sits outside every line this pass touched (all pre-existing,
+previously documented); STS smoke test (1499-position corpus) passes.
+
+Re-audit 2026-07-30 (3): finishing pass — nnue_eval_cmd bug, clippy zero-out,
+compute_baselines/detect_anomalies dedup, doc staleness
+
+Continued past the point of diminishing returns at the user's explicit request ("keep
+cleaning it out and finish").
+
+**Fixed — real bug, not caught by the earlier sweep:** `src/nnue_eval_cmd.rs`'s output
+shape depended on *result count*, not *input shape*: `if results.len() == 1 { bare
+record } else { list }` meant a **one-element list input** (e.g. `["fen"] | chessdb
+nnue-eval`) silently returned a bare record instead of a one-element list — inconsistent
+with the command's own declared `List-in -> List-out` signature and with every sibling
+command in this codebase (which always preserve input shape regardless of element count).
+Also silently dropped non-string elements from a list input via `filter_map` instead of
+erroring, unlike every sibling command's `v.as_str()?`. Fixed by tracking `single: bool`
+from the input's actual shape (not the output count) and erroring on non-string list
+elements. Not runtime-tested end-to-end (no `stockfish` binary available in this
+environment) — verified by code reading plus `cargo check`; the fix is a pure
+control-flow correction with no new external dependency.
+
+**Fixed — clippy zero-out:** ran `cargo clippy --fix` across the `src/bin/*.rs` utility
+scripts that had carried known pre-existing warnings all session (left alone earlier as
+low-priority): `pgn_to_jsonl.rs` (1), `lichess_to_jsonl.rs` (5, two passes — the second
+`--no-deps` pass caught 2 the first missed), `hugm_harness.rs` (1 auto-fixed
+`needless_borrows_for_generic_args`; 2 `needless_range_loop` warnings fixed by hand since
+clippy's own suggested rewrite was syntactically malformed — `names[2..k].iter()` /
+`beta[2..k].iter()` instead of indexing). The same `--fix` run also swept up the lib's
+remaining two known pre-existing warnings for free (`coach_derive_cmd.rs`'s two
+redundant `as i64` casts, `position.rs`'s redundant `.into()` calls and a `pawn_safe =
+pawn_safe & !...` → `&=` simplification — one auto-fix left mis-indented code in
+`piece_activity_score`'s rook-on-sixth branch, reformatted by hand) plus a
+`concepts.rs::rank_and_annotate`'s `sort_by` → `sort_by_key(Reverse(...))` simplification
+found along the way. **`cargo clippy --all-targets` now reports zero warnings across the
+entire crate** — every warning documented as "pre-existing, left alone" in every prior
+entry in this file is now gone.
+
+**Fixed — the previously-deferred `compute_baselines`/`detect_anomalies` duplication:**
+both functions independently replayed the identical `(player, game_id)`-keyed
+`prev_score`/`prev_eval_arr` bookkeeping to compute the same per-row hugm_score delta and
+eval-component deltas. Extracted `compute_row_deltas(rows, states) -> Vec<RowDelta>` (one
+pass, shared by both) — `RowDelta` carries the player/game_id/ply, the row's
+`StateVector`, the overall delta/signed_delta, and a `component_deltas: Vec<(name,
+abs_delta, signed_delta)>` list (empty on a game's first row for that player). Preserved
+one small pre-existing inconsistency deliberately rather than picking a side silently:
+`compute_baselines` used to default `phase_bucket` to `1` if `states` were shorter than
+`rows`, while `detect_anomalies` indexed `&states[i]` directly (would panic on the same
+mismatch) — both paths are unreachable in the one real caller (`DeriveCoachSignals::run`
+always builds `states` via `encode_move_states(&rows)`, guaranteeing equal length), so
+unified to a single defensive `states.get(i).copied().unwrap_or_default()` (phase
+defaults to `0`, not panicking) — strictly safer than the previous direct-index panic
+path, and the `1` vs. `0` default divergence is noted here since it's the one observable
+(if practically unreachable) behavior difference from before. Added a new regression
+test, `eval_component_deltas_feed_baselines_and_anomalies` — the component-delta path
+had **zero existing test coverage** before this pass (the `move_record` test helper
+always set `eval_arr: None`), so this was verified correct from first principles, not
+just "tests still pass."
+
+**Docs:**
+- `README.md`'s "Plugin Commands" table was missing 3 of the crate's 8 registered
+  commands (`pgn-to-fens`, `canonicalize-fen`, `nnue-eval`) — added.
+- Deleted `nnue.md` (confirmed with the user first): fully superseded by this file's own
+  "2026-05-13 Decision" entry above, which already states the bullet-training pipeline
+  and `position_encoder.rs` were removed 2026-07-30 and that this file (`NNUE_AUDIT.md`)
+  is where the history lives if that work is ever revived. `nnue.md` described a
+  `nuchessdb/nuchessdb.nu` entrypoint and `nnue_dataset_builder`/`dataset_builder_cmd`
+  files that no longer exist anywhere in the repo — actively misleading, not merely
+  outdated.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (39 tests, up from 38 —
+1 new test for the previously-uncovered eval-component-delta path); `cargo clippy
+--all-targets` reports **zero warnings** crate-wide (down from the ~15 documented as
+pre-existing/left-alone throughout this file); STS smoke test (1499-position corpus)
+passes.

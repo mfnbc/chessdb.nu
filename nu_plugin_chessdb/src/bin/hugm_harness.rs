@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     let reader = BufReader::new(input);
     let mut wtr = csv::Writer::from_path(output_path)?;
 
-    wtr.write_record(&[
+    wtr.write_record([
         "id", "fen", "phase",
         "hugm_raw", "engine_score",
         "material_total", "positional_total", "tactical_total",
@@ -223,7 +223,7 @@ fn phase_grouped_regression(rows: &[RegressionRow]) {
     ];
     println!("\n=== Phase-grouped OLS ===");
     print!("{:>16} {:>4}", "group", "n");
-    for i in 2..k { print!(" {:>9}", names[i]); }
+    for name in &names[2..k] { print!(" {:>9}", name); }
     println!(" {:>9} {:>6}", "phase", "R^2");
     for (lo,hi,label) in &groups {
         let subset: Vec<&RegressionRow> = rows.iter().filter(|r| r.phase>=*lo && r.phase<=*hi).collect();
@@ -237,7 +237,7 @@ fn phase_grouped_regression(rows: &[RegressionRow]) {
         let beta=solve_ridge(&xtx,&xty,k,0.0);
         let r2=compute_r2_vec(&subset,&beta);
         print!("  {:>16} {:>4}", label, subset.len());
-        for i in 2..k { print!(" {:>9.4}", beta[i]); }
+        for b in &beta[2..k] { print!(" {:>9.4}", b); }
         println!(" {:>9.4} {:>6.4}", beta[1], r2);
     }
 }

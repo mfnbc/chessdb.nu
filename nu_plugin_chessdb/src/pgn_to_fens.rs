@@ -2,6 +2,7 @@ use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Record, Signature, Type, Value};
 
 use crate::core::{pgn_to_batch_record, pgn_to_fens, BatchSummary, MoveRow};
+use crate::utils::map_string_or_list;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -169,24 +170,8 @@ impl PluginCommand for PgnToBatch {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let input_value = input.into_value(call.head)?;
-        let span = call.head;
-
-        match input_value {
-            Value::String { val, .. } => {
-                let batch = pgn_to_batch_record(&val, span)?;
-                Ok(PipelineData::Value(batch_record_value(batch, span), None))
-            }
-            Value::List { vals, .. } => {
-                let mut recs: Vec<Value> = Vec::new();
-                for v in vals {
-                    let s = v.as_str()?;
-                    let batch = pgn_to_batch_record(s, span)?;
-                    recs.push(batch_record_value(batch, span));
-                }
-                Ok(PipelineData::Value(Value::list(recs, span), None))
-            }
-            _ => Err(LabeledError::new("Expected string or list of strings").with_label("invalid input", call.head)),
-        }
+        map_string_or_list(input, call.head, |pgn, span| {
+            Ok(batch_record_value(pgn_to_batch_record(pgn, span)?, span))
+        })
     }
 }

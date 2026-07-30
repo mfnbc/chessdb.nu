@@ -2,6 +2,7 @@ use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, Type, Value};
 
 use crate::core::zobrist;
+use crate::utils::map_string_or_list;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -39,26 +40,8 @@ impl PluginCommand for Zobrist {
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
         let as_int = call.has_flag("int")?;
-        let input_value = input.into_value(call.head)?;
-
-        match input_value {
-            Value::String { val, .. } => {
-                // Single FEN string
-                let result = zobrist(&val, as_int, call.head)?;
-                Ok(PipelineData::Value(Value::string(result, call.head), None))
-            }
-            Value::List { vals, .. } => {
-                // List of FEN strings
-                let mut results = Vec::with_capacity(vals.len());
-                for val in vals {
-                    let fen_str = val.as_str()?;
-                    let hash = zobrist(fen_str, as_int, call.head)?;
-                    results.push(Value::string(hash, call.head));
-                }
-                Ok(PipelineData::Value(Value::list(results, call.head), None))
-            }
-            _ => Err(LabeledError::new("Expected string or list of strings")
-                .with_label("invalid input type", call.head)),
-        }
+        map_string_or_list(input, call.head, |fen, span| {
+            Ok(Value::string(zobrist(fen, as_int, span)?, span))
+        })
     }
 }

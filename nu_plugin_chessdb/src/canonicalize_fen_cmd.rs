@@ -2,6 +2,7 @@ use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, Type, Value};
 
 use crate::core::canonicalize_fen;
+use crate::utils::map_string_or_list;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -37,24 +38,8 @@ impl PluginCommand for CanonicalizeFen {
         call: &EvaluatedCall,
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
-        let input_value = input.into_value(call.head)?;
-
-        match input_value {
-            Value::String { val, .. } => {
-                let result = canonicalize_fen(&val, call.head)?;
-                Ok(PipelineData::Value(Value::string(result, call.head), None))
-            }
-            Value::List { vals, .. } => {
-                let mut results = Vec::with_capacity(vals.len());
-                for val in vals {
-                    let fen_str = val.as_str()?;
-                    let canonical = canonicalize_fen(fen_str, call.head)?;
-                    results.push(Value::string(canonical, call.head));
-                }
-                Ok(PipelineData::Value(Value::list(results, call.head), None))
-            }
-            _ => Err(LabeledError::new("Expected string or list of strings")
-                .with_label("invalid input type", call.head)),
-        }
+        map_string_or_list(input, call.head, |fen, span| {
+            Ok(Value::string(canonicalize_fen(fen, span)?, span))
+        })
     }
 }

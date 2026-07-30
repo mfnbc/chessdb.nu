@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
-use crate::core::pgn_to_fens;
+use crate::core::{initial_position, pgn_to_fens};
 use crate::eval::analyze_fen_with_engine_score;
 use crate::game_parse::parse_game;
 
@@ -76,6 +76,7 @@ impl PluginCommand for ProcessCorpus {
         // Phase 1: collect FENs during game parsing (no evaluation yet)
         let mut fens_to_eval: Vec<FenToEval> = Vec::new();
         let mut unique_positions = HashSet::new();
+        let (initial_fen, initial_zobrist) = initial_position();
 
         let username: Option<String> = call.get_flag("username")?;
         for g in games_array {
@@ -83,14 +84,13 @@ impl PluginCommand for ProcessCorpus {
 
             if let Some(pgn) = &parsed.pgn {
                 if let Ok(move_rows) = pgn_to_fens(pgn, span) {
-                    let initial_zobrist = "463b96181691fc9c".to_string();
                     if unique_positions.insert(initial_zobrist.clone()) {
                         fens_to_eval.push(FenToEval {
                             zobrist: initial_zobrist.clone(),
-                            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+                            fen: initial_fen.clone(),
                         });
                     }
-                    let mut prev_zobrist: Option<String> = Some(initial_zobrist);
+                    let mut prev_zobrist: Option<String> = Some(initial_zobrist.clone());
 
                     for m_row in move_rows {
                         let z_hex = m_row.zobrist.clone();

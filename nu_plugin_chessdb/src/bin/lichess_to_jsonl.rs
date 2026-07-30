@@ -47,8 +47,8 @@ fn main() -> anyhow::Result<()> {
 
         // Build PGN header + moves with numbering
         let mut pgn = String::new();
-        pgn.push_str(&format!("[Event \"lichess.org\"]\n"));
-        pgn.push_str(&format!("[Site \"lichess.org\"]\n"));
+        pgn.push_str("[Event \"lichess.org\"]\n");
+        pgn.push_str("[Site \"lichess.org\"]\n");
         pgn.push_str(&format!("[Date \"{}\"]\n", date));
         pgn.push_str(&format!("[White \"{}\"]\n", white));
         pgn.push_str(&format!("[Black \"{}\"]\n", black));
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
         pgn.push_str(&format!("[WhiteElo \"{}\"]\n", white_rating));
         pgn.push_str(&format!("[BlackElo \"{}\"]\n", black_rating));
         pgn.push_str(&format!("[Annotator \"{}\"]\n", id));
-        pgn.push_str("\n");
+        pgn.push('\n');
 
         // Turn moves into numbered SAN list
         let tokens: Vec<&str> = moves.split_whitespace().collect();
@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
             if i+1 < tokens.len() {
                 mv_text.push_str(&format!(" {} ", tokens[i+1]));
             } else {
-                mv_text.push_str(" ");
+                mv_text.push(' ');
             }
             i += 2;
         }
@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     let mut out = File::create(output)?;
     for pos in batch.positions {
         let rec = serde_json::json!({"fen": pos.fen, "game_index": pos.game_index, "ply": pos.ply});
-        writeln!(out, "{}", rec.to_string())?;
+        writeln!(out, "{}", rec)?;
     }
 
     Ok(())

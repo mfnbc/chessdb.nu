@@ -40,12 +40,20 @@ impl PluginCommand for NnueEval {
         let span = call.head;
         let input_value = input.into_value(span)?;
 
-        let fens: Vec<String> = match input_value {
-            Value::String { val, .. } => vec![val],
-            Value::List { vals, .. } => vals
-                .iter()
-                .filter_map(|v| v.as_str().ok().map(|s| s.to_string()))
-                .collect(),
+        // `single` tracks the input's own shape (String vs. List), not the
+        // element count — a one-element list must still come back as a
+        // one-element list, matching the declared List-in/List-out
+        // signature and every sibling command's convention, not collapse
+        // to a bare record the way a single-FEN string does.
+        let (fens, single): (Vec<String>, bool) = match input_value {
+            Value::String { val, .. } => (vec![val], true),
+            Value::List { vals, .. } => {
+                let mut out = Vec::with_capacity(vals.len());
+                for v in vals {
+                    out.push(v.as_str()?.to_string());
+                }
+                (out, false)
+            }
             _ => {
                 return Err(LabeledError::new("Expected a FEN string or list of FEN strings")
                     .with_label("invalid input type", span))
@@ -70,7 +78,7 @@ impl PluginCommand for NnueEval {
             results.push(Value::record(record, span));
         }
 
-        if results.len() == 1 {
+        if single {
             Ok(PipelineData::Value(results.remove(0), None))
         } else {
             Ok(PipelineData::Value(Value::list(results, span), None))
