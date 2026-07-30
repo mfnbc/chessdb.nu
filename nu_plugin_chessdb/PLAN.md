@@ -1117,3 +1117,95 @@ RESOLVED (continued):
   FEN will be canonical (always "w" to move), which would make bulletformat's internal flip a
   permanent no-op. Re-verify the score/result labeling once this pipeline is unpaused and fed
   from the database rather than an ad hoc external source.
+
+- BUG-15: FIXED (2026-07-30) — `hugm_score`/`hugm_eval_arr`'s sign convention drifted out from
+  under several consumers that pre-date (or were never updated for) board normalization.
+  Found during a service-definition/YAGNI audit ("is chess-review/chess-profile-position fit
+  for purpose"), verified empirically (Rust-level tests constructing real positions, not just
+  derived on paper) before touching anything, per this session's standing discipline.
+
+  **The convention, precisely**: `positions.hugm_score` / each `hugm_eval_arr` component is
+  `final_score` = `sum_groups(&groups)` computed on the *normalized* (White-always-to-move)
+  position — i.e. relative to whoever is actually to move *at that stored position*. Since a
+  `moves` row's position (`next_position_id`) is reached *after* `m.color`'s move, whoever is
+  to move there is `m.color`'s opponent, not `m.color` itself. So a row's own mover's
+  perspective is always `-hugm_score`, unconditionally — never `m.color`-conditional (chess's
+  turn alternation makes "the position after my move has my opponent to move" true regardless
+  of which color I am).
+
+  Three sites assumed the older, no-longer-true convention (`hugm_score` = real-White-absolute,
+  flip only for Black) instead:
+  1. **`chessdb/profile.nu`**: `profile-phase-stats`'s `avg_score_cp` and
+     `position-eval-components`'s `avg_king_safety_cp` used
+     `CASE WHEN m.color='white' THEN X ELSE -X END` — the `black` branch happened to already be
+     correct by coincidence (its negation is what the true convention needs *regardless* of
+     color), so only White-mover rows were wrong. `avg_pawns_cp`/`avg_activity_cp` had *no*
+     negation at all — wrong for every row, both colors. Fixed by replacing all of these with a
+     plain, unconditional `-p.hugm_score` / `-json_extract(...)` — the color CASE was never
+     actually doing anything a constant negation didn't already cover.
+  2. **`chessdb/sync.nu`**'s `review-game`: same White-branch-wrong CASE for the displayed
+     `score` column, plus a second, distinct bug in the Δ-component columns — `arr` (this row's
+     position) and `prev_arr` (the position before this move) are relative to *opposite* sides
+     (whoever's to move differs by exactly one ply), so `arr - prev_arr` was subtracting two
+     numbers in different reference frames. The correct per-component swing from the mover's
+     own perspective is `-(arr + prev_arr)`, not `arr - prev_arr` times a color sign. Fixed both.
+  3. **`coach_derive_cmd.rs`**'s `detect_anomalies` (Rust): `hurt_player` — the flag behind
+     `profile-concepts`' `hurt_rate`, the headline "what hurts this player" signal — had the
+     identical White-branch-wrong pattern (`row.color=='white' && signed_delta<0`, `'black' &&
+     signed_delta>0`). Here `signed_delta = curr - prev` compares a *single player's own* two
+     consecutive rows (same color both times, so both relative to the same opponent) — a valid
+     apples-to-apples subtraction, unlike (2) — so the fix is simpler: `hurt_player = signed_delta
+     > 0` unconditionally (same collapse-the-CASE-into-a-constant pattern as (1)). This was the
+     most consequential of the three: for every White-playing profiled user, every concept's
+     `hurt_rate` was measuring "how often did this concept coincide with the player *improving*,"
+     not being hurt — backwards, in the one number the whole coaching product is built to answer.
+     `MoveRecord.color` became entirely unused after this fix (it was the only reader) — removed
+     the field along with its parsing rather than leave known-dead struct data around.
+
+  Verified: added `hurt_player_is_positive_signed_delta_regardless_of_color`
+  (`coach_derive_cmd.rs`), which hand-supplies a baseline (bypassing Welford noise from tiny
+  synthetic samples) so a real anomaly clears the z-score gate for both a White-mover and a
+  Black-mover player, asserting both come back `hurt_player=true`. Confirmed the test actually
+  catches the bug — not a tautology — by temporarily reintroducing the old color-conditional
+  logic and watching it fail before restoring the fix. Full suite green throughout (37→38 tests),
+  `cargo clippy --all-targets` clean. The `chessdb/*.nu` side of the fix (profile.nu/sync.nu)
+  isn't independently unit-testable without the plugin registered (this sandbox's Nu 0.114 vs.
+  the plugin's target 0.111, same known limitation as earlier canonical-identity work) — verified
+  by direct algebraic/empirical derivation of the correct formula instead, the same rigor applied
+  to (3).
+
+  **Not yet done**: any `move_anomalies`/`player_baselines` rows already stored in an existing
+  database were computed under the old, wrong `hurt_player` convention for White-playing users.
+  This needs a `chess-derive` re-run per affected player once this ships (a normal, "safe to
+  re-run" chess-derive refresh — not a full chess-sync rebuild, since `positions`/`moves`
+  identity itself didn't change, only a downstream derived signal).
+
+Top-down YAGNI / fit-for-purpose audit (2026-07-30)
+
+Ran against a from-first-principles service definition (grounded in `chessdb/mod.nu`'s actual
+export surface + `ai/mod.nu`'s tool registrations, not invented): chessdb.nu ingests any number
+of players' chess.com games into a local SQLite file, evaluates positions with HUGM, and derives
+per-player coaching signals so an LLM/human coach can have an evidence-grounded conversation —
+via Nushell + `ai.nu` tool registration only, no web server/HTTP/GUI (architecturally, not just
+currently). Findings, not yet acted on except BUG-15 above (fixed as its own item):
+
+- Dead code, clear deletion candidates: `chessdb scan-pgn`/`ScanVisitor`/`core::scan_pgn` (zero
+  callers anywhere, already known to hash non-canonically); `core::legal_moves` (zero callers).
+- Initially misjudged as YAGNI, corrected after reading `NNUE_AUDIT.md`: `nnue-eval`,
+  `hugm_harness`, `lichess_to_jsonl`/`pgn_to_jsonl` are a live, intentional dev-time HUGM
+  calibration workflow (Stockfish ground truth → regress HUGM's own weights), not dead NNUE-
+  training weight — legitimate to be unreachable from `chessdb/*.nu`, the same way a test
+  harness doesn't need to be reachable from the product. `dataset_builder_cmd.rs` (bulletformat/
+  NPZ shards for training an actual replacement net) genuinely is paused per NNUE_AUDIT.md, with
+  the sign-convention risk noted in BUG-12 above if it's ever revived reading from `positions`.
+  User decision needed: delete, or keep as an explicitly-quarantined placeholder.
+  - Low-cost, technically-unreachable-from-the-interface utilities (`zobrist`, `pgn-to-fens`,
+    `pgn-to-batch`): legitimate manual/debug tools, thin wrappers around functions already used
+    internally — "reachable from the product interface" is the wrong bar for a debug utility.
+  - `ai/mod.nu`'s `chess-analyst` system prompt hand-documents the schema and is stale: claims
+    `moves.clock_seconds`/`positions.nnue_score`/`.eval_depth` (don't exist), missing
+    `moves.canonical_san` (does exist). Duplicates `chess_db_schema` (a tool in the same file
+    that could just be relied on live) — same "two sources of truth" problem CLAUDE.md already
+    flags for the terms-bag pattern. Its score-convention line was also stale relative to BUG-15.
+  - `hugm-eval` (evaluate an arbitrary hypothetical FEN) fits the coaching-conversation purpose
+    but isn't exposed as an `ai.nu` tool — minor gap, not a defect.

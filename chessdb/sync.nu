@@ -67,19 +67,27 @@ def review-game [game_id: int, db: string] {
         ORDER BY m.ply ASC
     " --params [$game_id])
 
+    # p.hugm_score / p.hugm_eval_arr for a stored position are relative to
+    # whoever is actually to move THERE — i.e. the opponent of the color that
+    # just played to reach it (m.color). So a row's own mover's perspective is
+    # always the *negation* of its stored value, never m.color-conditional;
+    # and since `arr` (this row's position) and `prev_arr` (the position
+    # before this move, already relative to this row's own mover) are
+    # relative to opposite sides, the per-component swing from the mover's
+    # own perspective is -(arr + prev_arr), not arr - prev_arr. See
+    # PLAN.md's "hugm_score/hugm_eval_arr sign bug" entry.
     $raw | enumerate | each { |item|
         let row      = $item.item
         let prev_arr = if $item.index == 0 { [0 0 0 0 0 0 0 0 0 0 0] } else {
             try { ($raw | get ($item.index - 1)).hugm_eval_arr | from json } catch { [0 0 0 0 0 0 0 0 0 0 0] }
         }
         let arr  = try { $row.hugm_eval_arr | from json } catch { $prev_arr }
-        let sign = match $row.color { "black" => -1, _ => 1 }
-        let d    = ($arr | zip $prev_arr | each { |p| ($p.0 - $p.1) * $sign })
+        let d    = ($arr | zip $prev_arr | each { |p| ($p.0 + $p.1) * -1 })
         {
             "#":         $row.move_number
             color:       $row.color
             move:        $row.san
-            score:       ($row.hugm_score * $sign)
+            score:       ($row.hugm_score * -1)
             Δ_material:  ($d | get 0)
             Δ_structure: ($d | get 1)
             Δ_activity:  ($d | get 2)

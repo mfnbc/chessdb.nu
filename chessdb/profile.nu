@@ -49,7 +49,11 @@ def "profile-phase-stats" [username: string --db: string = "./chess.db"] {
                  WHEN m.ply <= 50 THEN 'late_mid'
                  ELSE 'endgame' END as phase,
             COUNT(*) as n,
-            ROUND(AVG(CASE WHEN m.color='white' THEN p.hugm_score ELSE -p.hugm_score END), 0) as avg_score_cp,
+            -- p.hugm_score is relative to whoever is to move AT p (the
+            -- opponent of m.color, since m.color just moved to reach p), so
+            -- the mover's own perspective is always -p.hugm_score — never
+            -- m.color-conditional. See PLAN.md's hugm_score sign bug entry.
+            ROUND(AVG(-p.hugm_score), 0) as avg_score_cp,
             ROUND(AVG(ABS(p.hugm_score)), 0) as avg_abs_material
         FROM moves m
         JOIN positions p ON m.next_position_id = p.zobrist
@@ -315,12 +319,13 @@ def "position-eval-components" [username: string --db: string = "./chess.db"] {
                  WHEN m.ply <= 50 THEN 'late_mid'
                  ELSE 'endgame' END as phase_label,
             COUNT(*) as n,
-            ROUND(AVG(CAST(json_extract(p.hugm_eval_arr, '\$[1]') AS REAL)), 1) as avg_pawns_cp,
-            ROUND(AVG(CAST(json_extract(p.hugm_eval_arr, '\$[2]') AS REAL)), 1) as avg_activity_cp,
-            ROUND(AVG(CAST(
-                CASE WHEN m.color = 'white' THEN  json_extract(p.hugm_eval_arr, '\$[3]')
-                     ELSE                        -json_extract(p.hugm_eval_arr, '\$[3]') END
-            AS REAL)), 1) as avg_king_safety_cp
+            -- Each hugm_eval_arr component is relative to whoever is to move
+            -- AT p (the opponent of m.color), so the mover's own perspective
+            -- is always the negation — never m.color-conditional. See
+            -- PLAN.md's hugm_score/hugm_eval_arr sign bug entry.
+            ROUND(AVG(-CAST(json_extract(p.hugm_eval_arr, '\$[1]') AS REAL)), 1) as avg_pawns_cp,
+            ROUND(AVG(-CAST(json_extract(p.hugm_eval_arr, '\$[2]') AS REAL)), 1) as avg_activity_cp,
+            ROUND(AVG(-CAST(json_extract(p.hugm_eval_arr, '\$[3]') AS REAL)), 1) as avg_king_safety_cp
         FROM moves m
         JOIN positions p ON m.next_position_id = p.zobrist
         JOIN games g ON m.game_id = g.game_id

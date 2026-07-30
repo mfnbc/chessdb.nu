@@ -48,7 +48,7 @@ impl PluginCommand for DeriveCoachSignals {
     }
 }
 
-struct MoveRecord { game_id: String, ply: i64, fen: String, hugm_score: i64, player: String, color: String, state_id: Option<u16>, eval_arr: Option<Vec<i64>> }
+struct MoveRecord { game_id: String, ply: i64, fen: String, hugm_score: i64, player: String, state_id: Option<u16>, eval_arr: Option<Vec<i64>> }
 
 fn parse_move_record(v: &Value) -> Option<MoveRecord> {
     let rec = v.as_record().ok()?;
@@ -56,7 +56,6 @@ fn parse_move_record(v: &Value) -> Option<MoveRecord> {
         .and_then(|v| v.as_int().ok())
         .unwrap_or(0) as i64;
     let player = rec.get("player").and_then(|v| v.as_str().ok()).unwrap_or("unknown").to_string();
-    let color = rec.get("color").and_then(|v| v.as_str().ok()).unwrap_or("unknown").to_string();
     let state_id = rec.get("state_id").and_then(|v| v.as_int().ok()).map(|x| x as u16);
     let eval_arr = rec.get("hugm_eval_arr")
         .and_then(|v| v.as_str().ok())
@@ -67,7 +66,6 @@ fn parse_move_record(v: &Value) -> Option<MoveRecord> {
         fen: rec.get("fen")?.as_str().ok()?.to_string(),
         hugm_score,
         player,
-        color,
         state_id,
         eval_arr,
     })
@@ -233,8 +231,14 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
                 if let Some((mean, std)) = baselines.get(&key) {
                     let z = (delta - mean) / std;
                     if z > 2.0 {
-                        let hurt_player = (row.color == "white" && signed_delta < 0)
-                            || (row.color == "black" && signed_delta > 0);
+                        // signed_delta compares this player's own hugm_score
+                        // across two of their own consecutive moves, so both
+                        // terms are relative to the same side: their
+                        // opponent (whoever is to move right after this
+                        // player's move). A positive signed_delta always
+                        // means the opponent's advantage grew — this player
+                        // was hurt — regardless of which color they are.
+                        let hurt_player = signed_delta > 0;
                         results.push(make_anomaly(&row.player, &row.game_id, row.ply, state_id, concept, z, delta, signed_delta as f64, hurt_player, span));
                     }
                 }
@@ -255,8 +259,11 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
                         if let Some((mean, std)) = baselines.get(&key) {
                             let z = (comp_delta - mean) / std;
                             if z > 2.0 {
-                                let hurt_player = (row.color == "white" && comp_signed < 0.0)
-                                    || (row.color == "black" && comp_signed > 0.0);
+                                // Same reasoning as signed_delta above: both
+                                // terms are this player's own consecutive
+                                // rows, so comp_signed > 0 always means the
+                                // opponent's component-level advantage grew.
+                                let hurt_player = comp_signed > 0.0;
                                 results.push(make_anomaly(&row.player, &row.game_id, row.ply, state_id, name, z, comp_delta, comp_signed, hurt_player, span));
                             }
                         }
@@ -375,5 +382,60 @@ mod tests {
         assert_eq!(fast.has_passed_pawn, slow.has_passed_pawn);
         assert_eq!(fast.has_skewer, slow.has_skewer);
         assert_eq!(fast.has_discovered, slow.has_discovered);
+    }
+
+    fn move_record(player: &str, game_id: &str, ply: i64, hugm_score: i64) -> MoveRecord {
+        MoveRecord {
+            game_id: game_id.to_string(),
+            ply,
+            fen: String::new(),
+            hugm_score,
+            player: player.to_string(),
+            state_id: Some(0),
+            eval_arr: None,
+        }
+    }
+
+    // Regression for a real sign bug (found 2026-07-30 auditing chess-profile
+    // output): hugm_score, for a player's own consecutive moves, is always
+    // relative to their *opponent* (whoever is to move right after this
+    // player's move) — so `signed_delta = curr - prev` across two of a
+    // player's own rows always means "how much did my opponent's advantage
+    // change," regardless of which color the player is. hurt_player must
+    // therefore be `signed_delta > 0` unconditionally; a color-conditional
+    // version (as the code used to have) gets one color backwards.
+    #[test]
+    fn hurt_player_is_positive_signed_delta_regardless_of_color() {
+        // Bypass compute_baselines (Welford stats over tiny hand-built
+        // samples are fragile to get right) and hand-supply a tight
+        // baseline (mean=0, std=1) directly, so any real swing clears the
+        // z > 2.0 gate — isolates exactly the hurt_player sign logic in
+        // detect_anomalies.
+        let mut baselines = HashMap::new();
+        baselines.insert(("white_player".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0));
+        baselines.insert(("black_player".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0));
+
+        let rows = vec![
+            // White's own two consecutive moves: hugm_score is Black-relative
+            // both times, so signed_delta = 500 - 0 means Black's advantage
+            // grew by 500 — white_player was hurt.
+            move_record("white_player", "g1", 0, 0),
+            move_record("white_player", "g1", 2, 500),
+            // Black's own two consecutive moves: hugm_score is White-relative
+            // both times, so signed_delta = 500 - 0 means White's advantage
+            // grew by 500 — black_player was hurt.
+            move_record("black_player", "g2", 1, 0),
+            move_record("black_player", "g2", 3, 500),
+        ];
+        let states = vec![StateVector::default(); rows.len()];
+        let anomalies = detect_anomalies(&rows, &states, &baselines, 0, nu_protocol::Span::test_data());
+
+        assert_eq!(anomalies.len(), 2, "expected exactly one hugm_delta anomaly per player, got {anomalies:?}");
+        for a in &anomalies {
+            let rec = a.as_record().unwrap();
+            let player = rec.get("player").unwrap().as_str().unwrap();
+            let hurt = rec.get("hurt_player").unwrap().as_bool().unwrap();
+            assert!(hurt, "player {player} should be flagged as hurt_player=true (their opponent's advantage grew by 500), got false");
+        }
     }
 }
