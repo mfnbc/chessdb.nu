@@ -551,5 +551,29 @@ RESOLVED:
 - BUG-10: FIXED (2026-07-28) — `detect_discovered` had no defended/material-significance check,
   so it flagged 3 false-positive "discovered attacks" per side on the plain starting position.
   Fixed in `position.rs::detect_discovered`; regression test in `motif_canonical.rs`.
+- BUG-11: FIXED (2026-07-29) — `process_corpus.rs` / `nnue_eval_cmd.rs` module-boundary bleed.
+  Extracted chess.com/lichess game parsing (ECO/opening scraping, 4-format timestamp
+  normalization, result-relative-to-username logic) into `src/game_parse.rs::parse_game`
+  — 14 new unit tests, including one pinning down a subtle pre-existing behavior (a
+  present-but-invalid `end_time` commits to "unknown" rather than falling through to
+  `lastMoveAt`/`createdAt`; preserved, not fixed, since that wasn't this task's job).
+  Extracted the raw UCI/Stockfish handshake into `src/stockfish.rs::StockfishEngine`
+  (spawn/handshake/`eval_fen`, `Drop` sends `quit`) — 4 new unit tests for eval-line
+  parsing that had zero coverage before (buried inside `PluginCommand::run`). Both
+  commands' `run()` now just parse input, call the extracted logic, and build `Value`s
+  — actual wiring, not business logic. Verified beyond compiling: ran a realistic
+  chess.com-style game object through `parse_game` directly and confirmed every field
+  (game_id, source, result-relative-to-username, played_at, eco/opening) matched
+  expectations; full test suite 20→34 passing.
 
-OPEN: none currently tracked.
+OPEN:
+- BUG-12: `dataset_builder_cmd.rs`'s two divergent label-computation paths —
+  `run()` computes a side-relative WDL/scalar label from `result`
+  (`labels_buf`/`wdl_buf`, lines ~140-148) but passes them into `write_shard`
+  as `_features`/`_labels`/`_wdl`/`_weights` — all underscore-prefixed,
+  unused. `write_shard` instead re-derives an absolute (non-side-relative)
+  score/result_float from the raw `result` string itself (lines ~199-208).
+  Only one of the two label computations is actually written to disk; the
+  other is dead work. Lower priority — the dataset-builder/training pipeline
+  is already paused per `NNUE_AUDIT.md` ("Full NNUE training is deferred").
+  Not yet fixed.
