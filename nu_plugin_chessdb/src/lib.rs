@@ -6,7 +6,6 @@ pub mod core;
 pub mod hugm_eval_cmd;
 pub mod eval;
 pub mod pgn_to_fens;
-pub mod position_encoder;
 pub mod process_corpus;
 pub mod game_parse;
 pub mod nnue_eval_cmd;

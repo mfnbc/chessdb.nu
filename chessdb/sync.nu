@@ -15,7 +15,7 @@ def import-records [games: list, username: string, db: string] {
     }
     if ($corpus.positions | is-not-empty) {
         db-merge $db "positions" $corpus.positions [
-            "zobrist" "fen" "hugm_score" "hugm_eval_arr" "board_pieces"
+            "zobrist" "fen" "hugm_score" "hugm_eval_arr"
             "state_id" "mate_in_1" "is_checkmate"
         ]
     }

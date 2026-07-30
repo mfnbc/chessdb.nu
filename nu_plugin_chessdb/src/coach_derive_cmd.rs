@@ -136,7 +136,7 @@ impl Welford {
     }
 }
 
-fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(String, u8, String), (f64, f64)> {
+fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(String, u8, String), (f64, f64, i64)> {
     let mut prev_score: HashMap<(String, String), i64> = HashMap::new();
     let mut prev_eval_arr: HashMap<(String, String), Vec<i64>> = HashMap::new();
     let mut baselines: HashMap<(String, u8, String), Welford> = HashMap::new();
@@ -190,11 +190,10 @@ fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(St
             prev_eval_arr.insert(game_key.clone(), arr.clone());
         }
     }
-    baselines.into_iter().map(|((p, ph, cn), w)| ((p, ph, cn), (w.mean, w.std_dev()))).collect()
+    baselines.into_iter().map(|((p, ph, cn), w)| ((p, ph, cn), (w.mean, w.std_dev(), w.count as i64))).collect()
 }
 
-fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &HashMap<(String, u8, String), (f64, f64)>, min_games: i64, span: nu_protocol::Span) -> Vec<Value> {
-    let _ = min_games;
+fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &HashMap<(String, u8, String), (f64, f64, i64)>, min_games: i64, span: nu_protocol::Span) -> Vec<Value> {
     let mut prev_score: HashMap<(String, String), i64> = HashMap::new();
     let mut prev_eval_arr: HashMap<(String, String), Vec<i64>> = HashMap::new();
     let mut results = Vec::new();
@@ -228,7 +227,12 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
             for (concept, should_check) in &check_concepts {
                 if !should_check { continue; }
                 let key = (row.player.clone(), phase_bucket, concept.to_string());
-                if let Some((mean, std)) = baselines.get(&key) {
+                if let Some((mean, std, count)) = baselines.get(&key) {
+                    // Don't trust a baseline built from too few samples —
+                    // this is the entire point of --min-games: a Welford
+                    // mean/std from a handful of games is noisy enough that
+                    // its z-scores aren't meaningful yet.
+                    if *count < min_games { continue; }
                     let z = (delta - mean) / std;
                     if z > 2.0 {
                         // signed_delta compares this player's own hugm_score
@@ -256,7 +260,8 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
                     let comp_signed = (curr - prv) as f64;
                     if comp_delta >= 30.0 {
                         let key = (row.player.clone(), phase_bucket, name.to_string());
-                        if let Some((mean, std)) = baselines.get(&key) {
+                        if let Some((mean, std, count)) = baselines.get(&key) {
+                            if *count < min_games { continue; }
                             let z = (comp_delta - mean) / std;
                             if z > 2.0 {
                                 // Same reasoning as signed_delta above: both
@@ -292,7 +297,7 @@ fn make_anomaly(player: &str, game_id: &str, ply: i64, state_id: i64, concept: &
     }, span)
 }
 
-fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], _min_games: i64, span: nu_protocol::Span) -> (Vec<Value>, Vec<Value>) {
+fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], min_games: i64, span: nu_protocol::Span) -> (Vec<Value>, Vec<Value>) {
     let mut transitions: HashMap<(i64, i64), (i64, i64)> = HashMap::new(); // (state_from, state_to) → (total, blunders)
     let mut prev: Option<(String, i64, i64)> = None; // (game_id, state_id, score)
 
@@ -322,7 +327,7 @@ fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], _min_games: 
             "blunder_risk" => Value::float(risk, span),
         }, span));
 
-        if risk > 0.25 && *total >= 3 {
+        if risk > 0.25 && *total >= min_games {
             trans_anomalies.push(Value::record(nu_protocol::record! {
                 "state_from" => Value::int(*from, span),
                 "state_to" => Value::int(*to, span),
@@ -337,17 +342,18 @@ fn compute_transitions(rows: &[MoveRecord], states: &[StateVector], _min_games: 
     (trans_list, trans_anomalies)
 }
 
-fn format_results(rows: &[MoveRecord], states: &[StateVector], baselines: &HashMap<(String, u8, String), (f64, f64)>, span: nu_protocol::Span) -> (Value, Value) {
+fn format_results(rows: &[MoveRecord], states: &[StateVector], baselines: &HashMap<(String, u8, String), (f64, f64, i64)>, span: nu_protocol::Span) -> (Value, Value) {
     let states_out: Vec<Value> = rows.iter().zip(states.iter())
         .map(|(row, state)| state_vector_to_value(&row.game_id, row.ply, state, span))
         .collect();
-    let bl: Vec<Value> = baselines.iter().map(|((player, ph, cn), (mean, std))| {
+    let bl: Vec<Value> = baselines.iter().map(|((player, ph, cn), (mean, std, count))| {
         Value::record(nu_protocol::record! {
             "player" => Value::string(player, span),
             "phase_bucket" => Value::int(*ph as i64, span),
             "concept" => Value::string(cn, span),
             "mean" => Value::float(*mean, span),
             "std" => Value::float(*std, span),
+            "count" => Value::int(*count, span),
         }, span)
     }).collect();
     (Value::list(states_out, span), Value::list(bl, span))
@@ -408,12 +414,12 @@ mod tests {
     fn hurt_player_is_positive_signed_delta_regardless_of_color() {
         // Bypass compute_baselines (Welford stats over tiny hand-built
         // samples are fragile to get right) and hand-supply a tight
-        // baseline (mean=0, std=1) directly, so any real swing clears the
-        // z > 2.0 gate — isolates exactly the hurt_player sign logic in
-        // detect_anomalies.
+        // baseline (mean=0, std=1, count=25) directly, so any real swing
+        // clears the z > 2.0 gate and the min-games trust gate — isolates
+        // exactly the hurt_player sign logic in detect_anomalies.
         let mut baselines = HashMap::new();
-        baselines.insert(("white_player".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0));
-        baselines.insert(("black_player".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0));
+        baselines.insert(("white_player".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0, 25));
+        baselines.insert(("black_player".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0, 25));
 
         let rows = vec![
             // White's own two consecutive moves: hugm_score is Black-relative
@@ -437,5 +443,31 @@ mod tests {
             let hurt = rec.get("hurt_player").unwrap().as_bool().unwrap();
             assert!(hurt, "player {player} should be flagged as hurt_player=true (their opponent's advantage grew by 500), got false");
         }
+    }
+
+    // Regression for a real gap (found 2026-07-30 in the same audit as
+    // hurt_player above): --min-games was accepted by the command but
+    // silently discarded (`let _ = min_games;`) — detect_anomalies fired
+    // z-score anomalies off a baseline regardless of how few samples built
+    // it. Welford's real sample count is now threaded through
+    // compute_baselines -> detect_anomalies and gates emission.
+    #[test]
+    fn detect_anomalies_respects_min_games_baseline_trust() {
+        let mut baselines = HashMap::new();
+        baselines.insert(("p".to_string(), 0u8, "hugm_delta".to_string()), (0.0, 1.0, 5));
+
+        let rows = vec![
+            move_record("p", "g1", 0, 0),
+            move_record("p", "g1", 2, 500),
+        ];
+        let states = vec![StateVector::default(); rows.len()];
+
+        // Baseline has only 5 samples; requiring 25 must suppress the anomaly.
+        let suppressed = detect_anomalies(&rows, &states, &baselines, 25, nu_protocol::Span::test_data());
+        assert!(suppressed.is_empty(), "anomaly should be suppressed when count(5) < min_games(25), got {suppressed:?}");
+
+        // The same baseline clears a lower bar.
+        let allowed = detect_anomalies(&rows, &states, &baselines, 5, nu_protocol::Span::test_data());
+        assert!(!allowed.is_empty(), "anomaly should fire when count(5) >= min_games(5)");
     }
 }

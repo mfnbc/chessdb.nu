@@ -12,7 +12,6 @@ use crate::game_parse::parse_game;
 struct PendingPos {
     zobrist: String,
     fen: String,
-    board_pieces: String,
     hugm_score: i64,
     hugm_eval_arr: String,
     state_id: u16,
@@ -25,7 +24,6 @@ struct PendingPos {
 struct FenToEval {
     zobrist: String,
     fen: String,
-    board_pieces: String,
 }
 
 pub struct ProcessCorpus;
@@ -90,7 +88,6 @@ impl PluginCommand for ProcessCorpus {
                         fens_to_eval.push(FenToEval {
                             zobrist: initial_zobrist.clone(),
                             fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-                            board_pieces: "rnbqkbnrppppppppPPPPPPPPRNBQKBNR".to_string(),
                         });
                     }
                     let mut prev_zobrist: Option<String> = Some(initial_zobrist);
@@ -99,11 +96,9 @@ impl PluginCommand for ProcessCorpus {
                         let z_hex = m_row.zobrist.clone();
 
                         if unique_positions.insert(z_hex.clone()) {
-                            let board_pieces: String = m_row.fen.chars().take_while(|c| *c != ' ').filter(|c| c.is_alphabetic()).collect();
                             fens_to_eval.push(FenToEval {
                                 zobrist: z_hex.clone(),
                                 fen: m_row.fen.clone(),
-                                board_pieces,
                             });
                         }
 
@@ -178,7 +173,6 @@ impl PluginCommand for ProcessCorpus {
                 PendingPos {
                     zobrist: fe.zobrist.clone(),
                     fen: fe.fen.clone(),
-                    board_pieces: fe.board_pieces.clone(),
                     hugm_score,
                     hugm_eval_arr,
                     state_id,
@@ -194,7 +188,6 @@ impl PluginCommand for ProcessCorpus {
             let pos_record = record! {
                 "zobrist" => Value::string(&p.zobrist, span),
                 "fen" => Value::string(&p.fen, span),
-                "board_pieces" => Value::string(p.board_pieces, span),
                 "hugm_score" => Value::int(p.hugm_score, span),
                 "hugm_eval_arr" => Value::string(&p.hugm_eval_arr, span),
                 "state_id" => Value::int(p.state_id as i64, span),

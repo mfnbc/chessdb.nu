@@ -51,17 +51,21 @@ export def init-db [db: string] {
             fen           TEXT UNIQUE,
             hugm_score    INTEGER,
             hugm_eval_arr TEXT,
-            board_pieces  TEXT,
             state_id      INTEGER,
             mate_in_1     INTEGER DEFAULT 0,
-            is_checkmate  INTEGER DEFAULT 0,
-            updated_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+            is_checkmate  INTEGER DEFAULT 0
         )
     " | ignore
     for col_sql in [
         "ALTER TABLE positions ADD COLUMN state_id     INTEGER DEFAULT 0"
         "ALTER TABLE positions ADD COLUMN mate_in_1    INTEGER DEFAULT 0"
         "ALTER TABLE positions ADD COLUMN is_checkmate INTEGER DEFAULT 0"
+    ] { try { open $db | query db $col_sql } catch { } }
+    # board_pieces/updated_at: computed and stored but never queried anywhere
+    # in chessdb/*.nu (confirmed via audit) — dropped 2026-07-30.
+    for col_sql in [
+        "ALTER TABLE positions DROP COLUMN board_pieces"
+        "ALTER TABLE positions DROP COLUMN updated_at"
     ] { try { open $db | query db $col_sql } catch { } }
 
     open $db | query db "
@@ -140,11 +144,17 @@ export def init-db [db: string] {
             mean         REAL    NOT NULL DEFAULT 0,
             std          REAL    NOT NULL DEFAULT 0,
             count        INTEGER NOT NULL DEFAULT 0,
-            last_updated TEXT,
             PRIMARY KEY (username, concept_name, phase_bucket)
         )
     " | ignore
     try { open $db | query db "ALTER TABLE player_baselines ADD COLUMN std REAL NOT NULL DEFAULT 0" } catch { }
+    # last_updated: declared, never written or read anywhere — dropped
+    # 2026-07-30. count *was* the same kind of dead column (declared, never
+    # populated with a real value) until this same pass wired it up for
+    # real: it now carries the actual Welford sample size a baseline was
+    # built from, which chess-derive --min-games gates anomaly emission on
+    # (see coach_derive_cmd.rs) — kept and fixed, not dropped.
+    try { open $db | query db "ALTER TABLE player_baselines DROP COLUMN last_updated" } catch { }
 
     open $db | query db "
         CREATE TABLE IF NOT EXISTS transition_events (
@@ -154,20 +164,22 @@ export def init-db [db: string] {
             total_count   INTEGER NOT NULL DEFAULT 0,
             blunder_count INTEGER NOT NULL DEFAULT 0,
             blunder_risk  REAL    NOT NULL DEFAULT 0,
-            last_updated  TEXT,
             PRIMARY KEY (username, state_from, state_to)
         )
     " | ignore
+    try { open $db | query db "ALTER TABLE transition_events DROP COLUMN last_updated" } catch { }
 
     open $db | query db "
         CREATE TABLE IF NOT EXISTS openings (
             fen   TEXT PRIMARY KEY,
             eco   TEXT NOT NULL,
-            name  TEXT NOT NULL,
-            moves TEXT
+            name  TEXT NOT NULL
         )
     " | ignore
     open $db | query db "CREATE INDEX IF NOT EXISTS idx_openings_eco ON openings(eco)" | ignore
+    # moves: the ECO source's move-list text, stored but never queried
+    # anywhere in chessdb/*.nu — dropped 2026-07-30.
+    try { open $db | query db "ALTER TABLE openings DROP COLUMN moves" } catch { }
 
     open $db | query db "
         CREATE TABLE IF NOT EXISTS move_anomalies (
@@ -205,10 +217,9 @@ export def fetch-and-seed-eco [db: string] {
         try {
             http get $"($base)/($f).json"
             | items { |fen, data| {
-                fen:   $fen
-                eco:   ($data.eco?   | default "")
-                name:  ($data.name?  | default "")
-                moves: ($data.moves? | default "")
+                fen:  $fen
+                eco:  ($data.eco?  | default "")
+                name: ($data.name? | default "")
             }}
         } catch { [] }
     } | flatten
@@ -223,7 +234,7 @@ export def fetch-and-seed-eco [db: string] {
     # a Black-to-move ply.
     let canonical_fens = ($rows | get fen | chessdb canonicalize-fen)
     let rows = ($rows | enumerate | each { |item| $item.item | upsert fen ($canonical_fens | get $item.index) })
-    db-merge $db "openings" $rows ["fen" "eco" "name" "moves"]
+    db-merge $db "openings" $rows ["fen" "eco" "name"]
     print $"Seeded ($rows | length) ECO opening positions."
 }
 

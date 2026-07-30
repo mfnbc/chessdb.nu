@@ -59,14 +59,6 @@ pub struct BatchGameRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BatchCollisionRow {
-    pub zobrist: String,
-    pub fen: String,
-    pub occurrences: u32,
-    pub game_indexes: Vec<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniquePositionRow {
     pub zobrist: String,
     pub fen: String,
@@ -78,7 +70,6 @@ pub struct BatchSummary {
     pub games: Vec<BatchGameRow>,
     pub positions: Vec<MoveRow>,
     pub unique_positions: Vec<UniquePositionRow>,
-    pub collisions: Vec<BatchCollisionRow>,
 }
 
 pub fn encode_move(mv: &shakmaty::Move) -> u16 {
@@ -510,7 +501,6 @@ pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, La
     let mut positions = Vec::new();
     let mut unique_map: BTreeMap<String, String> = BTreeMap::new();
     unique_map.insert(initial_hash.clone(), initial_fen.to_string());
-    let mut collisions: BTreeMap<String, BatchCollisionRow> = BTreeMap::new();
     let mut game_index: u32 = 0;
 
     loop {
@@ -534,19 +524,6 @@ pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, La
             unique_map
                 .entry(row.zobrist.clone())
                 .or_insert_with(|| row.fen.clone());
-
-            let entry = collisions
-                .entry(row.zobrist.clone())
-                .or_insert(BatchCollisionRow {
-                    zobrist: row.zobrist.clone(),
-                    fen: row.fen.clone(),
-                    occurrences: 0,
-                    game_indexes: Vec::new(),
-                });
-            entry.occurrences += 1;
-            if !entry.game_indexes.contains(&row.game_index) {
-                entry.game_indexes.push(row.game_index);
-            }
         }
 
         positions.extend(game_rows.clone());
@@ -577,17 +554,11 @@ pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, La
         .map(|(zobrist, fen)| UniquePositionRow { zobrist, fen })
         .collect();
 
-    let collisions: Vec<BatchCollisionRow> = collisions
-        .into_values()
-        .filter(|row| row.occurrences > 1)
-        .collect();
-
     Ok(BatchSummary {
         source: "pgn".into(),
         games,
         positions,
         unique_positions,
-        collisions,
     })
 }
 

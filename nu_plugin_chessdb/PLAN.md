@@ -1230,3 +1230,81 @@ currently). Findings, acted on except the last two (still open):
   confirmed identical on the pre-edit committed version too, so not something this touched).
 - **STILL OPEN**: `hugm-eval` (evaluate an arbitrary hypothetical FEN) fits the
   coaching-conversation purpose but isn't exposed as an `ai.nu` tool — minor gap, not a defect.
+
+Second pass: schema/transient-struct duplication audit, and "is the canonical FEN
+transform actually universal?" (2026-07-30)
+
+User's exact question: the forward transform (`normalize_to_white_to_move`) was already
+centralized in `canonical.rs` and shared by `core.rs`/`eval::position`. The *reverse* side
+was not fully universal — two concrete gaps, both fixed:
+1. `normalize_to_white_to_move` only conditionally flips (based on the input's own
+   `chess.turn()`), so there was no way to de-canonicalize a position you already *know*
+   is canonical (e.g. a `positions.fen` row known via `moves.color` to have been flipped)
+   — calling the same function again is a no-op, since a canonical position always reads
+   "White to move". Fixed by extracting the actual mirror+recolor logic into a new
+   `pub fn flip_colors(chess: &Chess) -> Result<Chess>` — unconditional, and (unlike the
+   old inline version, which hardcoded `turn: Color::White`) sets `turn: chess.turn().other()`
+   so it's a true involution usable in *either* direction. `normalize_to_white_to_move` is
+   now a thin wrapper: flip via `flip_colors` only when not already White-to-move.
+2. The generic un-flip helpers (`unflip_color`, `unflip_phrase`, `unflip_square_str`) were
+   private to `eval/position.rs` even though they don't depend on anything eval-specific —
+   moved to `canonical.rs`, crate-wide reusable now. (`unflip_piece_ref`/`unflip_sensor_report`
+   stayed in `eval/position.rs` — they operate on `PieceRef`/`SensorReport`, eval-specific
+   types `canonical.rs` shouldn't depend on, per its own doc comment on dependency direction.)
+   Removed `position.rs`'s redundant private `unflip_square` (a thin rewrap of
+   `canonical::unflip_square` with no logic of its own).
+   Verified: new test `flip_colors_is_an_involution_and_de_canonicalizes` proves
+   `flip_colors` agrees with `normalize_to_white_to_move` on the forward direction *and*
+   that flipping its own output recovers the original position exactly — the actual
+   de-canonicalization use case this was extracted for.
+
+Also audited the SQLite schema and Rust-side "transient" structs (`MoveRow`, `BatchSummary`,
+`PendingPos`/`FenToEval`, `MoveRecord`) for duplication/YAGNI, per the user's request. Fixed,
+in the order presented:
+- **My own oversight from the prior pass, corrected**: `src/position_encoder.rs` (194 lines,
+  4 tests) had zero callers left once `dataset_builder_cmd.rs` — its only consumer — was
+  deleted, yet I'd written NNUE_AUDIT.md to claim it was a deliberate placeholder without
+  checking. Deleted; NNUE_AUDIT.md corrected to say so plainly.
+- **Dead SQLite columns removed** (declared/written, never queried anywhere in
+  `chessdb/*.nu`): `positions.board_pieces` (was computed with real CPU work in
+  `process_corpus.rs` for nothing), `positions.updated_at`, `openings.moves`,
+  `transition_events.last_updated`. All dropped via `ALTER TABLE ... DROP COLUMN`
+  migrations (try/catch, safe to re-run — verified against both a fresh DB and a
+  simulated pre-migration DB with the old columns and an existing row, confirming the
+  row survives and re-running `init-db` twice is a no-op the second time). All write-side
+  code removed too (`PendingPos`/`FenToEval` no longer carry `board_pieces`;
+  `fetch-and-seed-eco` no longer reads/stores ECO's `moves` field).
+  `player_baselines.count`/`.last_updated` needed a different call: `.last_updated` is
+  genuinely dead (dropped), but `.count` turned out to be the missing half of the very
+  next fix below — kept and wired up for real instead of deleted. Flagging this deviation
+  explicitly since the original finding said "dead column," and the actual fix was "make
+  it not dead" for this one field.
+- **`chess-derive --min-games` actually does something now.** It was accepted and silently
+  discarded twice (`let _ = min_games;` in `detect_anomalies`, an unused `_min_games` param
+  in `compute_transitions`), and `compute_baselines` computed each Welford baseline's real
+  sample count only to throw it away before it could reach anything — which is why
+  `player_baselines.count` was always the SQL default 0. Fixed: `compute_baselines` now
+  returns `(mean, std, count)`; `detect_anomalies` skips z-score anomaly emission entirely
+  when `count < min_games` (both the state-vector-concept path and the eval-component
+  path); `compute_transitions`'s hardcoded `total >= 3` threshold for flagging a risky
+  transition became `total >= min_games`, using the same configurable trust bar instead of
+  a magic number (worth revisiting if 25 turns out too strict specifically for transition
+  counts — state-pair transitions are rarer events than a single concept firing, and this
+  hasn't been empirically checked against real data yet). `format_results` now emits
+  `count` in `baselines_out`, and `chessdb/derive.nu`'s db-merge column list for
+  `player_baselines` includes it — verified this actually reaches the table with a mocked
+  `chessdb derive-coach-signals` call through a throwaway db. Added
+  `detect_anomalies_respects_min_games_baseline_trust`, and confirmed it actually catches
+  the bug (reverted the gate, watched it fail, restored it) — same discipline as BUG-15's
+  `hurt_player` test.
+- **`BatchSummary.collisions`** (`core::pgn_to_batch_record`) — computed (a full
+  `BTreeMap<zobrist, BatchCollisionRow>` tracking occurrence counts and game indexes per
+  position) but unread by its only real consumers: `lichess_to_jsonl.rs`/`pgn_to_jsonl.rs`
+  only touch `.positions`/`.games`, and `.unique_positions.len()` for one log line — never
+  `.collisions`. Removed the computation, the `BatchCollisionRow` struct, and the
+  `collisions`/`stats.collisions` fields from the Nu-facing `pgn-to-batch` output.
+
+Verified throughout: full test suite green at every step (ended at 32 lib tests, up from
+31 after `position_encoder.rs`'s 4 tests were removed with the file, since the two new
+regression tests added 1 net beyond that), `cargo clippy --all-targets` clean on every
+touched file, STS smoke test passes.

@@ -8,12 +8,12 @@
 // real terms. See PLAN.md's "Canonical position identity (tablebase-style
 // dedup)" section.
 
-use nu_plugin_chessdb::canonical::normalize_to_white_to_move;
+use nu_plugin_chessdb::canonical::{flip_colors, normalize_to_white_to_move};
 use nu_plugin_chessdb::chess::fen_to_chess;
 use nu_plugin_chessdb::core::{canonicalize_fen, pgn_to_fens};
 use nu_protocol::Span;
 use shakmaty::zobrist::{Zobrist64, ZobristHash};
-use shakmaty::EnPassantMode;
+use shakmaty::{fen::Fen, EnPassantMode, Color, Position};
 
 fn hash_of(fen: &str) -> String {
     let pos = fen_to_chess(fen, Span::test_data()).expect("FEN should parse");
@@ -129,4 +129,41 @@ fn canonicalize_fen_matches_pgn_to_fens_for_the_same_position() {
     // normalize_to_white_to_move's fast path).
     let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     assert_eq!(canonicalize_fen(start, Span::test_data()).unwrap(), start);
+}
+
+#[test]
+fn flip_colors_is_an_involution_and_de_canonicalizes() {
+    // flip_colors is the unconditional primitive extracted so it can serve
+    // both directions: normalize_to_white_to_move's forward flip, and
+    // de-canonicalizing a known-canonical position (e.g. a positions.fen
+    // row known — from moves.color — to have been stored via a flip) back
+    // to real terms, which normalize_to_white_to_move itself can't do
+    // (a canonical position always reads "White to move", so it would see
+    // nothing to flip).
+    let real_black_to_move = fen_to_chess(
+        "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1",
+        Span::test_data(),
+    )
+    .unwrap();
+    assert_eq!(real_black_to_move.turn(), Color::Black);
+
+    let canonical = flip_colors(&real_black_to_move).expect("flip should succeed");
+    assert_eq!(canonical.turn(), Color::White);
+    // Matches what normalize_to_white_to_move produces for the same input.
+    let (via_normalize, was_flipped) = normalize_to_white_to_move(&real_black_to_move).unwrap();
+    assert!(was_flipped);
+    assert_eq!(
+        Fen::from_position(canonical.clone(), EnPassantMode::Legal).to_string(),
+        Fen::from_position(via_normalize, EnPassantMode::Legal).to_string()
+    );
+
+    // De-canonicalize: flipping the canonical result again must recover the
+    // original real (Black-to-move) position exactly — the actual use case
+    // this primitive was extracted for.
+    let de_canonicalized = flip_colors(&canonical).expect("reverse flip should succeed");
+    assert_eq!(de_canonicalized.turn(), Color::Black);
+    assert_eq!(
+        Fen::from_position(de_canonicalized, EnPassantMode::Legal).to_string(),
+        Fen::from_position(real_black_to_move, EnPassantMode::Legal).to_string()
+    );
 }

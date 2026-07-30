@@ -42,7 +42,6 @@ fn batch_record_value(batch: crate::core::BatchSummary, span: nu_protocol::Span)
     let games_count = batch.games.len() as i64;
     let positions_count = batch.positions.len() as i64;
     let unique_positions_count = batch.unique_positions.len() as i64;
-    let collisions_count = batch.collisions.len() as i64;
 
     let games = batch
         .games
@@ -69,40 +68,16 @@ fn batch_record_value(batch: crate::core::BatchSummary, span: nu_protocol::Span)
         })
         .collect();
 
-    let collisions = batch
-        .collisions
-        .into_iter()
-        .map(|row| {
-            let mut rec = Record::new();
-            rec.push("zobrist", Value::string(row.zobrist, span));
-            rec.push("fen", Value::string(row.fen, span));
-            rec.push("occurrences", Value::int(row.occurrences as i64, span));
-            rec.push(
-                "game_indexes",
-                Value::list(
-                    row.game_indexes
-                        .into_iter()
-                        .map(|i| Value::int(i as i64, span))
-                        .collect(),
-                    span,
-                ),
-            );
-            Value::record(rec, span)
-        })
-        .collect();
-
     let mut stats = Record::new();
     stats.push("games", Value::int(games_count, span));
     stats.push("positions", Value::int(positions_count, span));
     stats.push("unique_positions", Value::int(unique_positions_count, span));
-    stats.push("collisions", Value::int(collisions_count, span));
 
     let mut rec = Record::new();
     rec.push("source", Value::string(batch.source, span));
     rec.push("games", Value::list(games, span));
     rec.push("positions", move_rows_value(&batch.positions, span));
     rec.push("unique_positions", Value::list(unique_positions, span));
-    rec.push("collisions", Value::list(collisions, span));
     rec.push("stats", Value::record(stats, span));
     Value::record(rec, span)
 }
@@ -171,7 +146,7 @@ impl PluginCommand for PgnToBatch {
     }
 
     fn description(&self) -> &str {
-        "Parse a PGN string containing one or more games and return a record with {source, games, positions, unique_positions, collisions, stats}."
+        "Parse a PGN string containing one or more games and return a record with {source, games, positions, unique_positions, stats}."
     }
 
     fn signature(&self) -> Signature {

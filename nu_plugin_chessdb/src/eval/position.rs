@@ -4,6 +4,7 @@ use shakmaty::{attacks, fen::Fen, Bitboard, Chess, Color, File, Position, Rank, 
 
 use crate::eval::concept_types::*;
 use crate::eval::sensor::{TacticalReport, PositionalReport, SensorReport, AggregatedScores, MaterialConceptReport};
+use crate::canonical::{unflip_color, unflip_phrase, unflip_square_str};
 
 // Configurable constants (GUESS values) collected here for easier tuning.
 const TACTICAL_BASE_PINS: i64 = 50;
@@ -2904,41 +2905,12 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
 ///
 /// Returns `(normalized, was_flipped)`. When `was_flipped`, board-coordinate
 /// output (squares/colors in `SensorReport`) must be un-flipped back before
-/// it reaches a human — see `unflip_square`/`unflip_color` below. Scores
-/// need no such correction: after normalization they're already relative to
+/// it reaches a human — see `unflip_sensor_report` below (which uses
+/// `crate::canonical::unflip_color`/`unflip_square_str`). Scores need no
+/// such correction: after normalization they're already relative to
 /// whoever is really to move, which is what every consumer wants.
 fn normalize_for_eval(chess: &Chess) -> Result<(Chess, bool)> {
     crate::canonical::normalize_to_white_to_move(chess)
-}
-
-/// Undo `normalize_for_eval`'s vertical flip on a single square. Not paired
-/// with a color swap here — callers apply `unflip_color` separately, since
-/// some fields (e.g. `OpenFile.file`) have a square-ish component but no
-/// color, and some have a color but no square.
-fn unflip_square(sq: Square) -> Square {
-    crate::canonical::unflip_square(sq)
-}
-
-fn unflip_color(color_str: &str) -> String {
-    if color_str == "white" { "black".into() } else { "white".into() }
-}
-
-/// `GatedIssue.phrase` is free text built (inside `build_sensor_report`,
-/// before this un-flip pass runs) with literal "White"/"Black"/"white"/
-/// "black" words baked in via format! — e.g. "Black is up 207 centipawns in
-/// material". Unlike `.side`, there's no structured field to derive a
-/// corrected phrase from at this point, so swap the words directly. Both
-/// capitalizations are swapped via a sentinel so a phrase containing both
-/// words doesn't get double-flipped by a naive sequential replace.
-fn unflip_phrase(phrase: &str) -> String {
-    const SENTINEL: &str = "\u{0}";
-    phrase
-        .replace("White", SENTINEL)
-        .replace("Black", "White")
-        .replace(SENTINEL, "Black")
-        .replace("white", SENTINEL)
-        .replace("black", "white")
-        .replace(SENTINEL, "black")
 }
 
 /// Un-flip every square/color in a `SensorReport` back to real board terms,
@@ -2949,19 +2921,12 @@ fn unflip_phrase(phrase: &str) -> String {
 /// those don't need a square correction, but they're still labeled
 /// "white"/"black" and do need the color swap) — verified against every
 /// struct in concept_types.rs/sensor.rs, not just the ones with PieceRefs.
+/// `unflip_color`/`unflip_square_str` themselves live in `crate::canonical`
+/// (generic, no eval-specific types) — this stays here because `PieceRef`
+/// is an eval-specific type `canonical` shouldn't need to depend on.
 fn unflip_piece_ref(pr: &mut PieceRef) {
     pr.square = unflip_square_str(&pr.square);
     pr.color = unflip_color(&pr.color);
-}
-
-/// `PieceRef.square`/`PassedPawn.square`/etc. are already-formatted strings
-/// (e.g. "d5"), not `Square` values, by the time they reach these structs —
-/// parse, flip, reformat.
-fn unflip_square_str(s: &str) -> String {
-    match s.parse::<Square>() {
-        Ok(sq) => unflip_square(sq).to_string(),
-        Err(_) => s.to_string(), // not a plain square (e.g. a notation string) — leave as-is
-    }
 }
 
 fn unflip_sensor_report(sensor: &mut SensorReport) {

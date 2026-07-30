@@ -51,7 +51,7 @@ export def "chess-derive" [
             | reject player
             | rename --column {concept: concept_name}
             | insert username $username
-        ) ["username" "concept_name" "phase_bucket" "mean" "std"]
+        ) ["username" "concept_name" "phase_bucket" "mean" "std" "count"]
     }
 
     if ($signals.anomalies | is-not-empty) {
