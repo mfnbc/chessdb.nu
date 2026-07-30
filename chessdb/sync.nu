@@ -7,23 +7,17 @@ def import-records [games: list, username: string, db: string] {
     init-db $db
     let corpus = ($games | to json | chessdb process-corpus --username $username)
 
-    if ($corpus.games | is-not-empty) {
-        db-merge $db "games" $corpus.games [
-            "game_id" "source" "source_game_id" "white" "black"
-            "white_elo" "black_elo" "result" "played_at" "time_control" "eco" "opening"
-        ]
-    }
-    if ($corpus.positions | is-not-empty) {
-        db-merge $db "positions" $corpus.positions [
-            "zobrist" "fen" "hugm_score" "hugm_eval_arr"
-            "state_id" "mate_in_1" "is_checkmate"
-        ]
-    }
-    if ($corpus.moves | is-not-empty) {
-        db-merge $db "moves" $corpus.moves [
-            "game_id" "position_id" "next_position_id" "ply" "move_number" "color" "san" "canonical_san" "uci"
-        ]
-    }
+    db-merge $db "games" $corpus.games [
+        "game_id" "source" "source_game_id" "white" "black"
+        "white_elo" "black_elo" "result" "played_at" "time_control" "eco" "opening"
+    ]
+    db-merge $db "positions" $corpus.positions [
+        "zobrist" "fen" "hugm_score" "hugm_eval_arr"
+        "state_id" "mate_in_1" "is_checkmate"
+    ]
+    db-merge $db "moves" $corpus.moves [
+        "game_id" "position_id" "next_position_id" "ply" "move_number" "color" "san" "canonical_san" "uci"
+    ]
 
     # Decode state_id bit-field into move_states rows for fast coaching queries.
     # Bit positions here must match nu_plugin_chessdb/src/eval/concepts.rs's

@@ -5,7 +5,7 @@ use shakmaty::{attacks, fen::Fen, Bitboard, Chess, Color, File, Position, Rank, 
 use crate::eval::concept_types::*;
 use crate::eval::sensor::{TacticalReport, PositionalReport, SensorReport, AggregatedScores, MaterialConceptReport};
 use crate::eval::concepts::{encode_state, extract_concepts, rank_issues_for_position};
-use crate::eval::threat_graph::ThreatGraph;
+use crate::eval::threat_graph::{role_name, ThreatGraph};
 use crate::canonical::{normalize_to_white_to_move, unflip_phrase, unflip_square_str};
 
 // Configurable constants (GUESS values) collected here for easier tuning.
@@ -1607,10 +1607,7 @@ fn piece_square_name(board: &shakmaty::Board, sq: Square) -> String {
 
 fn board_to_piece_ref(board: &shakmaty::Board, sq: Square) -> Option<PieceRef> {
     board.piece_at(sq).map(|p| PieceRef {
-        role: match p.role {
-            Role::Pawn => "Pawn", Role::Knight => "Knight", Role::Bishop => "Bishop",
-            Role::Rook => "Rook", Role::Queen => "Queen", Role::King => "King",
-        }.into(),
+        role: role_name(p.role),
         color: Side::from(p.color),
         square: sq.to_string(),
     })

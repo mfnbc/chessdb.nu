@@ -18,6 +18,17 @@ use ../../ai.nu/ai/data.nu
 
 const HERE = (path self | path dirname)
 
+# Shared by the five get_*_profile tool handlers below: each just forwards
+# `username` to a different chess-profile-* subcommand over a `nu -c`
+# subprocess and returns its JSON (or a tool-error string).
+def call-profile-tool [subcmd: string, args: record, nu_script: string, db: string] {
+    let u = ($args.username? | default "")
+    if $u == "" { return "tool error: requires `username`" }
+    let r = (do { ^nu -c $"use '($nu_script)' *; ($subcmd) '($u)' --db '($db)' | to json -r" } | complete)
+    if $r.exit_code != 0 { return $"tool error: ($r.stderr | str trim)" }
+    $r.stdout | str trim
+}
+
 export-env {
     if ($env.AI_TOOLS? | is-empty) { $env.AI_TOOLS = {} }
 
@@ -35,13 +46,7 @@ export-env {
                 required: ["username"]
             }
         }
-        handler: {|args, _|
-            let u = ($args.username? | default "")
-            if $u == "" { return "tool error: requires `username`" }
-            let r = (do { ^nu -c $"use '($nu_script)' *; chess-profile '($u)' --db '($db)' | to json -r" } | complete)
-            if $r.exit_code != 0 { return $"tool error: ($r.stderr | str trim)" }
-            $r.stdout | str trim
-        }
+        handler: {|args, _| call-profile-tool "chess-profile" $args $nu_script $db }
     }
 
     ai-config-env-tools "get_tactical_profile" {
@@ -55,13 +60,7 @@ export-env {
                 required: ["username"]
             }
         }
-        handler: {|args, _|
-            let u = ($args.username? | default "")
-            if $u == "" { return "tool error: requires `username`" }
-            let r = (do { ^nu -c $"use '($nu_script)' *; chess-profile-tactical '($u)' --db '($db)' | to json -r" } | complete)
-            if $r.exit_code != 0 { return $"tool error: ($r.stderr | str trim)" }
-            $r.stdout | str trim
-        }
+        handler: {|args, _| call-profile-tool "chess-profile-tactical" $args $nu_script $db }
     }
 
     ai-config-env-tools "get_precision_profile" {
@@ -75,13 +74,7 @@ export-env {
                 required: ["username"]
             }
         }
-        handler: {|args, _|
-            let u = ($args.username? | default "")
-            if $u == "" { return "tool error: requires `username`" }
-            let r = (do { ^nu -c $"use '($nu_script)' *; chess-profile-precision '($u)' --db '($db)' | to json -r" } | complete)
-            if $r.exit_code != 0 { return $"tool error: ($r.stderr | str trim)" }
-            $r.stdout | str trim
-        }
+        handler: {|args, _| call-profile-tool "chess-profile-precision" $args $nu_script $db }
     }
 
     ai-config-env-tools "get_positional_profile" {
@@ -95,13 +88,7 @@ export-env {
                 required: ["username"]
             }
         }
-        handler: {|args, _|
-            let u = ($args.username? | default "")
-            if $u == "" { return "tool error: requires `username`" }
-            let r = (do { ^nu -c $"use '($nu_script)' *; chess-profile-position '($u)' --db '($db)' | to json -r" } | complete)
-            if $r.exit_code != 0 { return $"tool error: ($r.stderr | str trim)" }
-            $r.stdout | str trim
-        }
+        handler: {|args, _| call-profile-tool "chess-profile-position" $args $nu_script $db }
     }
 
     ai-config-env-tools "get_opening_profile" {
@@ -115,13 +102,7 @@ export-env {
                 required: ["username"]
             }
         }
-        handler: {|args, _|
-            let u = ($args.username? | default "")
-            if $u == "" { return "tool error: requires `username`" }
-            let r = (do { ^nu -c $"use '($nu_script)' *; chess-profile-opening '($u)' --db '($db)' | to json -r" } | complete)
-            if $r.exit_code != 0 { return $"tool error: ($r.stderr | str trim)" }
-            $r.stdout | str trim
-        }
+        handler: {|args, _| call-profile-tool "chess-profile-opening" $args $nu_script $db }
     }
 
     ai-config-env-tools "chess_db_schema" {

@@ -103,7 +103,7 @@ impl ThreatGraph {
             .map(|p| role_name(p.role)).unwrap_or_default();
         steps.push(CaptureStep {
             piece: victim_role, color: victim_color,
-            square: square_name(sq), value_cp: victim_val,
+            square: sq.to_string(), value_cp: victim_val,
         });
         board.discard_piece_at(sq);
 
@@ -134,7 +134,7 @@ impl ThreatGraph {
                 steps.push(CaptureStep {
                     piece: role_name(best_role),
                     color: Side::from(side_to_capture),
-                    square: square_name(recap_sq), value_cp: val,
+                    square: recap_sq.to_string(), value_cp: val,
                 });
                 board.discard_piece_at(recap_sq);
 
@@ -172,7 +172,7 @@ impl ThreatGraph {
                     targets.push(PieceRef {
                         role: role_name(tp.role),
                         color: Side::from(enemy),
-                        square: square_name(t_sq),
+                        square: t_sq.to_string(),
                     });
                 }
             }
@@ -180,7 +180,7 @@ impl ThreatGraph {
                 let attacker = PieceRef {
                     role: role_name(piece.role),
                     color: Side::from(color),
-                    square: square_name(sq),
+                    square: sq.to_string(),
                 };
                 // Find which target hangs (lowest-value undefended)
                 let hangs = self.undefended_target(&targets, enemy);
@@ -251,7 +251,7 @@ impl ThreatGraph {
                     piece: PieceRef {
                         role: role_name(piece.role),
                         color: Side::from(piece.color),
-                        square: square_name(sq),
+                        square: sq.to_string(),
                     },
                     attacker_count: attacker_count as u8,
                 });
@@ -289,7 +289,7 @@ impl ThreatGraph {
                 captures.push(CaptureStep {
                     piece: role_name(r),
                     color: Side::from(side),
-                    square: square_name(s),
+                    square: s.to_string(),
                     value_cp: v,
                 });
                 current_sq = s;
@@ -299,7 +299,7 @@ impl ThreatGraph {
 
         if captures.len() >= 3 {
             Some(ExchangeChain {
-                square: square_name(sq),
+                square: sq.to_string(),
                 steps: captures,
                 net_cp: net,
                 winner: if net > 0 {
@@ -349,11 +349,8 @@ pub struct ExchangeChain {
 
 // ── Name helpers ──
 
-fn role_name(r: Role) -> String {
+pub fn role_name(r: Role) -> String {
     match r { Role::Pawn => "Pawn", Role::Knight => "Knight", Role::Bishop => "Bishop",
               Role::Rook => "Rook", Role::Queen => "Queen", Role::King => "King" }.into()
 }
 
-fn square_name(sq: Square) -> String {
-    format!("{}{}", (b'a' + u8::from(sq.file())) as char, u8::from(sq.rank()) + 1)
-}

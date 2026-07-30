@@ -44,32 +44,26 @@ export def "chess-derive" [
     open $db | query db "DELETE FROM transition_events WHERE username = ?"                  --params [$username]
     open $db | query db "DELETE FROM move_anomalies    WHERE username = ? AND consumed = 0" --params [$username]
 
-    if ($signals.baselines | is-not-empty) {
-        db-merge $db "player_baselines" (
-            $signals.baselines
-            | where player == $username
-            | reject player
-            | rename --column {concept: concept_name}
-            | insert username $username
-        ) ["username" "concept_name" "phase_bucket" "mean" "std" "count"]
-    }
+    db-merge $db "player_baselines" (
+        $signals.baselines
+        | where player == $username
+        | reject player
+        | rename --column {concept: concept_name}
+        | insert username $username
+    ) ["username" "concept_name" "phase_bucket" "mean" "std" "count"]
 
-    if ($signals.anomalies | is-not-empty) {
-        db-merge $db "move_anomalies" (
-            $signals.anomalies
-            | where player == $username
-            | reject player
-            | upsert game_id      { into int }
-            | upsert signed_delta { into int }
-            | insert username $username
-        ) ["username" "game_id" "ply" "state_id" "anomaly_type" "concept_name" "z_score" "severity" "signed_delta" "hurt_player"]
-    }
+    db-merge $db "move_anomalies" (
+        $signals.anomalies
+        | where player == $username
+        | reject player
+        | upsert game_id      { into int }
+        | upsert signed_delta { into int }
+        | insert username $username
+    ) ["username" "game_id" "ply" "state_id" "anomaly_type" "concept_name" "z_score" "severity" "signed_delta" "hurt_player"]
 
-    if ($signals.transitions | is-not-empty) {
-        db-merge $db "transition_events" (
-            $signals.transitions | insert username $username
-        ) ["username" "state_from" "state_to" "total_count" "blunder_count" "blunder_risk"]
-    }
+    db-merge $db "transition_events" (
+        $signals.transitions | insert username $username
+    ) ["username" "state_from" "state_to" "total_count" "blunder_count" "blunder_risk"]
 
     let nb = ($signals.baselines   | length)
     let na = ($signals.anomalies   | length)

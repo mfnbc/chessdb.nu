@@ -1524,3 +1524,73 @@ serialized a `PositionRecord` for the same hand-verified mirror-position fixture
 used in `motif_canonical.rs`, and confirmed the JSON contains exactly `"color": "white"`/
 `"black"` and `"side": "white"`/`"black"` (lowercase, matching the old `String` fields
 byte-for-byte) with no capitalized or otherwise-different variant leaking through.
+
+Re-audit 2026-07-30: role_name/square_name dedup, .nu-side sweep
+
+**Fixed, `src/eval/threat_graph.rs` + `src/eval/position.rs`:**
+- `role_name(Role) -> String` (Role → full piece name) was duplicated: a private helper
+  in `threat_graph.rs`, and an identical inline `match` inside `position.rs`'s
+  `board_to_piece_ref`. Made `role_name` `pub` and had `board_to_piece_ref` call it
+  instead of re-deriving the same match.
+- `threat_graph.rs`'s own `square_name(sq: Square) -> String` (hand-rolled `a`+file /
+  `1`+rank formatting) was entirely redundant with `shakmaty::Square`'s own `Display`
+  impl (confirmed by reading shakmaty 0.26.0's source directly — it already produces the
+  same "e4"-style output). Replaced all 7 call sites with `.to_string()` and deleted the
+  function. (`position.rs`'s separate `piece_square_name` helper is not a duplicate of
+  this — it names a *piece on* a square for explanation text, a different job; left as
+  is, matching the note already in PLAN.md's "D: Mobility & PST" status entry.)
+- Verified: `cargo check --all-targets`, `cargo test` (32 lib + 19 integration, all
+  green), `cargo clippy --all-targets` clean on both touched files (remaining warnings
+  are the same pre-existing ones in `hugm_harness.rs`/`lichess_to_jsonl.rs`/
+  `pgn_to_jsonl.rs` noted earlier in this file).
+
+**Confirmed already done, not re-touched:** re-checked the "Consistency pass on
+nu_plugin_chessdb" plan (module doc in `eval/mod.rs`, `render_explanations`/
+`render_structured_explanations` reading `SensorReport` not `.terms`, `coach_derive_cmd.rs`'s
+`decode_state_id`/`StateVector`/`state_vector_to_value` unification with a fast/slow
+agreement test, `hugm_eval_cmd.rs`'s shared `build_output_value`, `core.rs`'s
+`get_canonical_hash` reuse) — all five items are already implemented and committed from
+an earlier session. Nothing outstanding there.
+
+**Extended the audit to the Nu side** (`ai/mod.nu`, `chessdb/*.nu`) per CLAUDE.md's own
+documented idioms, since the Rust crate is now clean. Findings, fixed vs. deferred:
+
+*Fixed:*
+- `ai/mod.nu`: the five `get_*_profile` tool handlers (`get_coach_profile`,
+  `get_tactical_profile`, `get_precision_profile`, `get_positional_profile`,
+  `get_opening_profile`) were byte-for-byte identical except which `chess-profile-*`
+  subcommand they called — same username-guard, same `^nu -c` subprocess invocation, same
+  exit-code/stderr handling. A sixth profile command would have been one copy-paste to
+  forget. Extracted a shared `call-profile-tool [subcmd, args, nu_script, db]` def; each
+  handler is now a one-line call. Verified behaviorally equivalent by exercising the
+  extracted def directly (empty-username short-circuit, and real-username subprocess
+  dispatch) outside `export-env`'s ai.nu-dependent context, plus `nu-check` on the file.
+- `chessdb/sync.nu` (`import-records`) and `chessdb/derive.nu` (`chess-derive`): six
+  `if (X | is-not-empty) { db-merge ... }` guards were redundant — `db-merge` itself
+  (`db.nu:12`) already no-ops on empty `records`, and confirmed the intermediate
+  `where`/`reject`/`rename`/`insert` pipeline steps feeding it are empty-list-safe too.
+  Dropped the guards. Verified via `nu-check` on both files plus direct empty-list
+  pipeline tests in isolation.
+
+*Deferred (documented, not fixed — real but lower-value/higher-risk than the above):*
+- `chessdb/profile.nu` has several small SQL fragments duplicated 2-3x each as literal
+  text inside `query db "..."` strings: the phase-bucket-to-label `CASE ... WHEN 0 THEN
+  'deep_endgame' ...` mapping (3x: `tactical-phase-breakdown`, `precision-baselines`,
+  `precision-blunder-phases`), the ply-based phase `CASE WHEN m.ply <= 12 ...` mapping
+  (2x: `profile-phase-stats`, `position-eval-components`), the tactical-concept allow-list
+  `IN ('fork','pin','hanging_piece','skewer','discovered_attack')` (3x), the draw-result
+  literal list (3x in `profile.nu` + inverted once), and the player-color
+  `CASE WHEN color = 'white' THEN g.white ELSE g.black END` lookup (`derive.nu:16` /
+  `profile.nu:107`, plus `sync.nu:175,177` twice in one query). Not fixed because SQLite
+  has no server-side enum/view layer here and the natural Nu-side fix — interpolating a
+  shared string constant into each SQL literal via `$"...(frag)..."` — trades SQL
+  readability (each query stops being valid, self-contained SQL you can read top to
+  bottom) for a small reduction in copy-paste, and touches `--params` positional binding
+  in several places, which is exactly the kind of query code where a mechanical
+  find/replace risks a silent off-by-one. If a genuine SQL-view-based simplification is
+  wanted later, it deserves its own scoped pass with its own before/after query-output
+  diffing — not folded into this dedup sweep.
+
+Verified overall: `nu-check` clean on all five touched/reviewed `.nu` files; Rust-side
+`cargo check --all-targets`/`cargo test`/`cargo clippy --all-targets` all green (unaffected
+by the Nu-side changes, listed for completeness since both were done in the same pass).
