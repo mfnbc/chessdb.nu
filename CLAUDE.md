@@ -116,6 +116,56 @@ scoped fix.
 The same principle applies on the Nu side: prefer a record with named fields over a
 generic key-value table when the shape is known ahead of time.
 
+## Canonical (White-to-move) position identity — the tablebase simplification
+
+Everything stored under `positions.zobrist`/`positions.fen` and `openings.fen`
+is normalized so White is always the side to move — the same simplification
+chess endgame tablebases use to collapse a position and its exact color-mirror
+(reached by a different game, or by the other side of the same game) onto one
+stored entity, evaluated and looked up once instead of twice. It's mechanical:
+mirror the board vertically, swap piece colors, swap castling rights, mirror
+the en passant square — the one implementation is
+`nu_plugin_chessdb/src/canonical.rs`, used by both `core.rs` (position/move
+identity) and `eval::position` (evaluation normalization).
+
+**The corollary the name implies but is easy to forget: nothing in that
+canonical form tells you who is actually White or Black in a real game.** A
+canonical FEN's "w" side-to-move token, its square letters' case,
+`positions.board_pieces` — none of that is real-game truth, it's an opaque
+identity/scoring-normalization key. Any code that needs to know what actually
+happened in a real game — who played a move, what a human should see
+reviewing their own game, which color a specific player was — must read that
+from `moves.color`, `moves.san` (**not** `moves.canonical_san`), `moves.uci`,
+and `games.white`/`games.black`, and conform the canonical data back to that
+real context using those columns. Never infer real color from the shape of a
+canonical FEN/zobrist itself — it always looks like White is to move,
+regardless of what really happened.
+
+Two real bugs shipped from getting this backwards (full history in
+`nu_plugin_chessdb/PLAN.md`'s "Canonical position identity" section):
+- `moves.san` was overwritten with the canonical-frame move instead of the
+  real one, so `chess-review` showed players a color-mirrored version of
+  their own moves. Fixed by splitting into `san` (real) and `canonical_san`
+  (canonical, used only by `chess-explore`'s cross-game grouping — the one
+  place mixing real-frame SAN from either side actually would be nonsense).
+- `enrich-openings` joined canonical `positions.fen` against real,
+  non-canonical ECO FENs (`openings.fen`), silently failing to classify any
+  opening recorded at a Black-to-move ply. Fixed by canonicalizing ECO data
+  at seed time (`fetch-and-seed-eco`, via the `chessdb canonicalize-fen`
+  plugin command) so both sides of that join are actually canonical.
+
+**Quick reference — which side of the data is real vs. canonical:**
+
+| Field | Convention |
+|---|---|
+| `positions.zobrist` / `.fen` / `.board_pieces` | canonical (White always to move) |
+| `openings.fen` | canonical (canonicalized at seed time) |
+| `moves.san` | real (as actually played) |
+| `moves.canonical_san` | canonical (cross-game grouping only) |
+| `moves.uci`, `moves.color` | real |
+| `games.white` / `.black` / `.result` | real |
+| `positions.hugm_score` / `.state_id` / `.mate_in_1` / `.is_checkmate` | mover-relative scalars — orientation-invariant either way, safe to read directly without conforming |
+
 ## SQL string construction in db-merge
 
 `db-merge` (in `chessdb/db.nu`) builds INSERT statements by concatenating

@@ -109,6 +109,7 @@ fn move_rows_value(rows: &[crate::core::MoveRow], span: nu_protocol::Span) -> Va
             rec.push("move_number", Value::int(row.move_number as i64, span));
             rec.push("color", Value::string(row.color.clone(), span));
             rec.push("san", Value::string(row.san.clone(), span));
+            rec.push("canonical_san", Value::string(row.canonical_san.clone(), span));
             rec.push("uci", Value::string(row.uci.clone(), span));
             rec.push("fen", Value::string(row.fen.clone(), span));
             rec.push("zobrist", Value::string(row.zobrist.clone(), span));
@@ -195,7 +196,7 @@ impl PluginCommand for PgnToFens {
     }
 
     fn description(&self) -> &str {
-        "Parse a single-game PGN string and return a table of {game_index, ply, move_number, color, san, uci, fen, zobrist} for every move."
+        "Parse a single-game PGN string and return a table of {game_index, ply, move_number, color, san, canonical_san, uci, fen, zobrist} for every move."
     }
 
     fn signature(&self) -> Signature {

@@ -120,10 +120,13 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
         concepts.push(Concept { name: "king_in_check".into(), severity: 100, side: us_color.into(), phrase: format!("{}'s king is in check!", us_color), elo_min: 1000 });
     }
     if groups.king_safety.blended.abs() > 40 {
-        // blended < 0 → White's king is penalised (exposed); > 0 → Black's king is penalised
+        // king_safety.blended is us-them relative (like development below), not
+        // White-relative: blended < 0 means `us` (side to move) has the less safe
+        // king; > 0 means `them` does. Previously hardcoded "white"/"black" here
+        // regardless of side to move — wrong whenever Black was to move.
         let (side, phrase) = if groups.king_safety.blended < 0 {
-            ("white", "White's king is exposed".into())
-        } else { ("black", "Black's king is exposed".into()) };
+            (us_color, format!("{}'s king is exposed", us_color))
+        } else { (them_color, format!("{}'s king is exposed", them_color)) };
         concepts.push(Concept { name: "king_exposed".into(), severity: groups.king_safety.blended.abs(), side: side.into(), phrase, elo_min: 1400 });
     }
 

@@ -1,3 +1,5 @@
+pub mod canonical;
+pub mod canonicalize_fen_cmd;
 pub mod chess;
 pub mod core;
 // critter_eval_cmd removed — undifferentiated alias for hugm-eval (BUG-7)
@@ -51,6 +53,7 @@ impl Plugin for ChessdbPlugin {
             Box::new(nnue_eval_cmd::NnueEval),
             Box::new(coach_derive_cmd::DeriveCoachSignals),
             Box::new(zobrist::Zobrist),
+            Box::new(canonicalize_fen_cmd::CanonicalizeFen),
         ]
     }
 }

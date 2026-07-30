@@ -21,7 +21,7 @@ def import-records [games: list, username: string, db: string] {
     }
     if ($corpus.moves | is-not-empty) {
         db-merge $db "moves" $corpus.moves [
-            "game_id" "position_id" "next_position_id" "ply" "move_number" "color" "san" "uci"
+            "game_id" "position_id" "next_position_id" "ply" "move_number" "color" "san" "canonical_san" "uci"
         ]
     }
 
@@ -135,17 +135,47 @@ export def "chess-review" [
     review-game $game_id $db
 }
 
-# Move frequencies and average ELO for a position (identified by Zobrist hash).
+# Move frequencies and average ELO for a position (identified by its
+# canonical, White-always-to-move Zobrist hash — see nu_plugin_chessdb's
+# PLAN.md "Canonical position identity" section). With --username, also
+# reports how often that specific player faced this position: since the
+# position collapses real color-mirror occurrences from either side of any
+# game onto one row, "hit this position" only means something relative to
+# whose turn it actually was — times_to_play counts occurrences where the
+# player was the one to move, times_to_wait counts occurrences (in the
+# player's own games) where the opponent was to move instead.
 export def "chess-explore" [
     zobrist: string
     --db: string = "./chess.db"
+    --username: string
 ] {
-    open $db | query db "
-        SELECT m.san,
+    let moves_breakdown = (open $db | query db "
+        SELECT m.canonical_san as san,
                COUNT(*) as times_played,
                ROUND(AVG((g.white_elo + g.black_elo) / 2.0)) as avg_elo
         FROM moves m JOIN games g ON m.game_id = g.game_id
         WHERE m.position_id = ?
-        GROUP BY m.san ORDER BY times_played DESC
-    " --params [$zobrist]
+        GROUP BY m.canonical_san ORDER BY times_played DESC
+    " --params [$zobrist])
+
+    if ($username | is-empty) {
+        return $moves_breakdown
+    }
+
+    let familiarity = (open $db | query db "
+        SELECT
+            SUM(CASE WHEN m.color = (CASE WHEN g.white = ? THEN 'white' ELSE 'black' END)
+                THEN 1 ELSE 0 END) as times_to_play,
+            SUM(CASE WHEN m.color != (CASE WHEN g.white = ? THEN 'white' ELSE 'black' END)
+                THEN 1 ELSE 0 END) as times_to_wait
+        FROM moves m JOIN games g ON m.game_id = g.game_id
+        WHERE m.position_id = ? AND (g.white = ? OR g.black = ?)
+    " --params [$username, $username, $zobrist, $username, $username]).0?
+        | default {times_to_play: 0, times_to_wait: 0}
+
+    {
+        times_to_play: ($familiarity.times_to_play | default 0)
+        times_to_wait: ($familiarity.times_to_wait | default 0)
+        moves: $moves_breakdown
+    }
 }

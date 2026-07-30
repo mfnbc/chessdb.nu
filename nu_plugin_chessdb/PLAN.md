@@ -566,7 +566,526 @@ RESOLVED:
   (game_id, source, result-relative-to-username, played_at, eco/opening) matched
   expectations; full test suite 20→34 passing.
 
-OPEN: none currently tracked.
+Canonical position identity (tablebase-style dedup) — scoped and
+implemented 2026-07-29
+
+Follow-on from board normalization, at the user's request: instead of
+normalizing only *ephemerally* inside one evaluation call, make
+`positions.zobrist`/`positions.fen` themselves canonical (White-always-to-
+move) — the same technique endgame tablebases use to collapse color-mirror
+positions into one stored entry. Clarified first that this is *not* needed
+for sign-correctness (already solved by board normalization — `hugm_score`/
+`state_id` are already proven mover-relative and identical across mirrors,
+verified directly in that work). The only remaining, distinct benefit is
+deduplication: two different real games reaching exact color-mirror
+positions currently get evaluated and stored twice.
+
+**Key simplification found while scoping**: no new "was this occurrence
+flipped" tracking column is needed anywhere. It's already fully derivable
+from `moves.color` (already stored) plus ply alternation — for any
+`moves` row, the position *before* the move (`position_id`) was flipped iff
+`color == "black"`, and the position *after* it (`next_position_id`) was
+flipped iff `color == "white"` (verified against `core.rs`'s actual ply/color
+assignment in `GameVisitor::san`). Chess alternation makes this free.
+
+**Resolved by asking, not deciding unilaterally**: `chess-explore` aggregates
+`moves.san` (real, as-played notation) per position. If position identity
+becomes canonical, a canonical position reached from real games via *either*
+color's perspective would otherwise mix White's-frame SAN ("e4", "Nf3") with
+Black's-frame SAN ("...e5", "...Nf6") under one grouped result — nonsense to
+a human. User chose: **translate SAN to the canonical frame** for every
+move, not just accept the mixed output or keep moves real-only. Confirmed
+this is buildable: `shakmaty::Move`'s variants (`Normal`/`EnPassant`/
+`Castle`/`Put`) reference only `Square`/`Role` fields, no color at all — so
+translating a move to canonical frame is purely flipping its squares via
+`Square::flip_vertical()` (files unaffected), then `SanPlus::from_move(pos,
+&move)` regenerates correct notation against the canonical position.
+
+**What changes:**
+1. **New shared module** (not yet named — candidate: `src/canonical.rs`)
+   housing the normalize-to-white-to-move logic, used by *both*
+   `core.rs` (needs it per-ply, for both the pre-move and post-move
+   position, to support SAN translation) and `eval::position.rs`'s existing
+   `normalize_for_eval` (which should call into this shared version rather
+   than duplicate it — `core.rs` is the more foundational layer here, so the
+   dependency should run eval → core/canonical, not the other way).
+2. **`core.rs::GameVisitor::san`** (`src/core.rs:150-200`): currently computes
+   `fen`/`zobrist` from `new_pos` (the real post-move position) directly.
+   Needs to: normalize `self.pos` (pre-move) and `new_pos` (post-move) each
+   to canonical form; if `self.pos` needed flipping, flip `mv` (the move
+   just played) via a new `flip_move(&Move) -> Move` helper before calling
+   `SanPlus::from_move` for the *stored* SAN text; store the canonical
+   `fen`/`zobrist` (not real) as this row's position identity.
+3. **`process_corpus.rs`**: the hardcoded initial-position zobrist
+   (`"463b96181691fc9c"`, `position.rs`/`process_corpus.rs`) is already
+   White-to-move — unaffected. `board_pieces` (derived from `m_row.fen`)
+   needs to derive from the canonical fen for consistency, once `fen` is
+   canonical.
+4. **Evaluation itself (`analyze_fen_with_engine_score`) needs no change in
+   logic** — feeding it an already-canonical FEN just means
+   `normalize_for_eval` is a no-op (`was_flipped: false` always), and
+   `hugm_score`/`hugm_eval_arr`/`state_id` come out identical to today's
+   values either way (already proven mover-relative/orientation-invariant).
+   Confirmed `process_corpus.rs` never persists any square/color-bearing
+   `SensorReport` detail (only the scalar `hugm_score`/`hugm_eval_arr`/
+   `state_id`/`mate_in_1`/`is_checkmate` — checked `PendingPos`'s fields
+   directly), so there's no square-level correctness concern for the stored
+   pipeline from evaluating the canonical FEN instead of the real one.
+5. **Naming cleanup opportunity, found while reading this code**:
+   `core.rs::get_canonical_hash` is *already* named "canonical" but
+   currently just means "the real position's hash" — after this change it
+   would need to become genuinely canonical, or the name should be
+   reconsidered if a real (non-canonical) hash is still needed somewhere.
+
+**Consequence — bigger than prior migrations, flagging clearly**: this is
+*not* a "safe to re-run chess-derive" refresh like BUG-13's or BUG-12's.
+It changes what `positions.zobrist`/`positions.fen` *mean* — existing rows
+were built under the real-position convention. Any existing database needs
+`games`/`positions`/`moves`/`move_states` wiped and fully rebuilt via
+`chess-sync` from scratch (re-fetching from chess.com), not just a targeted
+re-derive. Worth confirming there's no other data (e.g. consumed anomaly/
+baseline history) the user cares about preserving before this runs.
+
+**Not yet resolved, needs a decision during implementation**:
+`chess-explore`'s `--params [$zobrist]` input — once zobrist is canonical,
+does the caller need to canonicalize their own lookup zobrist first (e.g.
+if given a real FEN/zobrist from elsewhere), or should `chess-explore`
+accept a real FEN and canonicalize it internally before querying? Leaning
+toward the latter for usability, not decided.
+
+**Implemented (2026-07-29), confirmed via "yes, go ahead":**
+1. `src/canonical.rs` — new shared module: `normalize_to_white_to_move`
+   (extracted verbatim from `eval::position::normalize_for_eval`'s old
+   inline logic — same bitboard/`Setup` rebuild, now the single copy),
+   `unflip_square`, and `flip_move` (pure square-flip on `shakmaty::Move`'s
+   `Normal`/`EnPassant`/`Castle`/`Put` variants — no color field to touch).
+   `eval::position::normalize_for_eval`/`unflip_square` are now thin
+   wrappers delegating here — no behavior change, confirmed by the full
+   test suite passing unchanged after the extraction.
+2. `core.rs::GameVisitor::san` (the function both `pgn_to_fens`, used by
+   `process_corpus.rs`'s real sync pipeline, and `pgn_to_batch_record`
+   share): now stores `fen`/`zobrist` from
+   `canonical::normalize_to_white_to_move(&new_pos)` instead of the real
+   `new_pos`. When the pre-move position had Black to move, `san` is
+   regenerated via `canonical::flip_move(&mv)` +
+   `shakmaty::san::SanPlus::from_move(canonical_pre_pos, &flipped_mv)`
+   rather than the real SAN text — `uci` is left untouched (real terms;
+   confirmed nothing in `chessdb/*.nu` reads `moves.uci`, only inserts it).
+   Note: had to qualify as `shakmaty::san::SanPlus` rather than the
+   `pgn_reader`-re-exported `SanPlus` already imported at the top of the
+   file — `pgn-reader = "0.24"` pins its own `shakmaty = "0.25"` internally,
+   a different version than this crate's direct `shakmaty = "0.26"`
+   dependency, so `pgn_reader::SanPlus::from_move` rejects our (0.26)
+   `Chess`/`Move` types at the type level. `shakmaty` 0.26 has its own
+   `san::SanPlus` with an identical `from_move` — used that instead.
+3. `process_corpus.rs`'s `board_pieces` (derived from `m_row.fen`) needed
+   no change — it automatically became canonical-consistent once `fen`
+   itself is canonical, confirmed by re-reading (just a prefix scan over
+   the FEN string, orientation-agnostic).
+4. Verification (`tests/canonical_identity.rs`, 3 new tests, all
+   hand-derived independently of `canonical.rs`'s own implementation):
+   - `1. Nf3` (White's move from a White-to-move real position): stored
+     `fen`/`zobrist` are the canonical mirror
+     (`rnbqkb1r/pppppppp/5n2/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 1 1`); `san`
+     stays `"Nf3"` (pre-move position was already White-to-move, so real =
+     canonical trivially); `uci` stays real (`g1f3`).
+   - `1. Nf3 Nf6` (Black's reply, played from a real Black-to-move
+     position): `san` is translated to `"Nf3"` (not the real `"Nf6"`) —
+     Black's g8-f6 mirrors onto canonical White's g1-f3; `uci` stays real
+     (`g8f6`); the real resulting position is White-to-move again, so
+     `fen`/`zobrist` pass through unflipped.
+   - Cross-checked `pgn_to_fens`'s stored zobrist for `1. Nf3` against an
+     *independently* parsed-and-normalized mirror FEN (not derived via
+     `pgn_to_fens` at all) — hashes matched, demonstrating the actual dedup
+     mechanism: two different sources reaching color-mirror-image real
+     positions converge on one identity.
+   - Full test suite green throughout (41 tests across lib + integration
+     files, up from 37 before this feature), `cargo clippy --all-targets`
+     clean on every touched file, STS smoke test
+     (`cargo test --test sts_positional -- --ignored`) still passes.
+5. **`get_canonical_hash` naming resolved**: it now genuinely computes a
+   canonical hash at its call site in `GameVisitor::san` (called on
+   `canonical_pos`, not `new_pos`) — the name is accurate there. Its other
+   two call sites (`ScanVisitor::san`, `pgn_to_batch_record`'s
+   initial-position hash) were **not** touched — see below.
+
+**Found but explicitly deferred (not fixed this pass):** `core.rs` has a
+second, separate PGN-replay visitor — `ScanVisitor`/`scan_pgn`, backing the
+`PgnScan` plugin command — with its own `san` method that calls
+`get_canonical_hash` on real (non-canonicalized) positions, same latent
+mislabeling `GameVisitor::san` had before this fix. Confirmed via
+`grep -rl` across `chessdb/*.nu` and this crate that `PgnScan`/`scan_pgn`/
+`ScanGameRow`/`ScanMoveRow` have **zero consumers** anywhere (not wired
+into the Nu sync pipeline, no tests, no docs) — it's a dead/experimental
+command. Left as-is to avoid unverified changes to unused code in this
+pass; worth fixing for consistency if `PgnScan` is ever put to use.
+
+**Not yet resolved — real loose end, needs a decision, not blocking this
+migration:** `chess-explore`'s `zobrist: string` parameter (`chessdb/
+sync.nu:139`) is looked up directly against `moves.position_id`. Now that
+stored zobrists are canonical, a zobrist the user computes independently
+from a Black-to-move FEN (e.g. via the existing `chessdb zobrist <fen>`
+plugin command, which hashes the *real*, non-canonical position — left
+alone per the original consolidation note, since it's a general-purpose
+CLI command, not implicitly tied to the `positions` table's convention)
+will not match. No Nu-side command currently exposes "canonicalize this
+FEN first." Options: teach `chess-explore` to accept a FEN and canonicalize
+internally (better usability, needs a new plugin command or Nu-side
+port of the transform), or document that `chess-explore` only accepts
+zobrists already sourced from this database (`positions`/`moves` query
+results, which are self-consistently canonical). Deferred until it
+actually blocks someone.
+
+**Follow-on: player-perspective position familiarity (2026-07-29)** —
+pushed the canonical-identity model onto `chess-explore` (`chessdb/
+sync.nu`): since a canonical position collapses both sides' real
+occurrences onto one row, "how many times has this position come up"
+only means something once you say *whose turn* it was. Added an optional
+`--username` flag: `moves.position_id` for a given zobrist is joined
+against `games`/`moves.color` the same way `position-win-rates`'s
+`player_color` CTE already does, split into `times_to_play` (occurrences
+where `--username` was the one to move there) and `times_to_wait`
+(occurrences, within that player's own games, where the opponent was to
+move instead). Without `--username`, output is unchanged (the original
+plain san/times_played/avg_elo table) — verified both call shapes plus
+the split itself against a hand-built two-row throwaway SQLite db (one
+move where the profiled player is to move, one where the opponent is)
+via direct `nu -c` module invocation, since this is pure SQL with no
+plugin dependency.
+
+**Top-down audit (2026-07-30), at the user's request ("push this identity
+onto everything else... needs full implementation/audit")** — went back
+through every Nu-side consumer of `positions.fen`/`moves.san` to check
+whether canonicalization broke an assumption of real (non-canonical)
+orientation. Found two real, concrete regressions, both fixed:
+
+1. **`chess-review`'s human-facing move display was showing the wrong
+   notation.** The original canonical-identity implementation overwrote
+   `moves.san` itself with the canonical-frame translation (needed for
+   `chess-explore`'s cross-game grouping) — but `review-game`
+   (`chessdb/sync.nu`) selects `m.san` to show a human the actual moves of
+   one specific real game, and this directly contradicts the user's
+   original design principle for this whole feature ("the moves and game
+   retains w/b p/o relative to who is to move"). A player who played
+   1...Nf6 would see "Nf3" in their own game review — indistinguishable
+   from a bug. Fixed by splitting into two columns: `core.rs::MoveRow`
+   gained `canonical_san` alongside the existing `san`; `GameVisitor::san`
+   now always keeps `san` as the real, as-played SAN, and computes
+   `canonical_san` separately (translated via the same
+   `flip_move`/`SanPlus::from_move` logic, only when the pre-move position
+   had Black to move). Plumbed through `process_corpus.rs`,
+   `pgn_to_fens.rs`'s `move_rows_value`, the `moves` table schema
+   (`canonical_san TEXT`, migration-safe `ALTER TABLE`), and `sync.nu`'s
+   `db-merge` column list. `chess-explore` now groups by `m.canonical_san`
+   (aliased back to `san` in its output for shape compatibility) instead of
+   `m.san` — restoring the property that was the entire point of
+   translating SAN in the first place, which the original implementation
+   had accidentally achieved by breaking `chess-review` instead of by
+   adding a dedicated column. Verified: `tests/canonical_identity.rs` now
+   asserts `1. Nf3 Nf6`'s Black-move row has `san == "Nf6"` (real) and
+   `canonical_san == "Nf3"` (translated); a hand-built two-game throwaway
+   SQLite db confirmed `chess-explore` collapses both games' occurrences
+   into one `canonical_san` row while `chess-review` on the same data shows
+   the real per-game SAN (`Nf6`, not `Nf3`).
+2. **ECO opening classification (`enrich-openings`, `db.nu`) silently
+   breaks for roughly half of all named openings.** It joins
+   `positions.fen` (now canonical) against `openings.fen` (seeded verbatim
+   from JeffML/eco.json's real, non-canonical FENs — ECO entries are
+   recorded at whatever ply/side they were actually reached, odd or even).
+   Any opening keyed at a Black-to-move ply would never match again.
+   Fixed at the seed boundary, not the join: added a new plugin command,
+   `chessdb canonicalize-fen` (`src/canonicalize_fen_cmd.rs`, backed by
+   `core::canonicalize_fen`, reusing `canonical::normalize_to_white_to_move`
+   — mirrors `zobrist.rs`'s string-or-list shape), and `fetch-and-seed-eco`
+   now runs every downloaded ECO FEN through one batched
+   `chessdb canonicalize-fen` call before storing (one plugin call for the
+   whole dataset, not one per row — `enumerate`+`upsert` reassembles the
+   rows with their canonical `fen`). `enrich-openings`'s join itself is
+   unchanged — both sides are canonical now, so `p.fen = o.fen` is
+   meaningful again. Existing `openings` tables must be rebuilt via
+   `chess-seed-openings` (already deletes+reseeds) once this ships.
+   Verified: new test `canonicalize_fen_matches_pgn_to_fens_for_the_same_
+   position` confirms the plugin command's output agrees with what
+   `pgn_to_fens` independently stores for the same real position, plus a
+   no-op check for already-White-to-move input; the `db.nu` batching logic
+   (`enumerate`/`upsert` reassembly) was checked separately with a mocked
+   `chessdb canonicalize-fen` (the real plugin can't be loaded in this
+   sandbox's Nu 0.114 — built for 0.111 — so this is a logic-only check,
+   same limitation noted earlier in this session).
+3. **Checked and found NOT broken, for completeness**: `chessdb
+   derive-coach-signals`' FEN-reparsing fallback path (`coach_derive_cmd.rs`,
+   used when a row lacks a precomputed `state_id`) re-derives `state_id`
+   from `p.fen` directly with no normalization step of its own — but since
+   `p.fen` is now already canonical, this fallback gets the needed
+   normalization for free, and its only output (`state_id`) was already
+   established (board-normalization work, above) to be orientation-
+   invariant. `derive.nu`'s query passing `p.fen` through was safe
+   unchanged.
+
+**Migration required for any existing database** (was already flagged
+before implementation, repeating here since it's now actionable): existing
+`games`/`positions`/`moves`/`move_states` rows were built under the old
+real-position convention and are stale under the new canonical one. Wipe
+those tables and fully re-run `chess-sync` from chess.com before relying on
+`positions.zobrist` for lookups/dedup — a targeted re-derive (like BUG-12/
+BUG-13's chess-derive refresh) is not sufficient here, since position
+*identity* itself changed, not just a derived signal. Also run
+`chess-seed-openings` (deletes+reseeds `openings`, then re-enriches
+`games.eco`/`.opening`) — the old `openings` rows are real, non-canonical
+FENs from before the `fetch-and-seed-eco` fix above and will not match.
+
+Board-normalization — scoped and implemented (2026-07-29)
+
+User's proposal, refined over the course of the color/perspective audit below:
+instead of threading a `color`/`us`/`them` parameter through every scoring
+function (the fix I'd proposed for BUG-13 alone), normalize the *board* once
+— transform any position so White is always the side to move (swap piece
+colors, mirror ranks, swap castling rights, mirror the en passant square) —
+before evaluation, and let every scoring function just always compute
+White-minus-Black, the way `material_score` already does today. Un-flip only
+at the one boundary that produces human-readable output (squares/colors in
+`SensorReport`).
+
+**Key finding that changes the size estimate**: `compute_groups` already
+does `let us = chess.turn(); let them = us.other();` and every scoring
+function (`material_score`, `pawn_structure_score`, `king_safety_score`,
+`piece_activity_score`, `tactical_score`, `detect_pins`/`forks`/`skewers`/
+`discovered`/`outposts`, `center_control_score`, `piece_coordination_score`,
+`tactical_pressure_score`, `vector_features_score`, `development_score`,
+`development_space_score`, `draw_weight`, `king_tropism_score` — 22 functions
+total, verified via `grep -n "fn \w*(.*color: Color" position.rs`) already
+takes a `color: Color` parameter. **None of these 22 functions need to
+change at all.** If the `Chess`/`Board` fed into `compute_groups` is already
+normalized, `chess.turn()` naturally evaluates to White, and every existing
+function call already does exactly the right thing — the ~25 scattered
+`if color.is_white() { .. } else { .. }` branches throughout `position.rs`
+(pawn advance direction, king-shield ranks, promotion distance, 7th-rank
+rook detection, etc. — also verified by grep) all collapse to their White
+branch, correctly, with zero code changes. **The entire ~3400-line scoring
+body of `position.rs` is untouched.** This is a much smaller, lower-risk
+change than it first appeared, concentrated entirely at the boundaries:
+
+1. **New: a normalize step.** `fn normalize_for_eval(chess: Chess) -> (Chess, bool /* was_flipped */)`
+   — if `chess.turn() == Black`: mirror the board vertically (`shakmaty::Board::flip_vertical`,
+   library-provided) *and* swap each piece's color (shakmaty has no single
+   call for this — `Color::flip`/`ByColor::flip` exist for swapping a pair of
+   values, but not a "recolor every piece on a board" convenience; this is
+   new, hand-written code, iterate pieces and rebuild), swap castling
+   rights White↔Black, mirror the en passant square's rank if present, set
+   side-to-move to White. Called once, at the top of
+   `analyze_fen_with_engine_score`, before `compute_groups`/`build_sensor_report`.
+2. **New: an unflip step**, applied to exactly the fields that carry
+   real-board coordinates/colors — concentrated almost entirely in `PieceRef`
+   (`square` needs `Square::flip_vertical()` — again library-provided —
+   `color` needs `Color::other()`), applied once to every struct containing
+   a `PieceRef` (`Fork`, `Pin`, `Skewer`, `DiscoveredAttack`, `HangingPiece`,
+   `Outpost`, `DevelopmentInfo.undeveloped_pieces`) plus the few standalone
+   `square`/`color` fields (`PassedPawn`, `IsolatedPawn`, `PawnBreak`).
+   `OpenFile`/`DoubledPawn`/`PawnIsland` (file-letter only) need no change —
+   vertical-only flip doesn't touch files. `threat_graph.rs`'s
+   `EvaluatedFork`/`HangingPiece` (also `PieceRef`-bearing, also has its own
+   `is_white()` labeling sites) needs the same treatment — verified it has
+   the identical pattern.
+3. **Unchanged, verified**: `EvalGroups`/`.terms` structure, `extract_concepts`,
+   `encode_state`/`decode_state_id`, `Concept`/`GatedIssue`, all of
+   `chessdb/*.nu` — everything downstream of `SensorReport` already consumes
+   correctly-shaped output and needs zero changes, since the external
+   contract (what "us"/"them"/`side` mean) doesn't change, only how it's
+   computed internally.
+4. **Side effect, not a separate task**: this fixes BUG-13 for free.
+   `material_score` doesn't need the color-parameter fix I proposed earlier
+   at all — on a pre-normalized board it already computes White(=real
+   mover)-minus-Black(=real waiter) directly, automatically consistent with
+   the other 8 `us`-relative components. No separate patch needed.
+5. **Does NOT fix BUG-14** (StateVector's either-side concept bits) — that's
+   a `state_id` bitfield design question, orthogonal to board orientation;
+   `sensor.tactical.forks` still combines both colors' forks into one `Vec`
+   regardless of whether the board was normalized first.
+
+**Resolved while scoping** (was an open question, checked directly rather
+than left assumed):
+- `LegalInfo` (`is_check`/`is_checkmate`/`is_stalemate`/`legal_move_count`)
+  and `mate_in_1_exists` are boolean/scalar and color-symmetric — plan to
+  compute these from the *original*, unnormalized `Chess` to avoid any risk,
+  rather than assume they're safe on the flipped one.
+- `Checks{sum_groups, matches_final, delta}` compares `final_score` against
+  a caller-supplied `engine_score`. Checked every caller: `process_corpus.rs`
+  (the actual ingestion pipeline) always passes `None`; only
+  `hugm_eval_cmd.rs`'s optional `--engine-score` CLI flag can supply a real
+  value, and nothing in `chessdb/*.nu` ever sets it — it's a manual, ad-hoc
+  comparison a human can invoke directly, not part of any automated or
+  stored pipeline. Low risk, confirmed rather than assumed.
+
+**Consequence (expected, not a regression)**: `positions.hugm_score`/`state_id`
+get different (corrected) values for any previously-Black-to-move position
+once BUG-13's fix lands as a side effect — same "safe to re-run" data
+migration already noted for BUG-13, via `chess-sync`/`chess-derive`.
+
+**Verification plan when implemented**: full existing test suite should
+pass unchanged (any hardcoded expected `hugm_score`/material values for a
+Black-to-move position that don't survive are exactly BUG-13 being fixed,
+not a regression — verify each such diff by hand). New tests needed: (a) a
+score-sign test mirroring `pawn_break_color_is_invariant_to_side_to_move`
+but for `final_score`/material, (b) critically, a real square/color
+correctness test — take a genuine Black-to-move tactical position, confirm
+a detected fork/pin reports the *actual* board square and color, not a
+flipped one (this is the one new failure mode this whole change introduces,
+so it needs its own explicit test, not just an invariance check).
+
+Implemented as scoped, with one real bug found and fixed during verification
+that the scope didn't anticipate:
+
+- `normalize_for_eval` built via `shakmaty::Setup`/`ByRole`/`ByColor`/
+  `Board::from_bitboards`/`Chess::from_setup` (no direct "swap a whole
+  position's colors" API exists in shakmaty, as expected from scoping —
+  built it from `Board::by_role`/`by_color` bitboard extraction +
+  `Bitboard::flip_vertical` on each, combined with a `ByColor` swap in one
+  pass). `unflip_square`/`unflip_color`/`unflip_piece_ref`/
+  `unflip_sensor_report` cover every color/square-bearing field across
+  `SensorReport` — this ended up larger than the scope's "concentrated
+  almost entirely in `PieceRef`" estimate: `MaterialBalance` (white/black
+  `PieceCounts` + `bishop_pair_white`/`black`), and seven more structs with
+  a bare `color` field but no square at all (`OpenFile`, `DoubledPawn`,
+  `PawnIsland`, `MinorityAttack`, `PawnMajority`, `RookOnSeventh`,
+  `CenterControl`, `KingExposure`, `DevelopmentInfo`) all needed the swap
+  too — verified against every struct in `concept_types.rs`/`sensor.rs`
+  directly rather than assuming the scope's estimate was complete.
+- **Bug found during verification, not anticipated in scoping**:
+  `GatedIssue.side` gets correctly un-flipped, but `GatedIssue.phrase` is
+  free text built with literal "White"/"Black"/"white"/"black" words baked
+  in by `format!` calls *inside* `build_sensor_report`, before the un-flip
+  pass runs — so `side` and `phrase` disagreed (e.g. `side: "white"`,
+  `phrase: "Black is up 207 centipawns..."`) until a dedicated
+  `unflip_phrase` word-swap (sentinel-based, to avoid double-flipping a
+  phrase containing both words) was added. Caught by an independent,
+  hand-verified test (see below), not by the implementation itself —
+  exactly the kind of thing that's easy to miss when the structured field
+  looks right and only the free text is wrong.
+- `threat_graph.rs` needed **zero code changes** — its `EvaluatedFork`/
+  `HangingPiece` output already flows through the same `unflip_sensor_report`
+  pass (`evaluated_forks`/`tactical.hanging` fields), confirmed by test.
+- `LegalInfo`/`mate_in_1_exists` computed from the original unflipped
+  position, as scoped.
+
+**Verification, beyond the scope's plan**: constructed a mirror-position
+test by hand (rank-flip + case-swap + side-to-move flip, computed
+independently of `normalize_for_eval`'s own code) — a genuine White-to-move
+queen fork and its exact Black-to-move mirror. Confirmed attacker/target
+squares, colors, `evaluated_forks`, `hanging` pieces, and `gated_issues`
+(`side` *and* `phrase`) all match the hand-computed expectation exactly, and
+`final_score` is identical between the two mirrors — direct confirmation
+BUG-13 is fixed as a side effect (previously, material's White-relative
+sign would have broken this equality). Also ran the full ~1499-position STS
+corpus (`sts_full_suite_evaluates_without_error`, many Black-to-move) to
+confirm no panics across a large, realistic sample, and a hand-mirrored
+en-passant pair (`e3` vs `e6` targets) to exercise the one code path
+nothing else touched — both succeeded with identical `final_score`/
+`state_id`. Promoted the fork-mirror test to a permanent regression
+(`board_normalization_reports_real_squares_and_colors_for_black_to_move`,
+`motif_canonical.rs`). Full suite: 51 passing (was 50), 0 failed, `cargo
+clippy` clean (no new warnings).
+
+**Consequence, as flagged in scoping**: `positions.hugm_score`/`state_id`
+now compute differently (correctly) for previously-Black-to-move positions
+— re-running `chess-sync`/`chess-derive` is needed to refresh any existing
+database, same as BUG-13's standalone note above.
+
+Color/perspective audit (2026-07-29) — requested re-check for white/black,
+player/opponent mixups given the recurring pattern of such bugs this session
+
+Ran a systematic sweep (Rust + Nu) for every site that compares, branches on,
+or labels something by chess color or side-relative identity. Three concrete,
+fixable-now bugs found and fixed; two deeper architectural findings need a
+scoping decision before touching (recorded as BUG-13/14 below, not fixed).
+
+FIXED:
+- `extract_pawn_breaks` (`position.rs:1790`) hardcoded `color: "white".into()`
+  for the us-side break and `"black".into()` for the them-side break,
+  regardless of side to move — every sibling extractor
+  (`extract_minority_attack`, `extract_pawn_majority`, `extract_rook_on_seventh`)
+  correctly derives the label from an actual `Color` parameter. Now takes
+  `us: Color, them: Color` and derives labels from `is_white()`, matching
+  its siblings. Regression test: `pawn_break_color_is_invariant_to_side_to_move`
+  (same physical break, FEN with `w` vs `b` to move, must report the same
+  absolute color both times — it didn't before this fix).
+- `concepts.rs`'s `king_exposed` block (line ~122) treated
+  `groups.king_safety.blended` as White-relative ("blended < 0 → White's
+  king exposed"), hardcoding `"white"`/`"black"`. But `king_safety.blended`
+  is computed as `king_safety_score(us) - king_safety_score(them)` (`us =
+  chess.turn()`, `position.rs:2541-2542`) — us/them-relative, exactly like
+  `development.blended` two blocks below it, which already handles this
+  correctly via `us_color`/`them_color`. Fixed to match. Regression test:
+  `king_exposed_concept_is_invariant_to_side_to_move`.
+- `chessdb/profile.nu`'s `position-win-rates`: `had_outpost`/`had_open_file`/
+  `had_passed_pawn` took `MAX(ms.has_X)` over every row in the game with no
+  color filter, while the sibling `had_king_exposed` correctly filtered to
+  `CASE WHEN m.color = pg.player_color THEN ... ELSE 0`. Added the same
+  filter to all three, so all four win-rate breakdowns are now consistently
+  scoped to the tracked player's own moves.
+
+NOT FIXED AT THE TIME — flagged for a scoping decision, found while
+verifying the above. BUG-13 was subsequently fixed via the board-
+normalization work (see that section, written above this one in the file
+but implemented after it) — kept here as the original finding for context:
+
+- BUG-13: FIXED (2026-07-29, via board normalization, not a standalone
+  patch) — `EvalGroups.material` is White-relative (computed directly as
+  White piece values − Black piece values, no color parameter — verified in
+  `material_score`, `position.rs:337-476`), but `pawn_structure`,
+  `piece_activity`, `king_safety`, `passed_pawns`, `development`,
+  `vector_features`, `strategic`, and `tactical` are all `us − them`
+  (`us = chess.turn()` at that specific FEN — verified in `compute_groups`,
+  `position.rs:2528-2542` and siblings). `sum_groups` (`position.rs:2451`,
+  → `final_score`/`hugm_score`) adds all nine directly with no correction.
+  Result: `hugm_score` is a genuinely consistent "positive = White ahead"
+  number only via its material term; the other eight components' sign
+  flips depending on whose move it is in that specific stored position.
+  `ai/mod.nu:209-211` documents (and `chessdb/sync.nu`'s `review-game`,
+  `coach_derive_cmd.rs`'s `hurt_player` logic assume) a single uniform
+  "White-relative, flip by mover color" convention for the whole score —
+  true for material, not for the rest. This is the likely root cause behind
+  the `king_exposed`-shaped bugs just fixed (same `us`-vs-White confusion,
+  just at the aggregate-score level instead of a single concept). Not
+  fixed here: correcting this touches the master evaluation number
+  persisted in `positions.hugm_score` and used throughout the coaching
+  pipeline (chess-review deltas, anomaly hurt_player attribution, the
+  AI analyst's documented convention) — needs a decision on where the fix
+  belongs (flip the 8 components in `sum_groups` only, vs. redefining what
+  each `GroupValue.blended` means throughout `position.rs`) before touching it.
+- BUG-14: `StateVector`'s concept-presence bits (`has_fork`, `has_pin`,
+  `has_hanging`, `has_outpost`, `open_file`, `has_passed_pawn`, `has_skewer`,
+  `has_discovered`) are true if *either* side has that concept present —
+  `encode_state`'s `BOOL_BITS` checks read `sensor.tactical.forks`/etc.,
+  which `build_sensor_report` populates by combining both `_us` and `_them`
+  raw examples (e.g. `evaluated_forks.extend(graph.find_forks(them))`).
+  Same for `king_exposure` (picks whichever king is more exposed, board-
+  color-blind — `position.rs:2833-2840`). Consequence: `coach_derive_cmd.rs`'s
+  per-concept baselines/anomalies (e.g. "eval swing when a fork was present")
+  don't distinguish "the player's own fork" from "the player got forked" —
+  both set the same bit. `chessdb/profile.nu`'s player-color filter (just
+  applied above to `had_outpost`/etc.) narrows this to "on the player's own
+  move" but can't fully fix it, since the bit itself doesn't say whose
+  concept it is. A real fix would mean splitting these into per-side bits
+  in the `state_id` bitfield (more of the 16-bit budget, another
+  `move_states` migration) — a StateVector schema change, not a quick fix.
+  Not fixed here.
+
+Also noted, not fixed (pre-existing heuristic-calibration quirk, unrelated
+to color bookkeeping): while verifying the `king_exposed` fix empirically,
+found that `king_safety_score`'s shield/storm table (`position.rs:936-947`)
+indexes a *missing* pawn on a file the same as a pawn still sitting on its
+home square (both leave `shield_rank` at its loop-entry default), and the
+resulting index (0 for White, 7 for Black after the `7 - rank` flip) maps to
+very different bonuses — a fully pawnless king can score as if maximally
+sheltered. Surfaced by a test position where a bare king scored *safer* than
+a fully-castled one. This is a calibration issue in the heuristic itself
+(same class as this file's other acknowledged "GUESS weight" gaps), not a
+color-mixup — flagged here only because it's exactly the kind of thing that
+would otherwise get silently absorbed into "well, chess heuristics are
+approximate" without anyone writing down what was actually observed.
+
+OPEN: BUG-14 only now (see above — needs a `state_id` schema change, not a
+quick fix). BUG-13 resolved via board normalization.
 
 RESOLVED (continued):
 - BUG-12: FIXED (2026-07-29) — `dataset_builder_cmd.rs`'s two divergent label-computation
@@ -591,3 +1110,10 @@ RESOLVED (continued):
   is stored positive when White is to move and negative when Black is to move (i.e. the label
   really is side-to-move-relative in the final output, not just in the discarded computation).
   Test suite 34→37 passing.
+  **Flag for whoever revives this (2026-07-30 audit)**: this correctness relies on `write_shard`'s
+  input `fen` being real (bulletformat's own side-to-move flip, `if stm == 1 { ... }`, is keyed
+  off the FEN's own turn token). This path isn't currently wired to read from the `positions`
+  table via any `chessdb/*.nu` command — if it ever is, and the source is `positions.fen`, that
+  FEN will be canonical (always "w" to move), which would make bulletformat's internal flip a
+  permanent no-op. Re-verify the score/result labeling once this pipeline is unpaused and fed
+  from the database rather than an ad hoc external source.

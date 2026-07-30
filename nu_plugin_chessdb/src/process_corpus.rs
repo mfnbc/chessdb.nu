@@ -116,6 +116,7 @@ impl PluginCommand for ProcessCorpus {
                                 "move_number" => Value::int(m_row.move_number as i64, span),
                                 "color" => Value::string(&m_row.color, span),
                                 "san" => Value::string(&m_row.san, span),
+                                "canonical_san" => Value::string(&m_row.canonical_san, span),
                                 "uci" => Value::string(&m_row.uci, span),
                             };
                             out_moves.push(Value::record(move_record, span));

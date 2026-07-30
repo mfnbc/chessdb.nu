@@ -339,9 +339,9 @@ def "position-win-rates" [username: string --db: string = "./chess.db"] {
         ),
         game_flags AS (
             SELECT ms.game_id,
-                   MAX(ms.has_outpost) as had_outpost,
-                   MAX(ms.has_open_file) as had_open_file,
-                   MAX(ms.has_passed_pawn) as had_passed_pawn,
+                   MAX(CASE WHEN m.color = pg.player_color THEN ms.has_outpost ELSE 0 END) as had_outpost,
+                   MAX(CASE WHEN m.color = pg.player_color THEN ms.has_open_file ELSE 0 END) as had_open_file,
+                   MAX(CASE WHEN m.color = pg.player_color THEN ms.has_passed_pawn ELSE 0 END) as had_passed_pawn,
                    MAX(CASE WHEN m.color = pg.player_color THEN ms.king_exposed ELSE 0 END) as had_king_exposed
             FROM move_states ms
             JOIN moves m ON m.game_id = ms.game_id AND m.ply = ms.ply

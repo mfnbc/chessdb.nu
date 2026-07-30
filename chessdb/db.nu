@@ -73,6 +73,7 @@ export def init-db [db: string] {
             move_number      INTEGER,
             color            TEXT,
             san              TEXT,
+            canonical_san    TEXT,
             uci              TEXT,
             PRIMARY KEY (game_id, ply),
             FOREIGN KEY (game_id)          REFERENCES games(game_id),
@@ -80,6 +81,12 @@ export def init-db [db: string] {
             FOREIGN KEY (next_position_id) REFERENCES positions(zobrist)
         )
     " | ignore
+    # san is the real, as-played move (for single-game review); canonical_san
+    # is the same move translated into the canonical (White-to-move) frame
+    # positions.zobrist/.fen use, for grouping by position identity across
+    # games (see chess-explore) — mixing real-frame SAN from either side
+    # under one canonical position would be meaningless there.
+    try { open $db | query db "ALTER TABLE moves ADD COLUMN canonical_san TEXT" } catch { }
     open $db | query db "CREATE INDEX IF NOT EXISTS idx_moves_pos ON moves(position_id)" | ignore
 
     # move_states columns are decoded once, here and in the migration/backfill
@@ -209,6 +216,13 @@ export def fetch-and-seed-eco [db: string] {
         print "Warning: ECO download failed — opening enrichment disabled."
         return
     }
+    # ECO data is keyed by real FENs at whatever ply/side eco.json recorded
+    # them at, but enrich-openings joins against positions.fen, which is
+    # canonical (White-always-to-move) — convert once here, in one batched
+    # plugin call, or matching silently fails for every opening recorded at
+    # a Black-to-move ply.
+    let canonical_fens = ($rows | get fen | chessdb canonicalize-fen)
+    let rows = ($rows | enumerate | each { |item| $item.item | upsert fen ($canonical_fens | get $item.index) })
     db-merge $db "openings" $rows ["fen" "eco" "name" "moves"]
     print $"Seeded ($rows | length) ECO opening positions."
 }

@@ -1787,12 +1787,14 @@ fn extract_pawn_islands(board: &shakmaty::Board) -> Vec<PawnIsland> {
     results
 }
 
-fn extract_pawn_breaks(groups: &EvalGroups) -> Vec<PawnBreak> {
+fn extract_pawn_breaks(groups: &EvalGroups, us: Color, them: Color) -> Vec<PawnBreak> {
     let mut results = Vec::new();
     let break_examples = groups.pawn_structure.terms.get("pawn_break_examples");
     let opp_terms = groups.pawn_structure.terms.get("opp_terms")
         .and_then(|v| v.as_object());
     let opp_breaks = opp_terms.and_then(|o| o.get("pawn_break_examples"));
+    let us_label = if us.is_white() { "white" } else { "black" };
+    let them_label = if them.is_white() { "white" } else { "black" };
 
     // pawn_break_examples from the us side (for us pawns)
     if let Some(arr) = break_examples.and_then(|v| v.as_array()) {
@@ -1801,7 +1803,7 @@ fn extract_pawn_breaks(groups: &EvalGroups) -> Vec<PawnBreak> {
                 ex.get("pawn").and_then(|v| v.as_str()),
                 ex.get("to").and_then(|v| v.as_str()),
             ) {
-                results.push(PawnBreak { square: pawn.into(), color: "white".into() });
+                results.push(PawnBreak { square: pawn.into(), color: us_label.into() });
             }
         }
     }
@@ -1812,7 +1814,7 @@ fn extract_pawn_breaks(groups: &EvalGroups) -> Vec<PawnBreak> {
                 ex.get("pawn").and_then(|v| v.as_str()),
                 ex.get("to").and_then(|v| v.as_str()),
             ) {
-                results.push(PawnBreak { square: pawn.into(), color: "black".into() });
+                results.push(PawnBreak { square: pawn.into(), color: them_label.into() });
             }
         }
     }
@@ -2825,7 +2827,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         doubled_pawns: extract_doubled_pawns(board),
         isolated_pawns: extract_isolated_pawns(board),
         pawn_islands: extract_pawn_islands(board),
-        pawn_breaks: extract_pawn_breaks(groups),
+        pawn_breaks: extract_pawn_breaks(groups, us, them),
         minority_attack: extract_minority_attack(groups, us),
         pawn_majority: extract_pawn_majority(groups, us, them),
         rook_on_seventh: extract_rook_on_seventh(groups, us, them),
@@ -2892,6 +2894,170 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
     }
 }
 
+/// Normalize a position so White is always the side to move — see
+/// `crate::canonical::normalize_to_white_to_move`'s doc comment for why.
+/// Every scoring function in this file already takes a `Color` and computes
+/// `us − them` where `us = chess.turn()` — feed them a position where White
+/// always *is* `chess.turn()`, and they need no changes at all; the ~25
+/// scattered `if color.is_white() {..} else {..}` branches throughout this
+/// file all correctly collapse to their White arm.
+///
+/// Returns `(normalized, was_flipped)`. When `was_flipped`, board-coordinate
+/// output (squares/colors in `SensorReport`) must be un-flipped back before
+/// it reaches a human — see `unflip_square`/`unflip_color` below. Scores
+/// need no such correction: after normalization they're already relative to
+/// whoever is really to move, which is what every consumer wants.
+fn normalize_for_eval(chess: &Chess) -> Result<(Chess, bool)> {
+    crate::canonical::normalize_to_white_to_move(chess)
+}
+
+/// Undo `normalize_for_eval`'s vertical flip on a single square. Not paired
+/// with a color swap here — callers apply `unflip_color` separately, since
+/// some fields (e.g. `OpenFile.file`) have a square-ish component but no
+/// color, and some have a color but no square.
+fn unflip_square(sq: Square) -> Square {
+    crate::canonical::unflip_square(sq)
+}
+
+fn unflip_color(color_str: &str) -> String {
+    if color_str == "white" { "black".into() } else { "white".into() }
+}
+
+/// `GatedIssue.phrase` is free text built (inside `build_sensor_report`,
+/// before this un-flip pass runs) with literal "White"/"Black"/"white"/
+/// "black" words baked in via format! — e.g. "Black is up 207 centipawns in
+/// material". Unlike `.side`, there's no structured field to derive a
+/// corrected phrase from at this point, so swap the words directly. Both
+/// capitalizations are swapped via a sentinel so a phrase containing both
+/// words doesn't get double-flipped by a naive sequential replace.
+fn unflip_phrase(phrase: &str) -> String {
+    const SENTINEL: &str = "\u{0}";
+    phrase
+        .replace("White", SENTINEL)
+        .replace("Black", "White")
+        .replace(SENTINEL, "Black")
+        .replace("white", SENTINEL)
+        .replace("black", "white")
+        .replace(SENTINEL, "black")
+}
+
+/// Un-flip every square/color in a `SensorReport` back to real board terms,
+/// in place. Only called when `normalize_for_eval` actually flipped the
+/// position. Covers every field that carries a color or square — including
+/// ones with a color but no square at all (`OpenFile`, `KingExposure`,
+/// `MinorityAttack`, etc. — vertical-only flipping never touches files, so
+/// those don't need a square correction, but they're still labeled
+/// "white"/"black" and do need the color swap) — verified against every
+/// struct in concept_types.rs/sensor.rs, not just the ones with PieceRefs.
+fn unflip_piece_ref(pr: &mut PieceRef) {
+    pr.square = unflip_square_str(&pr.square);
+    pr.color = unflip_color(&pr.color);
+}
+
+/// `PieceRef.square`/`PassedPawn.square`/etc. are already-formatted strings
+/// (e.g. "d5"), not `Square` values, by the time they reach these structs —
+/// parse, flip, reformat.
+fn unflip_square_str(s: &str) -> String {
+    match s.parse::<Square>() {
+        Ok(sq) => unflip_square(sq).to_string(),
+        Err(_) => s.to_string(), // not a plain square (e.g. a notation string) — leave as-is
+    }
+}
+
+fn unflip_sensor_report(sensor: &mut SensorReport) {
+    // material: a real color/color split (white/black piece counts and
+    // bishop-pair flags), not a score — swap both halves.
+    if let Some(bal) = &mut sensor.material.balance {
+        std::mem::swap(&mut bal.white, &mut bal.black);
+        std::mem::swap(&mut bal.bishop_pair_white, &mut bal.bishop_pair_black);
+        // bal.centipawns is a score (us-relative), not a board fact — leave it.
+    }
+
+    for f in &mut sensor.tactical.forks {
+        unflip_piece_ref(&mut f.attacker);
+        for t in &mut f.targets { unflip_piece_ref(t); }
+    }
+    for p in &mut sensor.tactical.pins {
+        unflip_piece_ref(&mut p.attacker);
+        unflip_piece_ref(&mut p.pinned);
+        unflip_piece_ref(&mut p.shielded);
+    }
+    for s in &mut sensor.tactical.skewers {
+        unflip_piece_ref(&mut s.attacker);
+        unflip_piece_ref(&mut s.front);
+        unflip_piece_ref(&mut s.behind);
+    }
+    for d in &mut sensor.tactical.discovered {
+        unflip_piece_ref(&mut d.mover);
+        unflip_piece_ref(&mut d.attacker);
+        unflip_piece_ref(&mut d.target);
+    }
+    for h in &mut sensor.tactical.hanging {
+        unflip_piece_ref(&mut h.piece);
+    }
+    for ef in &mut sensor.evaluated_forks {
+        unflip_piece_ref(&mut ef.attacker);
+        for t in &mut ef.targets { unflip_piece_ref(t); }
+        if let Some(h) = &mut ef.hangs { unflip_piece_ref(h); }
+    }
+
+    for o in &mut sensor.positional.outposts {
+        unflip_piece_ref(&mut o.piece);
+        unflip_piece_ref(&mut o.supported_by);
+    }
+    for f in &mut sensor.positional.open_files {
+        f.color = unflip_color(&f.color); // file letter unaffected by a vertical-only flip
+    }
+    for pp in &mut sensor.positional.passed_pawns {
+        pp.square = unflip_square_str(&pp.square);
+        pp.color = unflip_color(&pp.color);
+        // pp.rank is an already-orientation-invariant "distance to promotion"
+        // (computed via extract_passed_pawns's own is_white() branch), not a
+        // raw board rank — needs no correction.
+    }
+    for dp in &mut sensor.positional.doubled_pawns {
+        dp.color = unflip_color(&dp.color);
+    }
+    for ip in &mut sensor.positional.isolated_pawns {
+        ip.square = unflip_square_str(&ip.square);
+        ip.color = unflip_color(&ip.color);
+    }
+    for pi in &mut sensor.positional.pawn_islands {
+        pi.color = unflip_color(&pi.color);
+    }
+    for pb in &mut sensor.positional.pawn_breaks {
+        pb.square = unflip_square_str(&pb.square);
+        pb.color = unflip_color(&pb.color);
+    }
+    if let Some(ma) = &mut sensor.positional.minority_attack {
+        ma.color = unflip_color(&ma.color);
+    }
+    for pm in &mut sensor.positional.pawn_majority {
+        pm.color = unflip_color(&pm.color);
+    }
+    for r7 in &mut sensor.positional.rook_on_seventh {
+        r7.color = unflip_color(&r7.color);
+    }
+    if let Some(cc) = &mut sensor.positional.center_control {
+        cc.color = unflip_color(&cc.color);
+    }
+    if let Some(ke) = &mut sensor.positional.king_exposure {
+        ke.color = unflip_color(&ke.color);
+    }
+    if let Some(dev) = &mut sensor.positional.development {
+        dev.color = unflip_color(&dev.color);
+        for p in &mut dev.undeveloped_pieces { unflip_piece_ref(p); }
+    }
+
+    // gated_issues.side/.phrase are built inside build_sensor_report from
+    // the same flipped SensorReport, so both are in flipped-color terms and
+    // need correcting — .side structurally, .phrase as embedded text.
+    for issue in &mut sensor.gated_issues {
+        issue.side = unflip_color(&issue.side);
+        issue.phrase = unflip_phrase(&issue.phrase);
+    }
+}
+
 pub fn analyze_fen(fen: &str) -> Result<PositionRecord> {
     analyze_fen_with_engine_score(fen, None, None)
 }
@@ -2908,16 +3074,31 @@ pub fn analyze_fen_with_engine_score(
 
     let normalized_fen =
         Fen::from_position(chess.clone(), shakmaty::EnPassantMode::Legal).to_string();
-    let phase = compute_phase(chess.board());
+    // LegalInfo/mate_in_1_exists are boolean/scalar and color-symmetric —
+    // computed from the real, unflipped position on purpose, not because
+    // they'd differ, but to keep them independent of the eval-only
+    // normalization below.
     let legal_moves = chess.legal_moves();
     let legal_move_count = legal_moves.len();
-    let groups = compute_groups(&chess, phase, legal_move_count);
-    let mut sensor_report = build_sensor_report(chess.board(), fen, &groups, &chess, phase, player_elo);
-    sensor_report.mate_in_1_exists = legal_moves.iter().any(|m| {
+    let mate_in_1_exists = legal_moves.iter().any(|m| {
         let mut c = chess.clone();
         c.play_unchecked(m);
         c.is_checkmate()
     });
+
+    // Scoring/SensorReport work entirely in a normalized frame where White
+    // is always the side to move — see normalize_for_eval's doc comment.
+    // Scores that come out are already relative to whoever is really to
+    // move, which is what every consumer wants; square/color-bearing output
+    // gets un-flipped back below before it leaves this function.
+    let (eval_chess, was_flipped) = normalize_for_eval(&chess)?;
+    let phase = compute_phase(eval_chess.board());
+    let groups = compute_groups(&eval_chess, phase, legal_move_count);
+    let mut sensor_report = build_sensor_report(eval_chess.board(), fen, &groups, &eval_chess, phase, player_elo);
+    sensor_report.mate_in_1_exists = mate_in_1_exists;
+    if was_flipped {
+        unflip_sensor_report(&mut sensor_report);
+    }
     let final_score = sum_groups(&groups);
     let delta = engine_score.map(|score| final_score - score);
     let sum_groups_match = delta.map(|d| d == 0).unwrap_or(true);

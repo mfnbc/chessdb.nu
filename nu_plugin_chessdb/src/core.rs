@@ -36,7 +36,14 @@ pub struct MoveRow {
     pub ply: u32,
     pub move_number: u32,
     pub color: String,
+    /// The move exactly as played, real perspective — what a human reviewing
+    /// this specific game should see (see `chess-review` in `chessdb/sync.nu`).
     pub san: String,
+    /// The same move translated into the canonical (White-to-move) frame —
+    /// what cross-game aggregation by position identity should group on
+    /// (see `chess-explore`), since mixing real-frame SAN from either side
+    /// under one canonical position is meaningless.
+    pub canonical_san: String,
     pub uci: String,
     pub fen: String,
     pub zobrist: String,
@@ -182,8 +189,40 @@ impl Visitor for GameVisitor {
             }
         };
 
-        let fen = Fen::from_position(new_pos.clone(), EnPassantMode::Legal).to_string();
-        let zobrist = get_canonical_hash(&new_pos);
+        // Store this position's identity in canonical (White-to-move) frame
+        // so real color-mirror positions from different games collapse onto
+        // one row (see canonical.rs). `uci` is left in real terms since
+        // nothing downstream consumes it.
+        let (canonical_pos, _) = match crate::canonical::normalize_to_white_to_move(&new_pos) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(format!("Canonicalization error: {e}"));
+                return;
+            }
+        };
+        let fen = Fen::from_position(canonical_pos.clone(), EnPassantMode::Legal).to_string();
+        let zobrist = get_canonical_hash(&canonical_pos);
+
+        // `san` stays real (as actually played) — human-facing single-game
+        // review (`chess-review`) must show what really happened, not a
+        // color-mirrored move. `canonical_san` is the separate translated
+        // value cross-game aggregation by canonical position should group
+        // on instead (see `chess-explore`), since mixing real-frame SAN from
+        // either side under one canonical position is meaningless there.
+        let canonical_san = if self.pos.turn() == Color::Black {
+            let (canonical_pre_pos, _) = match crate::canonical::normalize_to_white_to_move(&self.pos) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.error = Some(format!("Canonicalization error: {e}"));
+                    return;
+                }
+            };
+            let flipped_mv = crate::canonical::flip_move(&mv);
+            shakmaty::san::SanPlus::from_move(canonical_pre_pos, &flipped_mv).to_string()
+        } else {
+            san_str.clone()
+        };
+
         let move_number = (self.ply / 2) + 1;
         let color = if self.ply.is_multiple_of(2) { "white" } else { "black" };
         self.ply += 1;
@@ -194,6 +233,7 @@ impl Visitor for GameVisitor {
             move_number,
             color: color.to_string(),
             san: san_str,
+            canonical_san,
             uci,
             fen,
             zobrist,
@@ -465,15 +505,19 @@ pub fn legal_moves(fen_str: &str, span: Span) -> Result<Vec<MoveRow>, LabeledErr
     Ok(pos
         .legal_moves()
         .iter()
-        .map(|mv| MoveRow {
-            game_index: 0,
-            ply: 0,
-            move_number: 0,
-            color: "unknown".into(),
-            san: San::from_move(&pos, mv).to_string(),
-            uci: Uci::from_move(mv, shakmaty::CastlingMode::Standard).to_string(),
-            fen: "unknown".into(),
-            zobrist: "unknown".into(),
+        .map(|mv| {
+            let san = San::from_move(&pos, mv).to_string();
+            MoveRow {
+                game_index: 0,
+                ply: 0,
+                move_number: 0,
+                color: "unknown".into(),
+                canonical_san: san.clone(),
+                san,
+                uci: Uci::from_move(mv, shakmaty::CastlingMode::Standard).to_string(),
+                fen: "unknown".into(),
+                zobrist: "unknown".into(),
+            }
         })
         .collect())
 }
@@ -734,4 +778,18 @@ pub fn zobrist(fen_str: &str, as_int: bool, span: Span) -> Result<String, Labele
     } else {
         format!("{:016x}", hash_value)
     })
+}
+
+/// Normalize an arbitrary FEN to the same canonical (White-always-to-move)
+/// frame `positions.zobrist`/`.fen` use. Needed by `chessdb/db.nu`'s
+/// `fetch-and-seed-eco`: ECO opening data (JeffML/eco.json) is keyed by real
+/// FENs at whatever ply/side they were recorded at, but `enrich-openings`
+/// joins against `positions.fen`, which is canonical — without converting
+/// the ECO side first, matching silently fails for every opening recorded
+/// at a Black-to-move ply.
+pub fn canonicalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledError> {
+    let pos = fen_to_chess(fen_str, span)?;
+    let (canonical_pos, _) = crate::canonical::normalize_to_white_to_move(&pos)
+        .map_err(|e| LabeledError::new(format!("Canonicalization error: {e}")))?;
+    Ok(Fen::from_position(canonical_pos, EnPassantMode::Legal).to_string())
 }
