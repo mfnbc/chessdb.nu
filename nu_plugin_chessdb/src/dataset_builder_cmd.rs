@@ -8,10 +8,8 @@ use std::path::Path;
 use std::io::Write;
 use std::collections::HashSet;
 
-use crate::position_encoder::encode_position;
 use crate::ChessdbPlugin;
 use shakmaty::zobrist::ZobristHash;
-use shakmaty::Position;
 
 pub struct DatasetBuilder;
 
@@ -19,7 +17,7 @@ impl PluginCommand for DatasetBuilder {
     type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str { "chessdb bullet-build" }
-    fn description(&self) -> &str { "Build NPZ shards for bullet training from a Nushell table of positions" }
+    fn description(&self) -> &str { "Build bulletformat .bin shards for bullet training from a Nushell table of positions" }
 
     fn signature(&self) -> Signature {
         Signature::build(self.name())
@@ -59,19 +57,7 @@ impl PluginCommand for DatasetBuilder {
             _ => return Err(LabeledError::new("Expected a list of records as input")),
         };
 
-        // Buffers
-        let mut features_buf: Vec<f32> = Vec::with_capacity((shard_size as usize) * 768);
-        let mut labels_buf: Vec<f32> = Vec::with_capacity(shard_size as usize);
-        let mut wdl_buf: Vec<f32> = Vec::with_capacity((shard_size as usize) * 3);
-        let mut weight_buf: Vec<f32> = Vec::with_capacity(shard_size as usize);
-
-        let mut meta_zobrist: Vec<String> = Vec::with_capacity(shard_size as usize);
-        let mut meta_game_id: Vec<String> = Vec::with_capacity(shard_size as usize);
-        let mut meta_ply: Vec<i64> = Vec::with_capacity(shard_size as usize);
-        let mut meta_white_elo: Vec<i64> = Vec::with_capacity(shard_size as usize);
-        let mut meta_black_elo: Vec<i64> = Vec::with_capacity(shard_size as usize);
-        let mut meta_result: Vec<String> = Vec::with_capacity(shard_size as usize);
-        let mut meta_fen: Vec<String> = Vec::with_capacity(shard_size as usize);
+        let mut meta = ShardMeta::with_capacity(shard_size as usize);
 
         let mut shard_idx = 0usize;
         let mut count_in_shard = 0usize;
@@ -118,8 +104,7 @@ impl PluginCommand for DatasetBuilder {
                 if zobrist_set.len() >= max_unique_count {
                     // flush
                     if count_in_shard>0 {
-                        write_shard(&out_dir, shard_idx, &features_buf, &labels_buf, &wdl_buf, &weight_buf,
-                            &meta_zobrist, &meta_game_id, &meta_ply, &meta_white_elo, &meta_black_elo, &meta_result, &meta_fen).map_err(|e| LabeledError::new(format!("write shard error: {}", e)))?;
+                        write_shard(&out_dir, shard_idx, &meta).map_err(|e| LabeledError::new(format!("write shard error: {}", e)))?;
                     }
                     let sentinel = serde_json::json!({"reason":"unique_limit_reached","unique_count":zobrist_set.len(),"total_positions_seen":total_positions_seen,"shard_idx":shard_idx});
                     let sfile = Path::new(&out_dir).join("unique_limit_reached.json");
@@ -131,71 +116,89 @@ impl PluginCommand for DatasetBuilder {
                 }
             }
 
-            let features_full = encode_position(&chess);
-            if features_full.len()<768 { continue; }
-            features_buf.extend_from_slice(&features_full[..768]);
-
-            // label
-            let side_white = chess.turn() == shakmaty::Color::White;
-            let scalar = match result.as_str() {
-                "1-0" => if side_white { 1.0 } else { -1.0 },
-                "0-1" => if side_white { -1.0 } else { 1.0 },
-                "1/2-1/2" | "1/2" => 0.0,
+            // Only recognized result strings produce a usable label downstream
+            // (write_shard's win/draw/loss score); skip anything else here,
+            // at the source, rather than writing an unlabeled row.
+            match result.as_str() {
+                "1-0" | "0-1" | "1/2-1/2" | "1/2" => {}
                 _ => continue,
-            };
-            labels_buf.push(scalar);
-            let (w,d,l) = if scalar>0.0 {(1.0,0.0,0.0)} else if scalar<0.0 {(0.0,0.0,1.0)} else {(0.0,1.0,0.0)};
-            wdl_buf.push(w); wdl_buf.push(d); wdl_buf.push(l);
-            weight_buf.push(1.0_f32);
+            }
 
-            meta_zobrist.push(format!("{:016x}", zob_u64));
-            meta_game_id.push(source_game_id);
-            meta_ply.push(ply);
-            meta_white_elo.push(white_elo);
-            meta_black_elo.push(black_elo);
-            meta_result.push(result);
-            meta_fen.push(fen);
+            meta.zobrist.push(format!("{:016x}", zob_u64));
+            meta.game_id.push(source_game_id);
+            meta.ply.push(ply);
+            meta.white_elo.push(white_elo);
+            meta.black_elo.push(black_elo);
+            meta.result.push(result);
+            meta.fen.push(fen);
 
             count_in_shard += 1;
             if count_in_shard as i64 >= shard_size {
-                write_shard(&out_dir, shard_idx, &features_buf, &labels_buf, &wdl_buf, &weight_buf,
-                    &meta_zobrist, &meta_game_id, &meta_ply, &meta_white_elo, &meta_black_elo, &meta_result, &meta_fen).map_err(|e| LabeledError::new(format!("write shard error: {}", e)))?;
+                write_shard(&out_dir, shard_idx, &meta).map_err(|e| LabeledError::new(format!("write shard error: {}", e)))?;
                 shard_idx +=1; count_in_shard=0;
-                features_buf.clear(); labels_buf.clear(); wdl_buf.clear(); weight_buf.clear();
-                meta_zobrist.clear(); meta_game_id.clear(); meta_ply.clear(); meta_white_elo.clear(); meta_black_elo.clear(); meta_result.clear(); meta_fen.clear();
+                meta.clear();
             }
         }
 
         if count_in_shard>0 {
-            write_shard(&out_dir, shard_idx, &features_buf, &labels_buf, &wdl_buf, &weight_buf,
-                &meta_zobrist, &meta_game_id, &meta_ply, &meta_white_elo, &meta_black_elo, &meta_result, &meta_fen).map_err(|e| LabeledError::new(format!("write shard error: {}", e)))?;
+            write_shard(&out_dir, shard_idx, &meta).map_err(|e| LabeledError::new(format!("write shard error: {}", e)))?;
         }
 
         Ok(PipelineData::empty())
     }
 }
 
-fn write_shard(
-    out_dir: &str,
-    shard_idx: usize,
-    _features: &Vec<f32>,
-    _labels: &Vec<f32>,
-    _wdl: &Vec<f32>,
-    _weights: &Vec<f32>,
-    meta_zobrist: &Vec<String>,
-    meta_game_id: &Vec<String>,
-    meta_ply: &Vec<i64>,
-    meta_white_elo: &Vec<i64>,
-    meta_black_elo: &Vec<i64>,
-    meta_result: &Vec<String>,
-    meta_fen: &Vec<String>,
-) -> anyhow::Result<()> {
-    let n = meta_result.len();
+/// Per-position metadata collected for one shard. `write_shard` derives the
+/// actual bullet-format training label (score/result) from `fen`/`result` at
+/// write time — nothing else here is a training feature, just provenance
+/// for the `.meta.json` sidecar.
+#[derive(Default)]
+struct ShardMeta {
+    zobrist: Vec<String>,
+    game_id: Vec<String>,
+    ply: Vec<i64>,
+    white_elo: Vec<i64>,
+    black_elo: Vec<i64>,
+    result: Vec<String>,
+    fen: Vec<String>,
+}
 
+impl ShardMeta {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            zobrist: Vec::with_capacity(n),
+            game_id: Vec::with_capacity(n),
+            ply: Vec::with_capacity(n),
+            white_elo: Vec::with_capacity(n),
+            black_elo: Vec::with_capacity(n),
+            result: Vec::with_capacity(n),
+            fen: Vec::with_capacity(n),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.zobrist.clear();
+        self.game_id.clear();
+        self.ply.clear();
+        self.white_elo.clear();
+        self.black_elo.clear();
+        self.result.clear();
+        self.fen.clear();
+    }
+}
+
+fn write_shard(out_dir: &str, shard_idx: usize, meta: &ShardMeta) -> anyhow::Result<()> {
+    let n = meta.result.len();
+
+    // bulletformat's `ChessBoard: FromStr` expects "fen | score | result" with
+    // score/result relative to White — it applies its own side-to-move flip
+    // internally (see FromStr::from_str: parses these at face value, then
+    // negates score and does `2 - result` when the FEN's stm is black).
+    // Passing already-side-relative values here would get double-flipped.
     let mut boards: Vec<ChessBoard> = Vec::with_capacity(n);
     for i in 0..n {
-        let fen = &meta_fen[i];
-        let result = meta_result[i].as_str();
+        let fen = &meta.fen[i];
+        let result = meta.result[i].as_str();
         let result_float = match result {
             "1-0" => 1.0_f32,
             "0-1" => 0.0_f32,
@@ -223,18 +226,70 @@ fn write_shard(
     let meta_path = Path::new(out_dir).join(&meta_name);
     let mut meta_f = File::create(&meta_path)?;
 
-    let meta = serde_json::json!({
+    let meta_json = serde_json::json!({
         "n": n,
         "shard_file": shard_name,
-        "zobrist": meta_zobrist,
-        "source_game_id": meta_game_id,
-        "ply": meta_ply,
-        "white_elo": meta_white_elo,
-        "black_elo": meta_black_elo,
-        "result": meta_result
+        "zobrist": meta.zobrist,
+        "source_game_id": meta.game_id,
+        "ply": meta.ply,
+        "white_elo": meta.white_elo,
+        "black_elo": meta.black_elo,
+        "result": meta.result
     });
-    meta_f.write_all(serde_json::to_string_pretty(&meta)?.as_bytes())?;
+    meta_f.write_all(serde_json::to_string_pretty(&meta_json)?.as_bytes())?;
 
     println!("wrote shard {} ({} samples)", shard_name, n);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the exact "fen | score | result" line write_shard constructs,
+    /// and confirms bulletformat::ChessBoard's own side-to-move flip produces
+    /// the label a training pipeline would actually expect: positive/winning
+    /// from the perspective of whoever is to move in that FEN, not always
+    /// from White's.
+    fn label_for(fen: &str, result: &str) -> (i16, u8) {
+        let result_float: f32 = match result {
+            "1-0" => 1.0,
+            "0-1" => 0.0,
+            _ => 0.5,
+        };
+        let score: i16 = match result {
+            "1-0" => 10000,
+            "0-1" => -10000,
+            _ => 0,
+        };
+        let line = format!("{fen} | {score} | {result_float}");
+        let cb: ChessBoard = line.parse().expect("valid bulletformat line");
+        (cb.score, cb.result)
+    }
+
+    const WHITE_TO_MOVE: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    const BLACK_TO_MOVE: &str = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+
+    #[test]
+    fn white_win_white_to_move_is_positive() {
+        let (score, result) = label_for(WHITE_TO_MOVE, "1-0");
+        assert_eq!(score, 10000);
+        assert_eq!(result, 2); // win, from the mover's (White's) perspective
+    }
+
+    #[test]
+    fn white_win_black_to_move_is_negative() {
+        // White ultimately won, but it's Black's move in this FEN — the
+        // label must be negative/losing from Black's perspective, not a
+        // blanket "White win" score copied in unchanged.
+        let (score, result) = label_for(BLACK_TO_MOVE, "1-0");
+        assert_eq!(score, -10000);
+        assert_eq!(result, 0); // loss, from the mover's (Black's) perspective
+    }
+
+    #[test]
+    fn draw_is_symmetric_regardless_of_side_to_move() {
+        assert_eq!(label_for(WHITE_TO_MOVE, "1/2-1/2"), (0, 1));
+        assert_eq!(label_for(BLACK_TO_MOVE, "1/2-1/2"), (0, 1));
+    }
 }

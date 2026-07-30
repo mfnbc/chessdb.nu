@@ -566,14 +566,28 @@ RESOLVED:
   (game_id, source, result-relative-to-username, played_at, eco/opening) matched
   expectations; full test suite 20→34 passing.
 
-OPEN:
-- BUG-12: `dataset_builder_cmd.rs`'s two divergent label-computation paths —
-  `run()` computes a side-relative WDL/scalar label from `result`
-  (`labels_buf`/`wdl_buf`, lines ~140-148) but passes them into `write_shard`
-  as `_features`/`_labels`/`_wdl`/`_weights` — all underscore-prefixed,
-  unused. `write_shard` instead re-derives an absolute (non-side-relative)
-  score/result_float from the raw `result` string itself (lines ~199-208).
-  Only one of the two label computations is actually written to disk; the
-  other is dead work. Lower priority — the dataset-builder/training pipeline
-  is already paused per `NNUE_AUDIT.md` ("Full NNUE training is deferred").
-  Not yet fixed.
+OPEN: none currently tracked.
+
+RESOLVED (continued):
+- BUG-12: FIXED (2026-07-29) — `dataset_builder_cmd.rs`'s two divergent label-computation
+  paths. `run()` computed a side-relative WDL/scalar label from `result` via `encode_position`
+  + `labels_buf`/`wdl_buf`, but passed them into `write_shard` as `_features`/`_labels`/`_wdl`/
+  `_weights` — all underscore-prefixed, unused; `write_shard` instead built its own White-relative
+  `score`/`result_float` from `result` directly and wrote *that*. Before fixing, checked whether
+  this was a live correctness bug (wrong-perspective labels for black-to-move positions), not
+  just dead code — read `bulletformat`'s vendored `ChessBoard::FromStr` source directly rather
+  than assuming. First pass concluded there was no internal flip and nearly reported a false
+  bug; re-reading the full function turned up `if stm == 1 { score = -score; result = 2 - result }`
+  a few lines further down, confirming the string format *does* expect White-relative values
+  with `bulletformat` doing its own side-to-move flip internally — so `write_shard`'s existing
+  computation was already correct, and the unused `run()` computation was simply dead weight
+  (removing it doesn't change any real output). Removed `encode_position`/`features_buf`/
+  `labels_buf`/`wdl_buf`/`weight_buf` entirely; bundled the 7 remaining metadata vectors into a
+  `ShardMeta` struct (`write_shard` was already flagged for `too_many_arguments`, 13/7 — now
+  passes one struct instead). Also fixed the command's stale description ("Build NPZ shards")
+  to match what it actually writes (`bulletformat` `.bin` + `.meta.json`).
+  Verified beyond compiling: added unit tests that build the actual "fen | score | result"
+  line and parse it through the real `bulletformat::ChessBoard` parser, confirming a white win
+  is stored positive when White is to move and negative when Black is to move (i.e. the label
+  really is side-to-move-relative in the final output, not just in the discarded computation).
+  Test suite 34→37 passing.
