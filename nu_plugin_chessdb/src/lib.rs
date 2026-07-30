@@ -9,7 +9,6 @@ pub mod pgn_to_fens;
 pub mod position_encoder;
 pub mod process_corpus;
 pub mod game_parse;
-pub mod dataset_builder_cmd;
 pub mod nnue_eval_cmd;
 pub mod coach_derive_cmd;
 pub mod stockfish;
@@ -47,9 +46,7 @@ impl Plugin for ChessdbPlugin {
             // critter-eval removed — use hugm-eval instead
             Box::new(pgn_to_fens::PgnToBatch),
             Box::new(pgn_to_fens::PgnToFens),
-            Box::new(pgn_to_fens::PgnScan),
             Box::new(process_corpus::ProcessCorpus),
-            Box::new(dataset_builder_cmd::DatasetBuilder),
             Box::new(nnue_eval_cmd::NnueEval),
             Box::new(coach_derive_cmd::DeriveCoachSignals),
             Box::new(zobrist::Zobrist),

@@ -4,8 +4,11 @@ NNUE Audit & Plan — chessdb.nu
 
 Full NNUE training is deferred. The project imports Stockfish's built-in NNUE
 via UCI rather than training a custom net. The bullet-based training pipeline
-(dataset builder, NPZ shards) is paused, though the position encoder that would
-feed it is still present and buildable (see below).
+(`dataset_builder_cmd.rs`, bulletformat shards) was removed 2026-07-30 in a
+YAGNI pass — it had been paused with no active work since before this audit,
+and PLAN.md has the full history if it's ever revived. The position encoder
+that would feed a future training pipeline is still present and buildable
+(see below).
 
 **Current focus**: HUGM calibration — regressing HUGM component scores against
 Stockfish centipawn scores to tune HUGM weights. `hugm_harness` (`src/bin/hugm_harness.rs`,

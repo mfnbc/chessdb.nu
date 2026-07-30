@@ -184,13 +184,22 @@ observations in the actual numbers you find.
 Database: A SQLite chess database built by chessdb.nu. Use chess_db_schema to
 learn the schema before writing any queries.
 
-Key tables and their exact columns:
-- games(game_id, source, white, black, white_elo, black_elo, result,
-        played_at, time_control, eco, opening, source_game_id)
-- moves(game_id, ply, move_number, color, san, uci,
-        position_id, next_position_id, clock_seconds)
-- positions(zobrist, fen, hugm_score, hugm_eval_arr, nnue_score,
-            eval_depth, state_id, is_checkmate, mate_in_1)
+Key tables and their exact columns (if in doubt, call chess_db_schema — this
+list is a summary, not a substitute for it):
+- games(game_id, source, source_game_id, white, black, white_elo, black_elo,
+        result, played_at, time_control, eco, opening)
+- moves(game_id, position_id, next_position_id, ply, move_number, color,
+        san, canonical_san, uci)
+  san is the real, as-played move. canonical_san is the same move translated
+  into positions' canonical frame (see below) — only useful for grouping by
+  position across games; for what a player actually played, use san.
+- positions(zobrist, fen, hugm_score, hugm_eval_arr, board_pieces, state_id,
+            mate_in_1, is_checkmate, updated_at)
+  zobrist/fen are canonical: normalized so White is always to move, the same
+  simplification chess tablebases use to collapse a position and its exact
+  color-mirror onto one row. fen's own "w"/"b" token and square case tell
+  you nothing about who was really to move in any specific game — for that,
+  use moves.color/moves.san, not positions.fen.
   hugm_eval_arr is a JSON array: [material, pawns, activity, king_safety, ...]
 - player_baselines(username, concept_name, phase_bucket, mean, std)
 - move_anomalies(username, game_id, ply, state_id, anomaly_type,
@@ -198,16 +207,21 @@ Key tables and their exact columns:
   NOTE: move_anomalies has NO phase_bucket column. To break anomalies by
   phase, JOIN with move_states on (game_id, ply):
     JOIN move_states ms ON ms.game_id = ma.game_id AND ms.ply = ma.ply
-- move_states(game_id, ply, state_id, phase_bucket,
-              has_fork, has_pin, has_hanging, king_exposed)
+- move_states(game_id, ply, state_id, phase_bucket, has_fork, has_pin,
+              has_hanging, king_exposed, has_outpost, has_open_file,
+              has_passed_pawn)
 - transition_events(username, state_from, state_to,
                     total_count, blunder_count, blunder_risk)
 
 IMPORTANT: move_anomalies links to a player via `username`, NOT via white/black/color.
 To query anomalies for a player use: WHERE username = 'PlayerName'
 
-Score convention: hugm_score is from White's perspective (positive = White ahead).
-When analysing a specific player, flip the sign for Black moves.
+Score convention: hugm_score/hugm_eval_arr for a stored position are relative
+to whoever is actually to move AT that position — not White absolute, and
+not simply the player who just moved. A moves row's position
+(next_position_id) is reached after m.color's move, so it's relative to
+m.color's opponent; that row's own mover's perspective is always
+-hugm_score, unconditionally (never color-conditional).
 Phase labels in baselines/anomalies are material-based: opening=25+ material, midgame=17-24, endgame=9-16, deep_endgame=0-8.
 eval_components in get_positional_profile uses ply-based phases: opening=ply≤12, midgame≤30, late_mid≤50, endgame.
 

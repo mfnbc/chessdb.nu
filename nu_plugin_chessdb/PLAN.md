@@ -1187,25 +1187,46 @@ export surface + `ai/mod.nu`'s tool registrations, not invented): chessdb.nu ing
 of players' chess.com games into a local SQLite file, evaluates positions with HUGM, and derives
 per-player coaching signals so an LLM/human coach can have an evidence-grounded conversation —
 via Nushell + `ai.nu` tool registration only, no web server/HTTP/GUI (architecturally, not just
-currently). Findings, not yet acted on except BUG-15 above (fixed as its own item):
+currently). Findings, acted on except the last two (still open):
 
-- Dead code, clear deletion candidates: `chessdb scan-pgn`/`ScanVisitor`/`core::scan_pgn` (zero
-  callers anywhere, already known to hash non-canonically); `core::legal_moves` (zero callers).
-- Initially misjudged as YAGNI, corrected after reading `NNUE_AUDIT.md`: `nnue-eval`,
-  `hugm_harness`, `lichess_to_jsonl`/`pgn_to_jsonl` are a live, intentional dev-time HUGM
-  calibration workflow (Stockfish ground truth → regress HUGM's own weights), not dead NNUE-
-  training weight — legitimate to be unreachable from `chessdb/*.nu`, the same way a test
-  harness doesn't need to be reachable from the product. `dataset_builder_cmd.rs` (bulletformat/
-  NPZ shards for training an actual replacement net) genuinely is paused per NNUE_AUDIT.md, with
-  the sign-convention risk noted in BUG-12 above if it's ever revived reading from `positions`.
-  User decision needed: delete, or keep as an explicitly-quarantined placeholder.
+- **FIXED (2026-07-30)**: dead code deleted — `chessdb scan-pgn`/`ScanVisitor`/`core::scan_pgn`
+  (zero callers anywhere, already known to hash non-canonically) and `core::legal_moves` (zero
+  callers). Both removed along with their `MoveRow`/`ScanGameRow`/`ScanMoveRow`/registration
+  plumbing; full suite green throughout (38→35 lib tests — no tests existed for either, so the
+  count drop is just their removal, not a regression).
+- **FIXED (2026-07-30)**: `dataset_builder_cmd.rs` deleted, per explicit user decision (asked
+  directly rather than assumed) — the bulletformat/NPZ shard-building path for training a
+  replacement NNUE net, paused per NNUE_AUDIT.md with no active work. Its `bulletformat`
+  dependency was the only user in the crate; while removing it, found `ndarray`/`ndarray-npy`
+  had **zero usages anywhere already** (a leftover from an even earlier NPZ-only approach,
+  predating bulletformat) — removed all three from `Cargo.toml`. `NNUE_AUDIT.md` updated to
+  record the removal. BUG-12's sign-convention risk note is now moot (there's no code left to
+  revive with that risk) but left in place as history.
+  - Initially misjudged as part of the same YAGNI cluster, corrected after reading
+    `NNUE_AUDIT.md`: `nnue-eval`, `hugm_harness`, `lichess_to_jsonl`/`pgn_to_jsonl` are a live,
+    intentional dev-time HUGM calibration workflow (Stockfish ground truth → regress HUGM's own
+    weights), not dead NNUE-training weight — legitimate to be unreachable from `chessdb/*.nu`,
+    the same way a test harness doesn't need to be reachable from the product. Left as-is.
   - Low-cost, technically-unreachable-from-the-interface utilities (`zobrist`, `pgn-to-fens`,
     `pgn-to-batch`): legitimate manual/debug tools, thin wrappers around functions already used
     internally — "reachable from the product interface" is the wrong bar for a debug utility.
-  - `ai/mod.nu`'s `chess-analyst` system prompt hand-documents the schema and is stale: claims
-    `moves.clock_seconds`/`positions.nnue_score`/`.eval_depth` (don't exist), missing
-    `moves.canonical_san` (does exist). Duplicates `chess_db_schema` (a tool in the same file
-    that could just be relied on live) — same "two sources of truth" problem CLAUDE.md already
-    flags for the terms-bag pattern. Its score-convention line was also stale relative to BUG-15.
-  - `hugm-eval` (evaluate an arbitrary hypothetical FEN) fits the coaching-conversation purpose
-    but isn't exposed as an `ai.nu` tool — minor gap, not a defect.
+    Left as-is.
+- **FIXED (2026-07-30)**: `ai/mod.nu`'s `chess-analyst` system prompt hand-documented the schema
+  and was stale: claimed `moves.clock_seconds`/`positions.nnue_score`/`.eval_depth` (don't
+  exist), was missing `moves.canonical_san` (does exist), and `move_states` (missing
+  `has_outpost`/`has_open_file`/`has_passed_pawn`). Rewrote the column lists to match
+  `chessdb/db.nu`'s actual schema exactly, added a one-line pointer to fall back on
+  `chess_db_schema` (a tool in the same file) rather than trust this summary blindly — doesn't
+  eliminate the duplication (CLAUDE.md's "two sources of truth" concern about the terms-bag
+  pattern applies here too), but at least it isn't actively wrong anymore. Also rewrote the
+  score-convention line to match BUG-15's fix (mover-relative, not White-absolute), and added a
+  short explanation of `positions.fen`/`.zobrist` being canonical so the model doesn't try to
+  infer real color from a canonical FEN's own "w"/"b" token. Verified the rewritten prompt
+  string is syntactically valid — an unescaped `"` I initially introduced (`"the player who
+  just moved."`) broke Nu's string parsing (`nu -c 'use ai/mod.nu'` failed with
+  `extra_token_after_closing_delimiter`); caught and fixed by actually loading the module,
+  not just eyeballing the diff. The remaining `AI_PROMPTS`-not-found error after that fix is
+  pre-existing/expected (this module assumes `ai.nu`'s environment is already initialized;
+  confirmed identical on the pre-edit committed version too, so not something this touched).
+- **STILL OPEN**: `hugm-eval` (evaluate an arbitrary hypothetical FEN) fits the
+  coaching-conversation purpose but isn't exposed as an `ai.nu` tool — minor gap, not a defect.
