@@ -6,7 +6,7 @@ use crate::eval::concept_types::*;
 use crate::eval::sensor::{TacticalReport, PositionalReport, SensorReport, AggregatedScores, MaterialConceptReport};
 use crate::eval::concepts::{encode_state, extract_concepts, rank_issues_for_position};
 use crate::eval::threat_graph::ThreatGraph;
-use crate::canonical::{normalize_to_white_to_move, unflip_color, unflip_phrase, unflip_square_str};
+use crate::canonical::{normalize_to_white_to_move, unflip_phrase, unflip_square_str};
 
 // Configurable constants (GUESS values) collected here for easier tuning.
 const TACTICAL_BASE_PINS: i64 = 50;
@@ -204,7 +204,7 @@ pub fn set_weights_from_file(path: &str) -> Result<(), String> {
 pub struct PositionRecord {
     pub fen: String,
     pub normalized_fen: String,
-    pub side_to_move: String,
+    pub side_to_move: Side,
     pub phase: u8,
     pub final_score: i64,
     pub engine_score: Option<i64>,
@@ -1611,7 +1611,7 @@ fn board_to_piece_ref(board: &shakmaty::Board, sq: Square) -> Option<PieceRef> {
             Role::Pawn => "Pawn", Role::Knight => "Knight", Role::Bishop => "Bishop",
             Role::Rook => "Rook", Role::Queen => "Queen", Role::King => "King",
         }.into(),
-        color: if p.color == Color::White { "white" } else { "black" }.into(),
+        color: Side::from(p.color),
         square: sq.to_string(),
     })
 }
@@ -1619,8 +1619,11 @@ fn board_to_piece_ref(board: &shakmaty::Board, sq: Square) -> Option<PieceRef> {
 fn outposts_to_typed(board: &shakmaty::Board, examples: &[(Square, Role, Square)]) -> Vec<Outpost> {
     examples.iter().filter_map(|(sq, role, support)| {
         let piece = board_to_piece_ref(board, *sq)?;
+        // Defensive fallback only — the support square for a detected outpost
+        // should always have a piece on it; role/color here are placeholders
+        // that shouldn't ever actually surface.
         let support_ref = board_to_piece_ref(board, *support).unwrap_or(PieceRef {
-            role: "Pawn".into(), color: "unknown".into(), square: "?".into(),
+            role: "Pawn".into(), color: Side::White, square: "?".into(),
         });
         if matches!(role, Role::Knight | Role::Bishop) {
             Some(Outpost { piece, supported_by: support_ref })
@@ -1668,7 +1671,7 @@ fn extract_passed_pawns(board: &shakmaty::Board) -> Vec<PassedPawn> {
             let protected = board.attacks_to(sq, color, board.occupied()).any();
             results.push(PassedPawn {
                 square: sq.to_string(), rank: advance as u8 + 2,
-                color: if color.is_white() { "white" } else { "black" }.into(),
+                color: Side::from(color),
                 is_protected: protected,
             });
         }
@@ -1688,7 +1691,7 @@ fn extract_open_files(board: &shakmaty::Board) -> Vec<OpenFile> {
                 let is_open = opp_pawns.is_empty();
                 results.push(OpenFile {
                     file: f.to_string(), rook_count,
-                    color: if color.is_white() { "white" } else { "black" }.into(),
+                    color: Side::from(color),
                 });
                 if is_open { break; }
             }
@@ -1714,7 +1717,7 @@ fn extract_king_exposure(board: &shakmaty::Board) -> Vec<KingExposure> {
             }
         }
         if attacker_count > 0 || shelter_files < 2 {
-            results.push(KingExposure { color: if color.is_white() { "white" } else { "black" }.into(), shelter_files, attacker_count });
+            results.push(KingExposure { color: Side::from(color), shelter_files, attacker_count });
         }
     }
     results
@@ -1736,7 +1739,7 @@ fn extract_isolated_pawns(board: &shakmaty::Board) -> Vec<IsolatedPawn> {
             if adjacent == 0 {
                 results.push(IsolatedPawn {
                     square: sq.to_string(),
-                    color: if color.is_white() { "white" } else { "black" }.into(),
+                    color: Side::from(color),
                 });
             }
         }
@@ -1754,7 +1757,7 @@ fn extract_doubled_pawns(board: &shakmaty::Board) -> Vec<DoubledPawn> {
             if count > 1 {
                 results.push(DoubledPawn {
                     file: f.to_string(), count,
-                    color: if color.is_white() { "white" } else { "black" }.into(),
+                    color: Side::from(color),
                 });
             }
         }
@@ -1783,7 +1786,7 @@ fn extract_pawn_islands(board: &shakmaty::Board) -> Vec<PawnIsland> {
         if island_count > 1 {
             results.push(PawnIsland {
                 files, count: island_count,
-                color: if color.is_white() { "white" } else { "black" }.into(),
+                color: Side::from(color),
             });
         }
     }
@@ -1796,8 +1799,8 @@ fn extract_pawn_breaks(groups: &EvalGroups, us: Color, them: Color) -> Vec<PawnB
     let opp_terms = groups.pawn_structure.terms.get("opp_terms")
         .and_then(|v| v.as_object());
     let opp_breaks = opp_terms.and_then(|o| o.get("pawn_break_examples"));
-    let us_label = if us.is_white() { "white" } else { "black" };
-    let them_label = if them.is_white() { "white" } else { "black" };
+    let us_label = Side::from(us);
+    let them_label = Side::from(them);
 
     // pawn_break_examples from the us side (for us pawns)
     if let Some(arr) = break_examples.and_then(|v| v.as_array()) {
@@ -1806,7 +1809,7 @@ fn extract_pawn_breaks(groups: &EvalGroups, us: Color, them: Color) -> Vec<PawnB
                 ex.get("pawn").and_then(|v| v.as_str()),
                 ex.get("to").and_then(|v| v.as_str()),
             ) {
-                results.push(PawnBreak { square: pawn.into(), color: us_label.into() });
+                results.push(PawnBreak { square: pawn.into(), color: us_label });
             }
         }
     }
@@ -1817,7 +1820,7 @@ fn extract_pawn_breaks(groups: &EvalGroups, us: Color, them: Color) -> Vec<PawnB
                 ex.get("pawn").and_then(|v| v.as_str()),
                 ex.get("to").and_then(|v| v.as_str()),
             ) {
-                results.push(PawnBreak { square: pawn.into(), color: them_label.into() });
+                results.push(PawnBreak { square: pawn.into(), color: them_label });
             }
         }
     }
@@ -1830,8 +1833,7 @@ fn extract_minority_attack(groups: &EvalGroups, us: Color) -> Option<MinorityAtt
     if minority_flag == 0 { return None; }
     let strength = groups.pawn_structure.terms.get("minority_attack_strength")
         .and_then(|v| v.as_i64()).unwrap_or(0);
-    let color = if us.is_white() { "white" } else { "black" };
-    Some(MinorityAttack { color: color.into(), strength })
+    Some(MinorityAttack { color: Side::from(us), strength })
 }
 
 fn extract_pawn_majority(groups: &EvalGroups, us: Color, them: Color) -> Vec<PawnMajority> {
@@ -1839,10 +1841,10 @@ fn extract_pawn_majority(groups: &EvalGroups, us: Color, them: Color) -> Vec<Paw
     let majority_us = groups.pawn_structure.terms.get("majority_us").and_then(|v| v.as_i64()).unwrap_or(0);
     let majority_them = groups.pawn_structure.terms.get("majority_them").and_then(|v| v.as_i64()).unwrap_or(0);
     if majority_us > 0 {
-        results.push(PawnMajority { color: (if us.is_white() { "white" } else { "black" }).into(), count: majority_us });
+        results.push(PawnMajority { color: Side::from(us), count: majority_us });
     }
     if majority_them > 0 {
-        results.push(PawnMajority { color: (if them.is_white() { "white" } else { "black" }).into(), count: majority_them });
+        results.push(PawnMajority { color: Side::from(them), count: majority_them });
     }
     results
 }
@@ -1858,10 +1860,10 @@ fn extract_rook_on_seventh(groups: &EvalGroups, us: Color, them: Color) -> Vec<R
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     if us_count > 0 {
-        results.push(RookOnSeventh { color: (if us.is_white() { "white" } else { "black" }).into(), count: us_count as u8 });
+        results.push(RookOnSeventh { color: Side::from(us), count: us_count as u8 });
     }
     if them_count > 0 {
-        results.push(RookOnSeventh { color: (if them.is_white() { "white" } else { "black" }).into(), count: them_count as u8 });
+        results.push(RookOnSeventh { color: Side::from(them), count: them_count as u8 });
     }
     results
 }
@@ -1872,9 +1874,9 @@ fn extract_center_control(board: &shakmaty::Board) -> Option<CenterControl> {
     let diff = cc_white - cc_black;
     if diff.abs() <= 15 { return None; }
     if diff > 0 {
-        Some(CenterControl { color: "white".into(), strength: diff })
+        Some(CenterControl { color: Side::White, strength: diff })
     } else {
-        Some(CenterControl { color: "black".into(), strength: -diff })
+        Some(CenterControl { color: Side::Black, strength: -diff })
     }
 }
 
@@ -1899,7 +1901,7 @@ fn extract_development_info(board: &shakmaty::Board) -> Vec<DevelopmentInfo> {
                     .collect()
             };
             results.push(DevelopmentInfo {
-                color: if color.is_white() { "white" } else { "black" }.into(),
+                color: Side::from(color),
                 undeveloped_pieces: pieces,
                 space_advantage: if color.is_white() { space } else { -space },
             });
@@ -2845,7 +2847,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         },
         development: {
             let dev_infos = extract_development_info(board);
-            let target_color = if us.is_white() { "white" } else { "black" };
+            let target_color = Side::from(us);
             let dev_first = dev_infos.iter().find(|d| d.color == target_color);
             dev_first.cloned().or_else(|| dev_infos.first().cloned())
         },
@@ -2872,7 +2874,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
     let state_id = encode_state(&partial, groups, phase).state_id;
 
     let gated_issues = if let Some(elo) = player_elo {
-        let side = if us.is_white() { "white" } else { "black" };
+        let side = Side::from(us);
         let concepts = extract_concepts(&partial, groups, side);
         rank_issues_for_position(&concepts, elo)
     } else { Vec::new() };
@@ -2908,9 +2910,10 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
 /// Returns `(normalized, was_flipped)`. When `was_flipped`, board-coordinate
 /// output (squares/colors in `SensorReport`) must be un-flipped back before
 /// it reaches a human — see `unflip_sensor_report` below (which uses
-/// `crate::canonical::unflip_color`/`unflip_square_str`). Scores need no
-/// such correction: after normalization they're already relative to
-/// whoever is really to move, which is what every consumer wants.
+/// `Side::other()` for colors and `crate::canonical::unflip_square_str` for
+/// squares). Scores need no such correction: after normalization they're
+/// already relative to whoever is really to move, which is what every
+/// consumer wants.
 fn normalize_for_eval(chess: &Chess) -> Result<(Chess, bool)> {
     normalize_to_white_to_move(chess)
 }
@@ -2921,14 +2924,14 @@ fn normalize_for_eval(chess: &Chess) -> Result<(Chess, bool)> {
 /// ones with a color but no square at all (`OpenFile`, `KingExposure`,
 /// `MinorityAttack`, etc. — vertical-only flipping never touches files, so
 /// those don't need a square correction, but they're still labeled
-/// "white"/"black" and do need the color swap) — verified against every
+/// White/Black and do need the color swap) — verified against every
 /// struct in concept_types.rs/sensor.rs, not just the ones with PieceRefs.
-/// `unflip_color`/`unflip_square_str` themselves live in `crate::canonical`
-/// (generic, no eval-specific types) — this stays here because `PieceRef`
-/// is an eval-specific type `canonical` shouldn't need to depend on.
+/// `unflip_square_str` lives in `crate::canonical` (generic, no eval-specific
+/// types); the color swap itself is just `Side::other()` now — no separate
+/// `unflip_color` helper needed.
 fn unflip_piece_ref(pr: &mut PieceRef) {
     pr.square = unflip_square_str(&pr.square);
-    pr.color = unflip_color(&pr.color);
+    pr.color = pr.color.other();
 }
 
 fn unflip_sensor_report(sensor: &mut SensorReport) {
@@ -2973,46 +2976,46 @@ fn unflip_sensor_report(sensor: &mut SensorReport) {
         unflip_piece_ref(&mut o.supported_by);
     }
     for f in &mut sensor.positional.open_files {
-        f.color = unflip_color(&f.color); // file letter unaffected by a vertical-only flip
+        f.color = f.color.other(); // file letter unaffected by a vertical-only flip
     }
     for pp in &mut sensor.positional.passed_pawns {
         pp.square = unflip_square_str(&pp.square);
-        pp.color = unflip_color(&pp.color);
+        pp.color = pp.color.other();
         // pp.rank is an already-orientation-invariant "distance to promotion"
         // (computed via extract_passed_pawns's own is_white() branch), not a
         // raw board rank — needs no correction.
     }
     for dp in &mut sensor.positional.doubled_pawns {
-        dp.color = unflip_color(&dp.color);
+        dp.color = dp.color.other();
     }
     for ip in &mut sensor.positional.isolated_pawns {
         ip.square = unflip_square_str(&ip.square);
-        ip.color = unflip_color(&ip.color);
+        ip.color = ip.color.other();
     }
     for pi in &mut sensor.positional.pawn_islands {
-        pi.color = unflip_color(&pi.color);
+        pi.color = pi.color.other();
     }
     for pb in &mut sensor.positional.pawn_breaks {
         pb.square = unflip_square_str(&pb.square);
-        pb.color = unflip_color(&pb.color);
+        pb.color = pb.color.other();
     }
     if let Some(ma) = &mut sensor.positional.minority_attack {
-        ma.color = unflip_color(&ma.color);
+        ma.color = ma.color.other();
     }
     for pm in &mut sensor.positional.pawn_majority {
-        pm.color = unflip_color(&pm.color);
+        pm.color = pm.color.other();
     }
     for r7 in &mut sensor.positional.rook_on_seventh {
-        r7.color = unflip_color(&r7.color);
+        r7.color = r7.color.other();
     }
     if let Some(cc) = &mut sensor.positional.center_control {
-        cc.color = unflip_color(&cc.color);
+        cc.color = cc.color.other();
     }
     if let Some(ke) = &mut sensor.positional.king_exposure {
-        ke.color = unflip_color(&ke.color);
+        ke.color = ke.color.other();
     }
     if let Some(dev) = &mut sensor.positional.development {
-        dev.color = unflip_color(&dev.color);
+        dev.color = dev.color.other();
         for p in &mut dev.undeveloped_pieces { unflip_piece_ref(p); }
     }
 
@@ -3020,7 +3023,7 @@ fn unflip_sensor_report(sensor: &mut SensorReport) {
     // the same flipped SensorReport, so both are in flipped-color terms and
     // need correcting — .side structurally, .phrase as embedded text.
     for issue in &mut sensor.gated_issues {
-        issue.side = unflip_color(&issue.side);
+        issue.side = issue.side.other();
         issue.phrase = unflip_phrase(&issue.phrase);
     }
 }
@@ -3073,7 +3076,7 @@ pub fn analyze_fen_with_engine_score(
     Ok(PositionRecord {
         fen: fen.to_string(),
         normalized_fen,
-        side_to_move: chess.turn().fold_wb("white", "black").to_string(),
+        side_to_move: Side::from(chess.turn()),
         phase,
         final_score,
         engine_score,
@@ -3097,14 +3100,14 @@ pub fn analyze_fen_with_engine_score(
 
 pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
-    let us_color = record.side_to_move.as_str();
-    let side_cap = if us_color == "white" { "White" } else { "Black" };
+    let us_color = record.side_to_move;
+    let side_cap = if us_color == Side::White { "White" } else { "Black" };
     let sensor = &record.sensor_report;
 
-    let make_obj = |kind: &str, side_str: &str, severity: i64, phrase: String, details: serde_json::Map<String, serde_json::Value>| -> serde_json::Value {
+    let make_obj = |kind: &str, side: Side, severity: i64, phrase: String, details: serde_json::Map<String, serde_json::Value>| -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert("kind".into(), serde_json::Value::from(kind));
-        obj.insert("side".into(), serde_json::Value::from(side_str));
+        obj.insert("side".into(), serde_json::Value::from(side.to_string()));
         obj.insert("severity".into(), serde_json::Value::from(severity));
         obj.insert("phrase".into(), serde_json::Value::from(phrase));
         obj.insert("details".into(), serde_json::Value::Object(details));
@@ -3220,10 +3223,10 @@ pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json
 /// gap in the migration. Everything else here reads typed data.
 pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let us_color = record.side_to_move.as_str();
-    let side = if us_color == "white" { "White" } else { "Black" };
+    let us_color = record.side_to_move;
+    let side = if us_color == Side::White { "White" } else { "Black" };
     let opp = if side == "White" { "Black" } else { "White" };
-    let opp_color = if us_color == "white" { "black" } else { "white" };
+    let opp_color = us_color.other();
     let sensor = &record.sensor_report;
 
     // Tactical explanations with examples when available
@@ -3328,12 +3331,13 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
 mod tests {
     use super::analyze_fen;
     use super::analyze_fen_with_engine_score;
+    use super::Side;
 
     #[test]
     fn parses_starting_position() {
         let record = analyze_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
             .expect("FEN should parse");
-        assert_eq!(record.side_to_move, "white");
+        assert_eq!(record.side_to_move, Side::White);
         assert!(record.legal.is_legal);
         assert!(!record.normalized_fen.is_empty());
     }

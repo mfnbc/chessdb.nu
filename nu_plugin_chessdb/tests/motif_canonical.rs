@@ -4,7 +4,7 @@
 // - Wikipedia: Positional play / pawn structures (examples adapted)
 // - Lichess public puzzles / study examples (representative)
 
-use nu_plugin_chessdb::eval::{analyze_fen, analyze_fen_with_engine_score, extract_concepts};
+use nu_plugin_chessdb::eval::{analyze_fen, analyze_fen_with_engine_score, extract_concepts, Side};
 
 #[test]
 fn wikipedia_pawn_break_detected() {
@@ -154,7 +154,7 @@ fn pawn_break_color_is_invariant_to_side_to_move() {
         let rec = analyze_fen(&fen).expect("FEN should parse");
         let breaks = &rec.sensor_report.positional.pawn_breaks;
         assert!(!breaks.is_empty(), "expected a pawn break candidate (stm={stm})");
-        assert!(breaks.iter().all(|b| b.color == "white"), "pawn break color must stay \"white\" regardless of side to move (stm={stm}), got {breaks:?}");
+        assert!(breaks.iter().all(|b| b.color == Side::White), "pawn break color must stay White regardless of side to move (stm={stm}), got {breaks:?}");
     }
 }
 
@@ -170,10 +170,10 @@ fn king_exposed_concept_is_invariant_to_side_to_move() {
     for stm in ["w", "b"] {
         let fen = format!("{board} {stm} - - 0 1");
         let rec = analyze_fen(&fen).expect("FEN should parse");
-        let concepts = extract_concepts(&rec.sensor_report, &rec.groups, &rec.side_to_move);
+        let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
         let king_exposed = concepts.iter().find(|c| c.name == "king_exposed");
         if let Some(c) = king_exposed {
-            sides.push(c.side.clone());
+            sides.push(c.side);
         }
     }
     assert_eq!(sides.len(), 2, "expected king_exposed to fire both times, got {sides:?}");
@@ -203,12 +203,12 @@ fn board_normalization_reports_real_squares_and_colors_for_black_to_move() {
     assert_eq!(rec1.sensor_report.tactical.forks.len(), 1);
     let f1 = &rec1.sensor_report.tactical.forks[0];
     assert_eq!(f1.attacker.notation(), "Qf2");
-    assert_eq!(f1.attacker.color, "black");
+    assert_eq!(f1.attacker.color, Side::Black);
 
     assert_eq!(rec2.sensor_report.tactical.forks.len(), 1);
     let f2 = &rec2.sensor_report.tactical.forks[0];
     assert_eq!(f2.attacker.notation(), "Qf7", "attacker square must be the real (un-flipped) board square");
-    assert_eq!(f2.attacker.color, "white", "attacker color must be the real (un-flipped) color");
+    assert_eq!(f2.attacker.color, Side::White, "attacker color must be the real (un-flipped) color");
     let target_squares: Vec<String> = f2.targets.iter().map(|t| t.notation()).collect();
     for expected in ["Ke8", "Bf8", "d7", "g7", "Nf6"] {
         assert!(target_squares.contains(&expected.to_string()), "expected target {expected} in {target_squares:?}");
@@ -220,6 +220,6 @@ fn board_normalization_reports_real_squares_and_colors_for_black_to_move() {
     // GatedIssue.phrase embeds color words as free text, built before the
     // un-flip pass runs — this must be corrected too, not just .side.
     let mat2 = rec2.sensor_report.gated_issues.iter().find(|g| g.name == "material_imbalance").expect("material_imbalance issue");
-    assert_eq!(mat2.side, "white");
+    assert_eq!(mat2.side, Side::White);
     assert!(mat2.phrase.starts_with("White"), "phrase should say White, got: {}", mat2.phrase);
 }

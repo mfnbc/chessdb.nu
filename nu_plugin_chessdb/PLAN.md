@@ -1444,3 +1444,83 @@ the rest checked clean:
   handling is gone.
 
 Verified: full suite green (32 tests), clippy clean, STS smoke test passes.
+
+`Side` enum for color — scoped and implemented 2026-07-30
+
+Follow-on from the deferred finding above. Re-investigated to get exact numbers rather
+than an estimate, and found the case is stronger than "type safety": the exact conversion
+`if color.is_white() { "white" } else { "black" }.into()` (or the `== Color::White`
+variant) is copy-pasted **22 times** across `position.rs`/`threat_graph.rs` — identical
+in every case, just a different variable name. This isn't just a latent-bug risk anymore,
+it's a concrete, already-present DRY violation this whole audit has been hunting for.
+
+**The type**: `pub enum Side { White, Black }` in `concept_types.rs`, deriving
+`Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize` with `#[serde(rename_all =
+"lowercase")]` — this serializes byte-identically to the current `String` fields
+("white"/"black"), so every JSON/Nu/SQL consumer downstream is unaffected. Methods:
+`other(self) -> Side` (replaces `canonical.rs::unflip_color`'s string-swap entirely —
+that whole function becomes dead and gets deleted, callers just write `x.color =
+x.color.other()`), and `From<shakmaty::Color> for Side` (replaces all 22 duplicated
+`if ... .is_white() { "white" } else { "black" }` conversions with `Side::from(color)`).
+`shakmaty::Color` can't get `Serialize` directly (orphan rule — it's a foreign type),
+which is exactly why this needs its own small local type rather than reusing shakmaty's
+enum for the output layer.
+
+**What converts** (all in `nu_plugin_chessdb/src/eval/`, zero external API change):
+- `concept_types.rs`: 14 fields (`PieceRef.color` and 13 more `color`/`side: String`
+  fields across `OpenFile`, `PassedPawn`, `PawnIsland`, `KingExposure`, `DoubledPawn`,
+  `IsolatedPawn`, `DevelopmentInfo`, `PawnBreak`, `MinorityAttack`, `PawnMajority`,
+  `RookOnSeventh`, `CenterControl`, `GatedIssue.side`).
+- `concepts.rs`: `Concept.side`, `count_and_push_by_color`'s `color_of: impl Fn(&T) ->
+  &str` becomes `Fn(&T) -> Side`, its `us_color`/`them_color: &str` params become `Side`.
+- `position.rs`: `PositionRecord.side_to_move`; all 8 duplicated conversions there;
+  `unflip_piece_ref`/`unflip_sensor_report`'s calls to `unflip_color` become `.other()`.
+- `threat_graph.rs`: 6 duplicated conversions.
+- `canonical.rs`: delete `unflip_color` (superseded by `Side::other()`); `unflip_phrase`
+  is unaffected (free-text word-swapping on `GatedIssue.phrase`, a genuinely different
+  problem — nothing there is a structured `Side` value).
+
+**Explicitly out of scope**: `core.rs`'s `MoveRow.color`/`GameVisitor`'s `"white"`/`"black"`
+literals stay `String` — that's DB/`moves`-table-facing (SQLite has no enum type, so
+there's no analogous type-safety win there), not the eval engine's internal output-type
+layer this finding is about. `move_states`/`positions` schema, Nu-side `chessdb/*.nu`:
+untouched, since the wire format doesn't change.
+
+**Verification plan**: full test suite plus a byte-for-byte JSON diff on a few of the
+existing hand-verified mirror-position fixtures (`motif_canonical.rs`,
+`canonical_identity.rs`) before/after, to prove this is a pure internal refactor with
+zero observable behavior change — not just "it compiles."
+
+**Implemented (2026-07-30), confirmed via "yes, go ahead":** matched the scope above
+closely, with three things found only once actually doing the work:
+
+1. **A 15th field the scope missed**: `threat_graph.rs`'s locally-defined `CaptureStep`
+   struct also had its own `color: String` — not part of the original 14-field count
+   (that only covered `concept_types.rs`), found once the compiler's cascading errors
+   pointed at it. Converted along with everything else.
+2. **One field deliberately left as `String`, for a real reason**: `threat_graph.rs`'s
+   `ExchangeChain.winner` is three-valued (`"white"`/`"black"`/`"even"`), not two — it
+   doesn't fit `Side` at all (a draw isn't a color), so it stays `String`. Worth
+   recording so it isn't mistaken for a spot the conversion missed.
+3. **`render_explanations`/`render_structured_explanations` (`position.rs`) needed their
+   own small fix**: both built a capitalized display string (`"White"`/`"Black"`) for
+   human-readable phrases from `record.side_to_move.as_str()` — since `Side`'s `Display`
+   only gives lowercase (matching the JSON convention), kept a plain `if us_color ==
+   Side::White { "White" } else { "Black" }` for that one display-text purpose. Not the
+   same duplicated pattern as the 22 struct-field conversions — those construct a
+   `Side` value; this constructs a capitalized string for a sentence, a genuinely
+   different job.
+
+`Side::other()` did replace `canonical::unflip_color` entirely, and `Side::from(shakmaty
+::Color)` did replace all ~22 duplicated conversions (`position.rs` and `threat_graph.rs`
+combined) with a single call each, exactly as scoped.
+
+Verified: full test suite green (32 tests, unchanged — no test's *behavior* changed, only
+some assertions' syntax, comparing against `Side::White`/`Side::Black` instead of string
+literals), `cargo clippy --all-targets` clean (including a `clone_on_copy` warning clippy
+caught in a test — `Side` being `Copy` made a leftover `.clone()` redundant, fixed), STS
+smoke test passes. Proved the core claim — zero external wire-format change — directly:
+serialized a `PositionRecord` for the same hand-verified mirror-position fixture already
+used in `motif_canonical.rs`, and confirmed the JSON contains exactly `"color": "white"`/
+`"black"` and `"side": "white"`/`"black"` (lowercase, matching the old `String` fields
+byte-for-byte) with no capitalized or otherwise-different variant leaking through.

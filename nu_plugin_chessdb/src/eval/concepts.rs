@@ -1,13 +1,13 @@
 use crate::eval::position::EvalGroups;
 use crate::eval::sensor::SensorReport;
-use crate::eval::concept_types::GatedIssue;
+use crate::eval::concept_types::{GatedIssue, Side};
 
 /// A named concept detected in a chess position, with severity and ELO threshold.
 #[derive(Debug, serde::Serialize)]
 pub struct Concept {
     pub name: String,
     pub severity: i64,
-    pub side: String,
+    pub side: Side,
     pub phrase: String,
     pub elo_min: i32,
 }
@@ -22,21 +22,21 @@ pub struct Concept {
 fn count_and_push_by_color<T>(
     concepts: &mut Vec<Concept>,
     items: &[T],
-    color_of: impl Fn(&T) -> &str,
-    us_color: &str,
-    them_color: &str,
+    color_of: impl Fn(&T) -> Side,
+    us_color: Side,
+    them_color: Side,
     name: &str,
     weight: i64,
     elo_min: i32,
-    phrase: impl Fn(&str, i64) -> String,
+    phrase: impl Fn(Side, i64) -> String,
 ) {
     let us_n = items.iter().filter(|t| color_of(t) == us_color).count() as i64;
     if us_n > 0 {
-        concepts.push(Concept { name: name.into(), severity: us_n * weight, side: us_color.into(), phrase: phrase(us_color, us_n), elo_min });
+        concepts.push(Concept { name: name.into(), severity: us_n * weight, side: us_color, phrase: phrase(us_color, us_n), elo_min });
     }
     let them_n = items.iter().filter(|t| color_of(t) == them_color).count() as i64;
     if them_n > 0 {
-        concepts.push(Concept { name: name.into(), severity: them_n * weight, side: them_color.into(), phrase: phrase(them_color, them_n), elo_min });
+        concepts.push(Concept { name: name.into(), severity: them_n * weight, side: them_color, phrase: phrase(them_color, them_n), elo_min });
     }
 }
 
@@ -44,81 +44,81 @@ fn count_and_push_by_color<T>(
 /// descending. `groups` is consulted only for the handful of scalar (non-tag) magnitudes —
 /// `material_total.value`, `king_safety.blended`, `development.blended` — that already live
 /// on typed `GroupValue` fields rather than in a `terms` string-keyed bag.
-pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move: &str) -> Vec<Concept> {
+pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move: Side) -> Vec<Concept> {
     let mut concepts = Vec::new();
-    let (us_color, them_color) = if side_to_move == "white" { ("white", "black") } else { ("black", "white") };
+    let (us_color, them_color) = (side_to_move, side_to_move.other());
 
     // --- Material (ELO 600+) ---
     let material_imbalance = groups.material_total.value;
     if material_imbalance.abs() > 50 {
         let (side, phrase) = if material_imbalance > 0 {
-            ("white", format!("White is up {} centipawns in material", material_imbalance))
+            (Side::White, format!("White is up {} centipawns in material", material_imbalance))
         } else {
-            ("black", format!("Black is up {} centipawns in material", -material_imbalance))
+            (Side::Black, format!("Black is up {} centipawns in material", -material_imbalance))
         };
-        concepts.push(Concept { name: "material_imbalance".into(), severity: material_imbalance.abs(), side: side.into(), phrase, elo_min: 600 });
+        concepts.push(Concept { name: "material_imbalance".into(), severity: material_imbalance.abs(), side, phrase, elo_min: 600 });
     }
 
     // Bishop pair (ELO 1800+)
     if let Some(bal) = &sensor.material.balance {
-        if bal.bishop_pair_white { concepts.push(Concept { name: "bishop_pair".into(), severity: 40, side: "white".into(), phrase: "White has the bishop pair".into(), elo_min: 1800 }); }
-        if bal.bishop_pair_black { concepts.push(Concept { name: "bishop_pair".into(), severity: 40, side: "black".into(), phrase: "Black has the bishop pair".into(), elo_min: 1800 }); }
+        if bal.bishop_pair_white { concepts.push(Concept { name: "bishop_pair".into(), severity: 40, side: Side::White, phrase: "White has the bishop pair".into(), elo_min: 1800 }); }
+        if bal.bishop_pair_black { concepts.push(Concept { name: "bishop_pair".into(), severity: 40, side: Side::Black, phrase: "Black has the bishop pair".into(), elo_min: 1800 }); }
     }
 
     // Tactical: forks (1000+), pins (1200+), skewers (1200+), discovered (1400+), hanging (600+)
-    count_and_push_by_color(&mut concepts, &sensor.tactical.forks, |f| f.attacker.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.tactical.forks, |f| f.attacker.color, us_color, them_color,
         "fork", 80, 1000, |side, n| format!("{} has {} fork(s)", side, n));
-    count_and_push_by_color(&mut concepts, &sensor.tactical.pins, |p| p.attacker.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.tactical.pins, |p| p.attacker.color, us_color, them_color,
         "pin", 50, 1200, |side, n| format!("{} has {} pin(s)", side, n));
-    count_and_push_by_color(&mut concepts, &sensor.tactical.skewers, |s| s.attacker.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.tactical.skewers, |s| s.attacker.color, us_color, them_color,
         "skewer", 45, 1200, |side, n| format!("{} has {} skewer(s)", side, n));
-    count_and_push_by_color(&mut concepts, &sensor.tactical.discovered, |d| d.attacker.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.tactical.discovered, |d| d.attacker.color, us_color, them_color,
         "discovered_attack", 60, 1400, |side, n| format!("{} has {} discovered attack(s)", side, n));
     // Hanging pieces — typed data existed but this concept was never emitted before this session.
-    count_and_push_by_color(&mut concepts, &sensor.tactical.hanging, |h| h.piece.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.tactical.hanging, |h| h.piece.color, us_color, them_color,
         "hanging_piece", 60, 600, |side, n| format!("{} has {} hanging piece(s)", side, n));
 
     // Pawn structure (ELO 1600+): isolated pawns, keyed by the pawn's real color (not us/them)
-    count_and_push_by_color(&mut concepts, &sensor.positional.isolated_pawns, |p| p.color.as_str(), "white", "black",
+    count_and_push_by_color(&mut concepts, &sensor.positional.isolated_pawns, |p| p.color, Side::White, Side::Black,
         "isolated_pawn", 30, 1600, |side, n| format!("{} has {} isolated pawn(s)", side, n));
 
     // Doubled pawns: sums each entry's own `count` field rather than counting
     // entries, so this doesn't fit count_and_push_by_color.
-    let doubled_white: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == "white").map(|p| p.count as i64).sum();
-    if doubled_white > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_white * 30, side: "white".into(), phrase: format!("white has {} doubled pawn(s)", doubled_white), elo_min: 1600 }); }
-    let doubled_black: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == "black").map(|p| p.count as i64).sum();
-    if doubled_black > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_black * 30, side: "black".into(), phrase: format!("black has {} doubled pawn(s)", doubled_black), elo_min: 1600 }); }
+    let doubled_white: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == Side::White).map(|p| p.count as i64).sum();
+    if doubled_white > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_white * 30, side: Side::White, phrase: format!("white has {} doubled pawn(s)", doubled_white), elo_min: 1600 }); }
+    let doubled_black: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == Side::Black).map(|p| p.count as i64).sum();
+    if doubled_black > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_black * 30, side: Side::Black, phrase: format!("black has {} doubled pawn(s)", doubled_black), elo_min: 1600 }); }
 
     // Pawn majority (1800+) and breaks (1800+)
     for m in &sensor.positional.pawn_majority {
-        concepts.push(Concept { name: "pawn_majority".into(), severity: m.count * 20, side: m.color.clone(), phrase: format!("{} has a pawn majority", m.color), elo_min: 1800 });
+        concepts.push(Concept { name: "pawn_majority".into(), severity: m.count * 20, side: m.color, phrase: format!("{} has a pawn majority", m.color), elo_min: 1800 });
     }
-    count_and_push_by_color(&mut concepts, &sensor.positional.pawn_breaks, |b| b.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.positional.pawn_breaks, |b| b.color, us_color, them_color,
         "pawn_break", 30, 1800, |side, n| format!("{} has {} pawn break candidate(s)", side, n));
 
     // Minority attack (ELO 2000+)
     if let Some(m) = &sensor.positional.minority_attack {
-        concepts.push(Concept { name: "minority_attack".into(), severity: m.strength * 35, side: m.color.clone(), phrase: format!("{} has a minority attack", m.color), elo_min: 2000 });
+        concepts.push(Concept { name: "minority_attack".into(), severity: m.strength * 35, side: m.color, phrase: format!("{} has a minority attack", m.color), elo_min: 2000 });
     }
 
     // Outposts (ELO 1600+)
-    count_and_push_by_color(&mut concepts, &sensor.positional.outposts, |o| o.piece.color.as_str(), us_color, them_color,
+    count_and_push_by_color(&mut concepts, &sensor.positional.outposts, |o| o.piece.color, us_color, them_color,
         "outpost", 40, 1600, |side, n| format!("{} has {} outpost(s)", side, n));
 
     // Rook activity (ELO 1400+): open_files has an extra rook_count > 0 predicate beyond
     // color, and rook_on_seventh sums a `count` field — neither fits count_and_push_by_color.
     let rook_open_us = sensor.positional.open_files.iter().filter(|f| f.color == us_color && f.rook_count > 0).count() as i64;
-    if rook_open_us > 0 { concepts.push(Concept { name: "rook_open_file".into(), severity: rook_open_us * 25, side: us_color.into(), phrase: format!("{} has rook(s) on open file(s)", us_color), elo_min: 1400 }); }
+    if rook_open_us > 0 { concepts.push(Concept { name: "rook_open_file".into(), severity: rook_open_us * 25, side: us_color, phrase: format!("{} has rook(s) on open file(s)", us_color), elo_min: 1400 }); }
     for r in sensor.positional.rook_on_seventh.iter().filter(|r| r.color == us_color) {
-        concepts.push(Concept { name: "rook_seventh".into(), severity: r.count as i64 * 30, side: us_color.into(), phrase: format!("{} has a rook on the 7th rank", us_color), elo_min: 1400 });
+        concepts.push(Concept { name: "rook_seventh".into(), severity: r.count as i64 * 30, side: us_color, phrase: format!("{} has a rook on the 7th rank", us_color), elo_min: 1400 });
     }
     for r in sensor.positional.rook_on_seventh.iter().filter(|r| r.color == them_color) {
-        concepts.push(Concept { name: "rook_seventh".into(), severity: r.count as i64 * 30, side: them_color.into(), phrase: format!("{} has a rook on the 7th rank", them_color), elo_min: 1400 });
+        concepts.push(Concept { name: "rook_seventh".into(), severity: r.count as i64 * 30, side: them_color, phrase: format!("{} has a rook on the 7th rank", them_color), elo_min: 1400 });
     }
 
     // King safety (ELO 1000-1400+)
     if sensor.in_check {
-        concepts.push(Concept { name: "king_in_check".into(), severity: 100, side: us_color.into(), phrase: format!("{}'s king is in check!", us_color), elo_min: 1000 });
+        concepts.push(Concept { name: "king_in_check".into(), severity: 100, side: us_color, phrase: format!("{}'s king is in check!", us_color), elo_min: 1000 });
     }
     if groups.king_safety.blended.abs() > 40 {
         // king_safety.blended is us-them relative (like development below), not
@@ -128,14 +128,14 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
         let (side, phrase) = if groups.king_safety.blended < 0 {
             (us_color, format!("{}'s king is exposed", us_color))
         } else { (them_color, format!("{}'s king is exposed", them_color)) };
-        concepts.push(Concept { name: "king_exposed".into(), severity: groups.king_safety.blended.abs(), side: side.into(), phrase, elo_min: 1400 });
+        concepts.push(Concept { name: "king_exposed".into(), severity: groups.king_safety.blended.abs(), side, phrase, elo_min: 1400 });
     }
 
     // Passed pawns (ELO 1400+)
     let passed_us = sensor.positional.passed_pawns.iter().filter(|p| p.color == us_color).count() as i64;
-    if passed_us > 0 { concepts.push(Concept { name: "passed_pawn".into(), severity: passed_us * 50, side: us_color.into(), phrase: format!("{} has {} passed pawn(s)", us_color, passed_us), elo_min: 1400 }); }
+    if passed_us > 0 { concepts.push(Concept { name: "passed_pawn".into(), severity: passed_us * 50, side: us_color, phrase: format!("{} has {} passed pawn(s)", us_color, passed_us), elo_min: 1400 }); }
     let passed_them = sensor.positional.passed_pawns.iter().filter(|p| p.color == them_color).count() as i64;
-    if passed_them > 0 { concepts.push(Concept { name: "passed_pawn".into(), severity: passed_them * 50, side: them_color.into(), phrase: format!("{} has {} passed pawn(s)", them_color, passed_them), elo_min: 1400 }); }
+    if passed_them > 0 { concepts.push(Concept { name: "passed_pawn".into(), severity: passed_them * 50, side: them_color, phrase: format!("{} has {} passed pawn(s)", them_color, passed_them), elo_min: 1400 }); }
 
     // Development (ELO 1400+)
     // development.blended > 0 means `us` (side to move) has the advantage
@@ -143,12 +143,12 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
         let (side, phrase) = if groups.development.blended > 0 {
             (us_color, format!("{} has a development advantage", us_color))
         } else { (them_color, format!("{} has a development advantage", them_color)) };
-        concepts.push(Concept { name: "development".into(), severity: groups.development.blended.abs(), side: side.into(), phrase, elo_min: 1400 });
+        concepts.push(Concept { name: "development".into(), severity: groups.development.blended.abs(), side, phrase, elo_min: 1400 });
     }
 
     // Center control (ELO 1800+)
     if let Some(cc) = &sensor.positional.center_control {
-        concepts.push(Concept { name: "center_control".into(), severity: cc.strength, side: cc.color.clone(), phrase: format!("{} controls the center", cc.color), elo_min: 1800 });
+        concepts.push(Concept { name: "center_control".into(), severity: cc.strength, side: cc.color, phrase: format!("{} controls the center", cc.color), elo_min: 1800 });
     }
 
     concepts.sort_by(|a, b| b.severity.cmp(&a.severity));
@@ -177,7 +177,7 @@ pub fn rank_issues_for_position(concepts: &[Concept], player_elo: i32) -> Vec<Ga
         if score < 1.0 { return None; }
         Some(GatedIssue { name: c.name.clone(), severity: c.severity, elo_min: c.elo_min,
             magnitude: 1.0, elo_relevance, confidence, score,
-            phrase: c.phrase.clone(), side: c.side.clone() })
+            phrase: c.phrase.clone(), side: c.side })
     }).collect();
     issues.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     let has_critical = issues.iter().any(|i| i.severity >= 80 && i.elo_min <= 1000 && i.score > 10.0);
@@ -207,7 +207,7 @@ pub fn rank_issues_for_player(
         };
         let score = magnitude * c.severity as f64 * elo_relevance * confidence;
         Some(GatedIssue { name: c.name.clone(), severity: c.severity, elo_min: c.elo_min,
-            magnitude, elo_relevance, confidence, score, phrase: c.phrase.clone(), side: c.side.clone() })
+            magnitude, elo_relevance, confidence, score, phrase: c.phrase.clone(), side: c.side })
     }).collect();
     issues.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     let has_critical = issues.iter().any(|i| i.severity >= 80 && i.elo_min <= 1000 && i.score > 10.0);

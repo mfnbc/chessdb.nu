@@ -1,10 +1,54 @@
 use serde::Serialize;
 
+/// White or black, for every color/side field in this module's typed output
+/// structs. Serializes to exactly the same `"white"`/`"black"` strings the
+/// fields here used to hold as bare `String`s (`#[serde(rename_all =
+/// "lowercase")]`), so this is a pure internal refactor — no JSON/Nu/SQL
+/// consumer downstream can tell the difference.
+///
+/// Deliberately its own type rather than reusing `shakmaty::Color`: that's a
+/// foreign type, so this crate can't implement `Serialize` for it directly
+/// (orphan rule). `other()` and `From<shakmaty::Color>` are the two things
+/// every call site actually needed — see `canonical::unflip_color` (now
+/// deleted, superseded by `other()`) and the ~22 duplicated `if
+/// color.is_white() { "white" } else { "black" }` conversions this replaced
+/// across `position.rs`/`threat_graph.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    White,
+    Black,
+}
+
+impl Side {
+    pub fn other(self) -> Side {
+        match self {
+            Side::White => Side::Black,
+            Side::Black => Side::White,
+        }
+    }
+}
+
+impl From<shakmaty::Color> for Side {
+    fn from(c: shakmaty::Color) -> Side {
+        if c.is_white() { Side::White } else { Side::Black }
+    }
+}
+
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Side::White => "white",
+            Side::Black => "black",
+        })
+    }
+}
+
 /// Reference to a piece on the board — human-readable, no bitboards.
 #[derive(Debug, Clone, Serialize)]
 pub struct PieceRef {
     pub role: String,     // "Knight", "Bishop", "Rook", "Queen", "Pawn", "King"
-    pub color: String,    // "white", "black"
+    pub color: Side,
     pub square: String,   // "d5", "e4", "a1"
 }
 
@@ -69,14 +113,14 @@ pub struct Outpost {
 pub struct OpenFile {
     pub file: String,
     pub rook_count: u8,
-    pub color: String,
+    pub color: Side,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PassedPawn {
     pub square: String,
     pub rank: u8,
-    pub color: String,
+    pub color: Side,
     pub is_protected: bool,
 }
 
@@ -84,12 +128,12 @@ pub struct PassedPawn {
 pub struct PawnIsland {
     pub files: Vec<String>,
     pub count: u8,
-    pub color: String,
+    pub color: Side,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KingExposure {
-    pub color: String,
+    pub color: Side,
     pub shelter_files: u8,
     pub attacker_count: u8,
 }
@@ -98,13 +142,13 @@ pub struct KingExposure {
 pub struct DoubledPawn {
     pub file: String,
     pub count: u8,
-    pub color: String,
+    pub color: Side,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IsolatedPawn {
     pub square: String,
-    pub color: String,
+    pub color: Side,
 }
 
 // ── Material concepts ──
@@ -131,7 +175,7 @@ pub struct MaterialBalance {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DevelopmentInfo {
-    pub color: String,
+    pub color: Side,
     pub undeveloped_pieces: Vec<PieceRef>,
     pub space_advantage: i64,
 }
@@ -141,30 +185,30 @@ pub struct DevelopmentInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct PawnBreak {
     pub square: String,
-    pub color: String,
+    pub color: Side,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MinorityAttack {
-    pub color: String,
+    pub color: Side,
     pub strength: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PawnMajority {
-    pub color: String,
+    pub color: Side,
     pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RookOnSeventh {
-    pub color: String,
+    pub color: Side,
     pub count: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CenterControl {
-    pub color: String,
+    pub color: Side,
     pub strength: i64,
 }
 
@@ -184,5 +228,5 @@ pub struct GatedIssue {
     pub confidence: f64,
     pub score: f64,
     pub phrase: String,
-    pub side: String,
+    pub side: Side,
 }

@@ -75,13 +75,6 @@ pub fn unflip_square(sq: Square) -> Square {
     sq.flip_vertical()
 }
 
-/// Swap "white"/"black" (any other value passes through unchanged only in
-/// the sense that this always returns one of the two — callers only ever
-/// pass one of these two strings).
-pub fn unflip_color(color_str: &str) -> String {
-    if color_str == "white" { "black".into() } else { "white".into() }
-}
-
 /// `PieceRef.square`/`PassedPawn.square`/etc. are already-formatted strings
 /// (e.g. "d5"), not `Square` values, by the time they reach typed output
 /// structs — parse, flip, reformat.

@@ -98,11 +98,11 @@ impl ThreatGraph {
             .map(|p| Self::piece_value(p.role)).unwrap_or(0);
         let mut net = victim_val;
 
-        let victim_color = if initiator.is_white() { "black" } else { "white" };
+        let victim_color = Side::from(initiator.other());
         let victim_role = self.pieces[Self::idx(sq)]
             .map(|p| role_name(p.role)).unwrap_or_default();
         steps.push(CaptureStep {
-            piece: victim_role, color: victim_color.into(),
+            piece: victim_role, color: victim_color,
             square: square_name(sq), value_cp: victim_val,
         });
         board.discard_piece_at(sq);
@@ -133,7 +133,7 @@ impl ThreatGraph {
                 net += delta;
                 steps.push(CaptureStep {
                     piece: role_name(best_role),
-                    color: if side_to_capture.is_white() { "white" } else { "black" }.into(),
+                    color: Side::from(side_to_capture),
                     square: square_name(recap_sq), value_cp: val,
                 });
                 board.discard_piece_at(recap_sq);
@@ -171,7 +171,7 @@ impl ThreatGraph {
                     total_val += val as i64;
                     targets.push(PieceRef {
                         role: role_name(tp.role),
-                        color: (if enemy.is_white() { "white" } else { "black" }).to_string(),
+                        color: Side::from(enemy),
                         square: square_name(t_sq),
                     });
                 }
@@ -179,7 +179,7 @@ impl ThreatGraph {
             if targets.len() >= 2 && total_val >= Self::piece_value(Role::Rook) {
                 let attacker = PieceRef {
                     role: role_name(piece.role),
-                    color: (if color.is_white() { "white" } else { "black" }).to_string(),
+                    color: Side::from(color),
                     square: square_name(sq),
                 };
                 // Find which target hangs (lowest-value undefended)
@@ -250,7 +250,7 @@ impl ThreatGraph {
                 out.push(HangingPiece {
                     piece: PieceRef {
                         role: role_name(piece.role),
-                        color: (if piece.color.is_white() { "white" } else { "black" }).to_string(),
+                        color: Side::from(piece.color),
                         square: square_name(sq),
                     },
                     attacker_count: attacker_count as u8,
@@ -288,7 +288,7 @@ impl ThreatGraph {
                 net += delta;
                 captures.push(CaptureStep {
                     piece: role_name(r),
-                    color: (if side.is_white() { "white" } else { "black" }).to_string(),
+                    color: Side::from(side),
                     square: square_name(s),
                     value_cp: v,
                 });
@@ -334,7 +334,7 @@ pub struct EvaluatedFork {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CaptureStep {
     pub piece: String,
-    pub color: String,
+    pub color: Side,
     pub square: String,
     pub value_cp: i64,
 }
