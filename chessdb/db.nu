@@ -82,19 +82,48 @@ export def init-db [db: string] {
     " | ignore
     open $db | query db "CREATE INDEX IF NOT EXISTS idx_moves_pos ON moves(position_id)" | ignore
 
+    # move_states columns are decoded once, here and in the migration/backfill
+    # below plus the INSERT in sync.nu's import-records — from the bit layout
+    # defined in nu_plugin_chessdb/src/eval/concepts.rs's BIT_* constants
+    # (encode_state/decode_state_id). Downstream queries (chessdb/profile.nu)
+    # must read these named columns, never re-shift ms.state_id directly —
+    # that was a real, fixed bug (duplicated bit-layout knowledge outside its
+    # one source of truth), not a style preference.
     open $db | query db "
         CREATE TABLE IF NOT EXISTS move_states (
-            game_id      INTEGER NOT NULL,
-            ply          INTEGER NOT NULL,
-            state_id     INTEGER NOT NULL,
-            phase_bucket INTEGER NOT NULL,
-            has_fork     BOOLEAN NOT NULL DEFAULT 0,
-            has_pin      BOOLEAN NOT NULL DEFAULT 0,
-            has_hanging  BOOLEAN NOT NULL DEFAULT 0,
-            king_exposed BOOLEAN NOT NULL DEFAULT 0,
+            game_id         INTEGER NOT NULL,
+            ply             INTEGER NOT NULL,
+            state_id        INTEGER NOT NULL,
+            phase_bucket    INTEGER NOT NULL,
+            has_fork        BOOLEAN NOT NULL DEFAULT 0,
+            has_pin         BOOLEAN NOT NULL DEFAULT 0,
+            has_hanging     BOOLEAN NOT NULL DEFAULT 0,
+            king_exposed    BOOLEAN NOT NULL DEFAULT 0,
+            has_outpost     BOOLEAN NOT NULL DEFAULT 0,
+            has_open_file   BOOLEAN NOT NULL DEFAULT 0,
+            has_passed_pawn BOOLEAN NOT NULL DEFAULT 0,
             PRIMARY KEY (game_id, ply)
         )
     " | ignore
+    for col_sql in [
+        "ALTER TABLE move_states ADD COLUMN has_outpost     BOOLEAN"
+        "ALTER TABLE move_states ADD COLUMN has_open_file   BOOLEAN"
+        "ALTER TABLE move_states ADD COLUMN has_passed_pawn BOOLEAN"
+    ] { try { open $db | query db $col_sql } catch { } }
+    # One-time backfill for rows inserted before the three columns above
+    # existed (new rows already get them from sync.nu's INSERT). Guarded to
+    # only touch not-yet-backfilled rows, so this is cheap on repeat runs.
+    try {
+        open $db | query db "
+            UPDATE move_states
+            SET has_outpost     = (COALESCE(p.state_id, 0) >> 10) & 1,
+                has_open_file   = (COALESCE(p.state_id, 0) >> 11) & 1,
+                has_passed_pawn = (COALESCE(p.state_id, 0) >> 12) & 1
+            FROM moves m JOIN positions p ON m.next_position_id = p.zobrist
+            WHERE move_states.game_id = m.game_id AND move_states.ply = m.ply
+              AND (move_states.has_outpost IS NULL OR move_states.has_open_file IS NULL OR move_states.has_passed_pawn IS NULL)
+        "
+    } catch { }
 
     open $db | query db "
         CREATE TABLE IF NOT EXISTS player_baselines (

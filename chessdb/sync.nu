@@ -26,18 +26,26 @@ def import-records [games: list, username: string, db: string] {
     }
 
     # Decode state_id bit-field into move_states rows for fast coaching queries.
+    # Bit positions here must match nu_plugin_chessdb/src/eval/concepts.rs's
+    # BIT_* constants (encode_state/decode_state_id) — this is the one place
+    # on the Nu/SQL side that decodes state_id; downstream queries
+    # (chessdb/profile.nu) read these named columns, never re-shift state_id.
     if ($corpus.moves | is-not-empty) {
         try {
             open $db | query db "
                 INSERT OR IGNORE INTO move_states
-                    (game_id, ply, state_id, phase_bucket, has_fork, has_pin, has_hanging, king_exposed)
+                    (game_id, ply, state_id, phase_bucket, has_fork, has_pin, has_hanging, king_exposed,
+                     has_outpost, has_open_file, has_passed_pawn)
                 SELECT m.game_id, m.ply,
                     COALESCE(p.state_id, 0),
                     (COALESCE(p.state_id, 0) & 3),
                     ((COALESCE(p.state_id, 0) >> 7) & 1),
                     ((COALESCE(p.state_id, 0) >> 8) & 1),
                     ((COALESCE(p.state_id, 0) >> 9) & 1),
-                    ((COALESCE(p.state_id, 0) >> 5) & 1)
+                    ((COALESCE(p.state_id, 0) >> 5) & 1),
+                    ((COALESCE(p.state_id, 0) >> 10) & 1),
+                    ((COALESCE(p.state_id, 0) >> 11) & 1),
+                    ((COALESCE(p.state_id, 0) >> 12) & 1)
                 FROM moves m JOIN positions p ON m.next_position_id = p.zobrist
             " | ignore
         } catch { }

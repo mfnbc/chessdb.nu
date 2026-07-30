@@ -383,24 +383,35 @@ Done:
   manual hex-format call sites (`GameVisitor::san`, `pgn_to_batch_record`)
   now call the existing `get_canonical_hash` helper instead of re-deriving.
 
-Found but explicitly not fixed here (same class of bug, different layer,
-outside this pass's approved scope — flagged for a future pass):
-- **`chessdb/sync.nu` and `chessdb/profile.nu` independently bit-shift raw
-  `state_id` in SQL** (`profile.nu:174-176,185-187,342-345`,
-  `sync.nu:33-40`) — the identical "bit layout duplicated outside its one
-  source of truth" problem just fixed in Rust, now found in the Nu/SQL
-  layer too. Some of it (`had_outpost`/`had_open_file`/`had_passed_pawn` at
-  `profile.nu:342-345`) is a genuine schema gap — the `move_states` table
-  has no columns for those three concepts, only `has_fork`/`has_pin`/
-  `has_hanging`/`king_exposed`/`phase_bucket`. But `profile.nu:174-176` and
-  `185-187` re-derive `had_fork`/`had_pin`/`had_hanging` by bit-shifting
-  `ms.state_id` even though the table already has `ms.has_fork`/`ms.has_pin`/
-  `ms.has_hanging` columns sitting right there unused — the exact same
-  "typed data ignored in favor of re-deriving from a raw encoding" pattern
-  as the Rust-side finding this pass just fixed. Not touched — different
-  layer (SQL/Nu vs Rust), different verification needs (DB-backed, not
-  `cargo test`), and wasn't part of what was surveyed when this plan was
-  scoped.
+Follow-up fixed (2026-07-29): `chessdb/sync.nu`/`chessdb/profile.nu`'s SQL-side
+state_id bit-shift duplication
+
+Closed the flagged follow-up from the pass above. `chessdb/db.nu`'s
+`move_states` table gained `has_outpost`, `has_open_file`, `has_passed_pawn`
+columns (bits 10/11/12, matching `concepts.rs`'s `BIT_*` constants) — the
+real gap, since those three concepts had no column at all before, forcing
+`profile.nu:342-345` to bit-shift `state_id` directly. Added the matching
+`ALTER TABLE`/backfill migration in `init-db` (guarded by `IS NULL` so it's
+cheap after the first run on an existing DB) and extended `sync.nu`'s
+`INSERT OR IGNORE` to populate the three new columns for new rows going
+forward. `profile.nu:174-176,185-187` (`tactical-win-impact`) and
+`profile.nu:342-345` (`position-win-rates`) now read `ms.has_fork`/
+`ms.has_pin`/`ms.has_hanging`/`ms.has_outpost`/`ms.has_open_file`/
+`ms.has_passed_pawn`/`ms.king_exposed` directly instead of re-deriving any
+of them from `ms.state_id` — `sync.nu`'s INSERT is now the only place on the
+Nu/SQL side that decodes the bit layout, mirroring `decode_state_id` as the
+one decode point on the Rust side (the two can't be unified across the
+language boundary, but at least each language now has exactly one).
+
+Verified against a real SQLite DB, not just `cargo check`: built a
+pre-migration `move_states` table missing the three columns, seeded a row
+with `state_id` bits 7/10/11/12 set, ran `chess-init` and confirmed the
+backfill produced the correct decoded values, then ran
+`chess-profile-tactical`/`chess-profile-position` end-to-end against that
+DB and confirmed correct, error-free output (`fork` correctly attributed,
+`outpost`/`open_file`/`passed_pawn` all `present: 1`, `king_exposed`
+correctly `0`). Also confirmed a fresh `chess-init` produces the new columns
+directly via `CREATE TABLE` (no migration path needed).
 
 Verification: `cargo check`/`cargo clippy --tests` clean (only pre-existing
 warnings remain, in untouched `src/bin/hugm_harness.rs`); full test suite

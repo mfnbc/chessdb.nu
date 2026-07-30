@@ -171,9 +171,9 @@ def "tactical-win-impact" [username: string --db: string = "./chess.db"] {
     open $db | query db "
         WITH player_flags AS (
             SELECT ms.game_id,
-                   MAX((ms.state_id >> 7) & 1) as had_fork,
-                   MAX((ms.state_id >> 8) & 1) as had_pin,
-                   MAX((ms.state_id >> 9) & 1) as had_hanging
+                   MAX(ms.has_fork) as had_fork,
+                   MAX(ms.has_pin) as had_pin,
+                   MAX(ms.has_hanging) as had_hanging
             FROM move_states ms
             JOIN moves m ON m.game_id = ms.game_id AND m.ply = ms.ply
             JOIN games g ON g.game_id = ms.game_id
@@ -182,9 +182,9 @@ def "tactical-win-impact" [username: string --db: string = "./chess.db"] {
         ),
         opp_flags AS (
             SELECT ms.game_id,
-                   MAX((ms.state_id >> 7) & 1) as had_fork,
-                   MAX((ms.state_id >> 8) & 1) as had_pin,
-                   MAX((ms.state_id >> 9) & 1) as had_hanging
+                   MAX(ms.has_fork) as had_fork,
+                   MAX(ms.has_pin) as had_pin,
+                   MAX(ms.has_hanging) as had_hanging
             FROM move_states ms
             JOIN moves m ON m.game_id = ms.game_id AND m.ply = ms.ply
             JOIN games g ON g.game_id = ms.game_id
@@ -339,10 +339,10 @@ def "position-win-rates" [username: string --db: string = "./chess.db"] {
         ),
         game_flags AS (
             SELECT ms.game_id,
-                   MAX((ms.state_id >> 10) & 1) as had_outpost,
-                   MAX((ms.state_id >> 11) & 1) as had_open_file,
-                   MAX((ms.state_id >> 12) & 1) as had_passed_pawn,
-                   MAX(CASE WHEN m.color = pg.player_color THEN (ms.state_id >> 5) & 1 ELSE 0 END) as had_king_exposed
+                   MAX(ms.has_outpost) as had_outpost,
+                   MAX(ms.has_open_file) as had_open_file,
+                   MAX(ms.has_passed_pawn) as had_passed_pawn,
+                   MAX(CASE WHEN m.color = pg.player_color THEN ms.king_exposed ELSE 0 END) as had_king_exposed
             FROM move_states ms
             JOIN moves m ON m.game_id = ms.game_id AND m.ply = ms.ply
             JOIN player_games pg ON pg.game_id = ms.game_id
