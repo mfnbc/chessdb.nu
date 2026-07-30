@@ -130,9 +130,9 @@ identity) and `eval::position` (evaluation normalization).
 
 **The corollary the name implies but is easy to forget: nothing in that
 canonical form tells you who is actually White or Black in a real game.** A
-canonical FEN's "w" side-to-move token, its square letters' case,
-`positions.board_pieces` — none of that is real-game truth, it's an opaque
-identity/scoring-normalization key. Any code that needs to know what actually
+canonical FEN's "w" side-to-move token and its square letters' case are not
+real-game truth — they're an opaque identity/scoring-normalization key. Any
+code that needs to know what actually
 happened in a real game — who played a move, what a human should see
 reviewing their own game, which color a specific player was — must read that
 from `moves.color`, `moves.san` (**not** `moves.canonical_san`), `moves.uci`,
@@ -158,7 +158,7 @@ Two real bugs shipped from getting this backwards (full history in
 
 | Field | Convention |
 |---|---|
-| `positions.zobrist` / `.fen` / `.board_pieces` | canonical (White always to move) |
+| `positions.zobrist` / `.fen` | canonical (White always to move) |
 | `openings.fen` | canonical (canonicalized at seed time) |
 | `moves.san` | real (as actually played) |
 | `moves.canonical_san` | canonical (cross-game grouping only) |

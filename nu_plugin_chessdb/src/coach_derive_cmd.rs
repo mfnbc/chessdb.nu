@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use shakmaty::Position;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
-use crate::eval::StateVector;
+use crate::eval::{
+    build_sensor_report, compute_groups, compute_phase, decode_state_id, encode_state, StateVector,
+};
 
 pub struct DeriveCoachSignals;
 
@@ -82,7 +84,7 @@ fn encode_move_states(rows: &[MoveRecord]) -> Vec<StateVector> {
         // decode_state_id shares its bit layout with encode_state (concepts.rs),
         // so this can't silently desync the way a hand-rolled decoder could.
         if let Some(sid) = r.state_id {
-            return crate::eval::decode_state_id(sid);
+            return decode_state_id(sid);
         }
         // Slow path: re-parse FEN (fallback for rows without state_id)
         let fen = match shakmaty::fen::Fen::from_ascii(r.fen.as_bytes()) {
@@ -91,10 +93,10 @@ fn encode_move_states(rows: &[MoveRecord]) -> Vec<StateVector> {
         let chess: shakmaty::Chess = match fen.into_position(shakmaty::CastlingMode::Standard) {
             Ok(c) => c, Err(_) => return StateVector::default(),
         };
-        let phase = crate::eval::compute_phase(chess.board());
-        let groups = crate::eval::compute_groups(&chess, phase, 0);
-        let sensor = crate::eval::build_sensor_report(chess.board(), &r.fen, &groups, &chess, phase, None);
-        crate::eval::encode_state(&sensor, &groups, phase)
+        let phase = compute_phase(chess.board());
+        let groups = compute_groups(&chess, phase, 0);
+        let sensor = build_sensor_report(chess.board(), &r.fen, &groups, &chess, phase, None);
+        encode_state(&sensor, &groups, phase)
     }).collect()
 }
 
@@ -368,12 +370,12 @@ mod tests {
         let fen = "rnb1kbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1qPP/RNBQKB1R w KQkq - 0 1";
         let parsed = shakmaty::fen::Fen::from_ascii(fen.as_bytes()).unwrap();
         let chess: shakmaty::Chess = parsed.into_position(shakmaty::CastlingMode::Standard).unwrap();
-        let phase = crate::eval::compute_phase(chess.board());
-        let groups = crate::eval::compute_groups(&chess, phase, 0);
-        let sensor = crate::eval::build_sensor_report(chess.board(), fen, &groups, &chess, phase, None);
-        let slow = crate::eval::encode_state(&sensor, &groups, phase);
+        let phase = compute_phase(chess.board());
+        let groups = compute_groups(&chess, phase, 0);
+        let sensor = build_sensor_report(chess.board(), fen, &groups, &chess, phase, None);
+        let slow = encode_state(&sensor, &groups, phase);
 
-        let fast = crate::eval::decode_state_id(slow.state_id);
+        let fast = decode_state_id(slow.state_id);
 
         assert_eq!(fast.state_id, slow.state_id);
         assert_eq!(fast.phase, slow.phase);

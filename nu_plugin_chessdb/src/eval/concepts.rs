@@ -1,5 +1,6 @@
 use crate::eval::position::EvalGroups;
 use crate::eval::sensor::SensorReport;
+use crate::eval::concept_types::GatedIssue;
 
 /// A named concept detected in a chess position, with severity and ELO threshold.
 #[derive(Debug, serde::Serialize)]
@@ -159,20 +160,6 @@ pub fn concepts_for_elo(concepts: &[Concept], elo: i32) -> Vec<&Concept> {
     concepts.iter().filter(|c| c.elo_min <= elo).collect()
 }
 
-/// A gated issue scored by magnitude × severity × elo_relevance × confidence.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GatedIssue {
-    pub name: String,
-    pub severity: i64,
-    pub elo_min: i32,
-    pub magnitude: f64,
-    pub elo_relevance: f64,
-    pub confidence: f64,
-    pub score: f64,
-    pub phrase: String,
-    pub side: String,
-}
-
 /// Gate concepts for a single position (no delta history).
 /// Ranks by severity × elo_relevance × confidence. Returns top 1-3.
 pub fn rank_issues_for_position(concepts: &[Concept], player_elo: i32) -> Vec<GatedIssue> {
@@ -277,7 +264,7 @@ const BIT_DISCOVERED: u32 = 14;
 /// fine, each closure can differ; what matters is that bit position and check
 /// live in the same tuple, so they can't end up paired with the wrong bit the
 /// way two separately-maintained lists could.
-type SensorPredicate = fn(&crate::eval::sensor::SensorReport) -> bool;
+type SensorPredicate = fn(&SensorReport) -> bool;
 const BOOL_BITS: &[(u32, SensorPredicate)] = &[
     (BIT_KING_EXPOSED, |s| s.positional.king_exposure.as_ref().map(|k| k.attacker_count > 0).unwrap_or(false)),
     (BIT_IN_CHECK,     |s| s.in_check),
@@ -291,7 +278,7 @@ const BOOL_BITS: &[(u32, SensorPredicate)] = &[
     (BIT_DISCOVERED,   |s| !s.tactical.discovered.is_empty()),
 ];
 
-pub fn encode_state(sensor: &crate::eval::sensor::SensorReport, groups: &crate::eval::position::EvalGroups, phase: u8) -> StateVector {
+pub fn encode_state(sensor: &SensorReport, groups: &EvalGroups, phase: u8) -> StateVector {
     let phase_bits = match phase {
         0..=8 => 0u8,      // deep endgame
         9..=16 => 1,       // endgame

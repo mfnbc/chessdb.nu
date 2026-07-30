@@ -4,7 +4,9 @@ use shakmaty::{attacks, fen::Fen, Bitboard, Chess, Color, File, Position, Rank, 
 
 use crate::eval::concept_types::*;
 use crate::eval::sensor::{TacticalReport, PositionalReport, SensorReport, AggregatedScores, MaterialConceptReport};
-use crate::canonical::{unflip_color, unflip_phrase, unflip_square_str};
+use crate::eval::concepts::{encode_state, extract_concepts, rank_issues_for_position};
+use crate::eval::threat_graph::ThreatGraph;
+use crate::canonical::{normalize_to_white_to_move, unflip_color, unflip_phrase, unflip_square_str};
 
 // Configurable constants (GUESS values) collected here for easier tuning.
 const TACTICAL_BASE_PINS: i64 = 50;
@@ -1626,32 +1628,32 @@ fn outposts_to_typed(board: &shakmaty::Board, examples: &[(Square, Role, Square)
     }).collect()
 }
 
-fn pins_to_typed(board: &shakmaty::Board, examples: &[(Square, Square, Square)]) -> Vec<crate::eval::concept_types::Pin> {
-    use crate::eval::concept_types::PinType;
+fn pins_to_typed(board: &shakmaty::Board, examples: &[(Square, Square, Square)]) -> Vec<Pin> {
+    use PinType;
     examples.iter().filter_map(|(pinner_sq, pinned_sq, shielded_sq)| {
         let attacker = board_to_piece_ref(board, *pinner_sq)?;
         let pinned   = board_to_piece_ref(board, *pinned_sq)?;
         let shielded = board_to_piece_ref(board, *shielded_sq)?;
         let pin_type = if shielded.role == "King" { PinType::Absolute } else { PinType::Relative };
-        Some(crate::eval::concept_types::Pin { attacker, pinned, shielded, pin_type })
+        Some(Pin { attacker, pinned, shielded, pin_type })
     }).collect()
 }
 
-fn skewers_to_typed(board: &shakmaty::Board, examples: &[(Square, Square, Square)]) -> Vec<crate::eval::concept_types::Skewer> {
+fn skewers_to_typed(board: &shakmaty::Board, examples: &[(Square, Square, Square)]) -> Vec<Skewer> {
     examples.iter().filter_map(|(attacker_sq, front_sq, back_sq)| {
         let attacker = board_to_piece_ref(board, *attacker_sq)?;
         let front    = board_to_piece_ref(board, *front_sq)?;
         let behind   = board_to_piece_ref(board, *back_sq)?;
-        Some(crate::eval::concept_types::Skewer { attacker, front, behind })
+        Some(Skewer { attacker, front, behind })
     }).collect()
 }
 
-fn discovered_to_typed(board: &shakmaty::Board, examples: &[(Square, Square, Square)]) -> Vec<crate::eval::concept_types::DiscoveredAttack> {
+fn discovered_to_typed(board: &shakmaty::Board, examples: &[(Square, Square, Square)]) -> Vec<DiscoveredAttack> {
     examples.iter().filter_map(|(blocker_sq, slider_sq, target_sq)| {
         let mover   = board_to_piece_ref(board, *blocker_sq)?;
         let attacker = board_to_piece_ref(board, *slider_sq)?;
         let target  = board_to_piece_ref(board, *target_sq)?;
-        Some(crate::eval::concept_types::DiscoveredAttack { mover, attacker, target })
+        Some(DiscoveredAttack { mover, attacker, target })
     }).collect()
 }
 
@@ -2794,7 +2796,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
     let them = us.other();
 
     // Build the unified threat graph — one pass over the board
-    let graph = crate::eval::threat_graph::ThreatGraph::build(chess);
+    let graph = ThreatGraph::build(chess);
 
     // Forks with SEE: graph-derived, includes material consequence
     let mut evaluated_forks = graph.find_forks(us);
@@ -2867,12 +2869,12 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         in_check,
         ..Default::default()
     };
-    let state_id = crate::eval::concepts::encode_state(&partial, groups, phase).state_id;
+    let state_id = encode_state(&partial, groups, phase).state_id;
 
     let gated_issues = if let Some(elo) = player_elo {
         let side = if us.is_white() { "white" } else { "black" };
-        let concepts = crate::eval::concepts::extract_concepts(&partial, groups, side);
-        crate::eval::concepts::rank_issues_for_position(&concepts, elo)
+        let concepts = extract_concepts(&partial, groups, side);
+        rank_issues_for_position(&concepts, elo)
     } else { Vec::new() };
 
     SensorReport {
@@ -2896,7 +2898,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
 }
 
 /// Normalize a position so White is always the side to move — see
-/// `crate::canonical::normalize_to_white_to_move`'s doc comment for why.
+/// `normalize_to_white_to_move`'s doc comment for why.
 /// Every scoring function in this file already takes a `Color` and computes
 /// `us − them` where `us = chess.turn()` — feed them a position where White
 /// always *is* `chess.turn()`, and they need no changes at all; the ~25
@@ -2910,7 +2912,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
 /// such correction: after normalization they're already relative to
 /// whoever is really to move, which is what every consumer wants.
 fn normalize_for_eval(chess: &Chess) -> Result<(Chess, bool)> {
-    crate::canonical::normalize_to_white_to_move(chess)
+    normalize_to_white_to_move(chess)
 }
 
 /// Un-flip every square/color in a `SensorReport` back to real board terms,
@@ -3422,13 +3424,6 @@ mod tests {
         // Ensure king_tropism term present in a normal position (non-zero phase)
         let record = analyze_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").expect("FEN should parse");
         assert!(record.groups.king_safety.terms.contains_key("tropism_us"));
-        let _ = record
-            .groups
-            .king_safety
-            .terms
-            .get("tropism_us")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
     }
 
     #[test]

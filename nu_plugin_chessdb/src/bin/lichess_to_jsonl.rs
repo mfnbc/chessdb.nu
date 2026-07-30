@@ -34,8 +34,7 @@ fn main() -> anyhow::Result<()> {
         if white_rating < min_rating || black_rating < min_rating { continue; }
 
         let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("game");
-        let _created_at = v.get("createdAt").and_then(|t| t.as_i64()).unwrap_or(0);
-        // For simplicity, leave date unknown (we don't need accurate date for PGN parsing here)
+        // We don't need an accurate date for PGN parsing here.
         let date = "0000.00.00".to_string();
 
         let moves = v.get("moves").and_then(|m| m.as_str()).unwrap_or("");

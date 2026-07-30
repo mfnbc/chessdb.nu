@@ -1,10 +1,14 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, Type, Value};
 
+use crate::core::canonicalize_fen;
+use crate::ChessdbPlugin;
+use crate::PLUGIN_CATEGORY;
+
 pub struct CanonicalizeFen;
 
 impl PluginCommand for CanonicalizeFen {
-    type Plugin = crate::ChessdbPlugin;
+    type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str {
         "chessdb canonicalize-fen"
@@ -23,7 +27,7 @@ impl PluginCommand for CanonicalizeFen {
                     Type::List(Box::new(Type::String)),
                 ),
             ])
-            .category(Category::Custom(crate::PLUGIN_CATEGORY.into()))
+            .category(Category::Custom(PLUGIN_CATEGORY.into()))
     }
 
     fn run(
@@ -37,14 +41,14 @@ impl PluginCommand for CanonicalizeFen {
 
         match input_value {
             Value::String { val, .. } => {
-                let result = crate::core::canonicalize_fen(&val, call.head)?;
+                let result = canonicalize_fen(&val, call.head)?;
                 Ok(PipelineData::Value(Value::string(result, call.head), None))
             }
             Value::List { vals, .. } => {
                 let mut results = Vec::with_capacity(vals.len());
                 for val in vals {
                     let fen_str = val.as_str()?;
-                    let canonical = crate::core::canonicalize_fen(fen_str, call.head)?;
+                    let canonical = canonicalize_fen(fen_str, call.head)?;
                     results.push(Value::string(canonical, call.head));
                 }
                 Ok(PipelineData::Value(Value::list(results, call.head), None))

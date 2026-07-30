@@ -17,7 +17,7 @@ pub struct SensorReport {
     pub evaluated_forks: Vec<EvaluatedFork>,
     /// ELO-gated, ranked issues for coaching (from concepts.rs)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gated_issues: Vec<crate::eval::concepts::GatedIssue>,
+    pub gated_issues: Vec<GatedIssue>,
     /// Side to move has at least one legal move that delivers checkmate
     #[serde(default)]
     pub mate_in_1_exists: bool,

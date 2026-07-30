@@ -1,10 +1,14 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, Type, Value};
 
+use crate::core::zobrist;
+use crate::ChessdbPlugin;
+use crate::PLUGIN_CATEGORY;
+
 pub struct Zobrist;
 
 impl PluginCommand for Zobrist {
-    type Plugin = crate::ChessdbPlugin;
+    type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str {
         "chessdb zobrist"
@@ -24,7 +28,7 @@ impl PluginCommand for Zobrist {
                     Type::List(Box::new(Type::String)),
                 ),
             ])
-            .category(Category::Custom(crate::PLUGIN_CATEGORY.into()))
+            .category(Category::Custom(PLUGIN_CATEGORY.into()))
     }
 
     fn run(
@@ -40,7 +44,7 @@ impl PluginCommand for Zobrist {
         match input_value {
             Value::String { val, .. } => {
                 // Single FEN string
-                let result = crate::core::zobrist(&val, as_int, call.head)?;
+                let result = zobrist(&val, as_int, call.head)?;
                 Ok(PipelineData::Value(Value::string(result, call.head), None))
             }
             Value::List { vals, .. } => {
@@ -48,7 +52,7 @@ impl PluginCommand for Zobrist {
                 let mut results = Vec::with_capacity(vals.len());
                 for val in vals {
                     let fen_str = val.as_str()?;
-                    let hash = crate::core::zobrist(fen_str, as_int, call.head)?;
+                    let hash = zobrist(fen_str, as_int, call.head)?;
                     results.push(Value::string(hash, call.head));
                 }
                 Ok(PipelineData::Value(Value::list(results, call.head), None))

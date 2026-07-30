@@ -167,3 +167,22 @@ pub struct CenterControl {
     pub color: String,
     pub strength: i64,
 }
+
+/// A gated issue scored by magnitude × severity × elo_relevance × confidence.
+/// Lives here (not in `concepts.rs`, where `rank_issues_for_position`/
+/// `rank_issues_for_player` build it) because `SensorReport` (`sensor.rs`)
+/// carries a `Vec<GatedIssue>` field — putting the type in the shared
+/// foundational types module `sensor.rs` already depends on avoids a
+/// `sensor.rs` <-> `concepts.rs` mutual dependency.
+#[derive(Debug, Clone, Serialize)]
+pub struct GatedIssue {
+    pub name: String,
+    pub severity: i64,
+    pub elo_min: i32,
+    pub magnitude: f64,
+    pub elo_relevance: f64,
+    pub confidence: f64,
+    pub score: f64,
+    pub phrase: String,
+    pub side: String,
+}

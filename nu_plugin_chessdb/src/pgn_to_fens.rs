@@ -1,6 +1,10 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Record, Signature, Type, Value};
 
+use crate::core::{pgn_to_batch_record, pgn_to_fens, BatchSummary, MoveRow};
+use crate::ChessdbPlugin;
+use crate::PLUGIN_CATEGORY;
+
 pub struct PgnToFens;
 
 pub struct PgnToBatch;
@@ -18,7 +22,7 @@ fn headers_value(items: &[(String, String)], span: nu_protocol::Span) -> Value {
     Value::list(rows, span)
 }
 
-fn move_rows_value(rows: &[crate::core::MoveRow], span: nu_protocol::Span) -> Value {
+fn move_rows_value(rows: &[MoveRow], span: nu_protocol::Span) -> Value {
     let rows = rows
         .iter()
         .map(|row| {
@@ -38,7 +42,7 @@ fn move_rows_value(rows: &[crate::core::MoveRow], span: nu_protocol::Span) -> Va
     Value::list(rows, span)
 }
 
-fn batch_record_value(batch: crate::core::BatchSummary, span: nu_protocol::Span) -> Value {
+fn batch_record_value(batch: BatchSummary, span: nu_protocol::Span) -> Value {
     let games_count = batch.games.len() as i64;
     let positions_count = batch.positions.len() as i64;
     let unique_positions_count = batch.unique_positions.len() as i64;
@@ -83,7 +87,7 @@ fn batch_record_value(batch: crate::core::BatchSummary, span: nu_protocol::Span)
 }
 
 impl PluginCommand for PgnToFens {
-    type Plugin = crate::ChessdbPlugin;
+    type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str {
         "chessdb pgn-to-fens"
@@ -99,7 +103,7 @@ impl PluginCommand for PgnToFens {
                 (Type::String, Type::List(Box::new(Type::Record(vec![].into())))),
                 (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::Record(vec![].into())))),
             ])
-            .category(Category::Custom(crate::PLUGIN_CATEGORY.into()))
+            .category(Category::Custom(PLUGIN_CATEGORY.into()))
     }
 
     fn run(
@@ -115,7 +119,7 @@ impl PluginCommand for PgnToFens {
 
         match input_value {
             Value::String { val, .. } => {
-                let rows = crate::core::pgn_to_fens(&val, span)?;
+                let rows = pgn_to_fens(&val, span)?;
                 if let Value::List { vals, .. } = move_rows_value(&rows, span) {
                     all_rows.extend(vals);
                 }
@@ -123,7 +127,7 @@ impl PluginCommand for PgnToFens {
             Value::List { vals, .. } => {
                 for v in vals {
                     let s = v.as_str()?;
-                    let rows = crate::core::pgn_to_fens(s, span)?;
+                    let rows = pgn_to_fens(s, span)?;
                     if let Value::List { vals: inner, .. } = move_rows_value(&rows, span) {
                         all_rows.extend(inner);
                     }
@@ -139,7 +143,7 @@ impl PluginCommand for PgnToFens {
 }
 
 impl PluginCommand for PgnToBatch {
-    type Plugin = crate::ChessdbPlugin;
+    type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str {
         "chessdb pgn-to-batch"
@@ -155,7 +159,7 @@ impl PluginCommand for PgnToBatch {
                 (Type::String, Type::Record(vec![].into())),
                 (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::Record(vec![].into())))),
             ])
-            .category(Category::Custom(crate::PLUGIN_CATEGORY.into()))
+            .category(Category::Custom(PLUGIN_CATEGORY.into()))
     }
 
     fn run(
@@ -170,14 +174,14 @@ impl PluginCommand for PgnToBatch {
 
         match input_value {
             Value::String { val, .. } => {
-                let batch = crate::core::pgn_to_batch_record(&val, span)?;
+                let batch = pgn_to_batch_record(&val, span)?;
                 Ok(PipelineData::Value(batch_record_value(batch, span), None))
             }
             Value::List { vals, .. } => {
                 let mut recs: Vec<Value> = Vec::new();
                 for v in vals {
                     let s = v.as_str()?;
-                    let batch = crate::core::pgn_to_batch_record(s, span)?;
+                    let batch = pgn_to_batch_record(s, span)?;
                     recs.push(batch_record_value(batch, span));
                 }
                 Ok(PipelineData::Value(Value::list(recs, span), None))

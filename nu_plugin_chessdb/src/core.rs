@@ -10,6 +10,7 @@ use shakmaty::{
     Bitboard, Chess, Color, EnPassantMode, Piece, Position, Role,
 };
 
+use crate::canonical::{flip_move, normalize_to_white_to_move};
 use crate::chess::fen_to_chess;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +101,7 @@ struct GameVisitor {
 }
 
 impl GameVisitor {
-    fn new(game_index: u32, _span: Span) -> Self {
+    fn new(game_index: u32) -> Self {
         Self {
             game_index,
             headers: Vec::new(),
@@ -166,7 +167,7 @@ impl Visitor for GameVisitor {
         // so real color-mirror positions from different games collapse onto
         // one row (see canonical.rs). `uci` is left in real terms since
         // nothing downstream consumes it.
-        let (canonical_pos, _) = match crate::canonical::normalize_to_white_to_move(&new_pos) {
+        let (canonical_pos, _) = match normalize_to_white_to_move(&new_pos) {
             Ok(p) => p,
             Err(e) => {
                 self.error = Some(format!("Canonicalization error: {e}"));
@@ -183,14 +184,14 @@ impl Visitor for GameVisitor {
         // on instead (see `chess-explore`), since mixing real-frame SAN from
         // either side under one canonical position is meaningless there.
         let canonical_san = if self.pos.turn() == Color::Black {
-            let (canonical_pre_pos, _) = match crate::canonical::normalize_to_white_to_move(&self.pos) {
+            let (canonical_pre_pos, _) = match normalize_to_white_to_move(&self.pos) {
                 Ok(p) => p,
                 Err(e) => {
                     self.error = Some(format!("Canonicalization error: {e}"));
                     return;
                 }
             };
-            let flipped_mv = crate::canonical::flip_move(&mv);
+            let flipped_mv = flip_move(&mv);
             shakmaty::san::SanPlus::from_move(canonical_pre_pos, &flipped_mv).to_string()
         } else {
             san_str.clone()
@@ -474,7 +475,7 @@ pub fn checker_summary(fen_str: &str, span: Span) -> Result<CheckerSummary, Labe
 
 pub fn pgn_to_fens(pgn_str: &str, span: Span) -> Result<Vec<MoveRow>, LabeledError> {
     let mut reader = BufferedReader::new(pgn_str.as_bytes());
-    let mut visitor = GameVisitor::new(0, span);
+    let mut visitor = GameVisitor::new(0);
 
     let rows = reader
         .read_game(&mut visitor)
@@ -504,7 +505,7 @@ pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, La
     let mut game_index: u32 = 0;
 
     loop {
-        let mut visitor = GameVisitor::new(game_index, span);
+        let mut visitor = GameVisitor::new(game_index);
         let game_rows = match reader.read_game(&mut visitor) {
             Ok(Some(rows)) => rows,
             Ok(None) => break,
@@ -583,7 +584,7 @@ pub fn zobrist(fen_str: &str, as_int: bool, span: Span) -> Result<String, Labele
 /// at a Black-to-move ply.
 pub fn canonicalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
-    let (canonical_pos, _) = crate::canonical::normalize_to_white_to_move(&pos)
+    let (canonical_pos, _) = normalize_to_white_to_move(&pos)
         .map_err(|e| LabeledError::new(format!("Canonicalization error: {e}")))?;
     Ok(Fen::from_position(canonical_pos, EnPassantMode::Legal).to_string())
 }

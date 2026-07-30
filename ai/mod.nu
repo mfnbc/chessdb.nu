@@ -193,15 +193,19 @@ list is a summary, not a substitute for it):
   san is the real, as-played move. canonical_san is the same move translated
   into positions' canonical frame (see below) — only useful for grouping by
   position across games; for what a player actually played, use san.
-- positions(zobrist, fen, hugm_score, hugm_eval_arr, board_pieces, state_id,
-            mate_in_1, is_checkmate, updated_at)
+- positions(zobrist, fen, hugm_score, hugm_eval_arr, state_id,
+            mate_in_1, is_checkmate)
   zobrist/fen are canonical: normalized so White is always to move, the same
   simplification chess tablebases use to collapse a position and its exact
   color-mirror onto one row. fen's own "w"/"b" token and square case tell
   you nothing about who was really to move in any specific game — for that,
   use moves.color/moves.san, not positions.fen.
   hugm_eval_arr is a JSON array: [material, pawns, activity, king_safety, ...]
-- player_baselines(username, concept_name, phase_bucket, mean, std)
+- player_baselines(username, concept_name, phase_bucket, mean, std, count)
+  count is the real Welford sample size the baseline was built from — a
+  baseline with a low count is noisy; chess-derive's own --min-games gate
+  already filters low-count baselines out of move_anomalies, but treat a
+  low player_baselines.count as low-confidence if you query it directly.
 - move_anomalies(username, game_id, ply, state_id, anomaly_type,
                  concept_name, z_score, severity, signed_delta, hurt_player, consumed)
   NOTE: move_anomalies has NO phase_bucket column. To break anomalies by

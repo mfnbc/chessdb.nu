@@ -338,11 +338,3 @@ fn gen_weights(beta: &[f64], _names: &[&str], path: &str) {
     f.write_all(serde_json::to_string_pretty(&w).unwrap().as_bytes()).unwrap();
     println!("\nWrote weights to {}", path);
 }
-
-impl RegressionRow {
-    #[allow(dead_code)]
-    fn hugm_raw(&self) -> i64 {
-        self.material + self.pawn_structure + self.piece_activity + self.king_safety
-        + self.passed_pawns + self.development + self.vector_features + self.strategic
-    }
-}

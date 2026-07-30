@@ -5,11 +5,67 @@ use serde_json::json;
 use nu_plugin_chessdb::core::pgn_to_batch_record;
 use nu_protocol::Span;
 
-fn headers_lookup(headers: &Vec<(String,String)>, key: &str) -> Option<String> {
+fn headers_lookup(headers: &[(String,String)], key: &str) -> Option<String> {
     for (k,v) in headers.iter() {
         if k.eq_ignore_ascii_case(key) { return Some(v.clone()); }
     }
     None
+}
+
+fn has_valid_result(pgn_block: &str) -> bool {
+    for ln in pgn_block.lines() {
+        let ln = ln.trim();
+        if ln.starts_with("[Result ") {
+            if let Some(start) = ln.find('"') {
+                if let Some(end) = ln[start+1..].find('"') {
+                    let val = &ln[start+1..start+1+end];
+                    return val != "*" && !val.trim().is_empty();
+                }
+            }
+            return false;
+        }
+    }
+    false
+}
+
+/// Parse one PGN game block and print one JSONL line per position. Shared by
+/// both the blank-line-triggered path and the final trailing-block path in
+/// `main` — previously duplicated verbatim in both places.
+fn process_game_block(current: &str, span: Span) {
+    if !has_valid_result(current) { return; }
+    match pgn_to_batch_record(current, span) {
+        Ok(batch) => {
+            for pos in batch.positions {
+                let game_idx = pos.game_index as usize;
+                let game = if game_idx < batch.games.len() { Some(&batch.games[game_idx]) } else { None };
+                let headers = game.map(|g| g.headers.clone()).unwrap_or_default();
+                // Prefer Site tail when available
+                let site = headers_lookup(&headers, "Site").unwrap_or_default();
+                let mut source_game_id = String::new();
+                if site.starts_with("https://lichess.org/") {
+                    if let Some(idx) = site.rfind('/') { source_game_id = site[idx+1..].to_string(); }
+                }
+                if source_game_id.is_empty() {
+                    source_game_id = game.map(|g| g.source_game_id.clone()).unwrap_or_default();
+                }
+                let result_hdr = headers_lookup(&headers, "Result").unwrap_or_else(|| game.map(|g| g.result.clone()).unwrap_or_else(|| "*".to_string()));
+                if result_hdr == "*" || result_hdr.trim().is_empty() { continue; }
+                let white_elo = headers_lookup(&headers, "WhiteElo").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let black_elo = headers_lookup(&headers, "BlackElo").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let out = json!({
+                    "fen": pos.fen,
+                    "zobrist": pos.zobrist,
+                    "source_game_id": source_game_id,
+                    "ply": pos.ply,
+                    "white_elo": white_elo,
+                    "black_elo": black_elo,
+                    "result": result_hdr
+                });
+                println!("{}", out.to_string());
+            }
+        }
+        Err(e) => eprintln!("pgn_to_batch_record error: {}", e),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -26,62 +82,9 @@ fn main() -> anyhow::Result<()> {
         let line = line_res?;
         if line.trim().is_empty() {
             if !current.trim().is_empty() {
-                // We have one game block in `current`. Inspect Result header quickly.
-                let mut has_valid_result = false;
-                for ln in current.lines() {
-                    let ln = ln.trim();
-                    if ln.starts_with("[Result ") {
-                        if let Some(start) = ln.find('"') {
-                            if let Some(end) = ln[start+1..].find('"') {
-                                let val = &ln[start+1..start+1+end];
-                                if val != "*" && !val.trim().is_empty() {
-                                    has_valid_result = true;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-
-                if has_valid_result {
-                    match pgn_to_batch_record(&current, span) {
-                        Ok(batch) => {
-                            for pos in batch.positions {
-                                let game_idx = pos.game_index as usize;
-                                let game = if game_idx < batch.games.len() { Some(&batch.games[game_idx]) } else { None };
-                                let headers = game.map(|g| g.headers.clone()).unwrap_or_default();
-                                // Prefer Site tail when available
-                                let site = headers_lookup(&headers, "Site").unwrap_or_default();
-                                let mut source_game_id = String::new();
-                                if site.starts_with("https://lichess.org/") {
-                                    if let Some(idx) = site.rfind('/') { source_game_id = site[idx+1..].to_string(); }
-                                }
-                                if source_game_id.is_empty() {
-                                    source_game_id = game.map(|g| g.source_game_id.clone()).unwrap_or_else(|| "".to_string());
-                                }
-                                let result_hdr = headers_lookup(&headers, "Result").unwrap_or_else(|| game.map(|g| g.result.clone()).unwrap_or_else(|| "*".to_string()));
-                                if result_hdr == "*" || result_hdr.trim().is_empty() { continue; }
-                                let white_elo = headers_lookup(&headers, "WhiteElo").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                                let black_elo = headers_lookup(&headers, "BlackElo").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                                let out = json!({
-                                    "fen": pos.fen,
-                                    "zobrist": pos.zobrist,
-                                    "source_game_id": source_game_id,
-                                    "ply": pos.ply,
-                                    "white_elo": white_elo,
-                                    "black_elo": black_elo,
-                                    "result": result_hdr
-                                });
-                                println!("{}", out.to_string());
-                            }
-                        }
-                        Err(e) => eprintln!("pgn_to_batch_record error: {}", e),
-                    }
-                }
-
+                process_game_block(&current, span);
                 processed_games += 1;
                 if processed_games >= max_games { break; }
-
                 current.clear();
             }
         } else {
@@ -92,55 +95,7 @@ fn main() -> anyhow::Result<()> {
 
     // In case file didn't end with a blank line, process last block
     if !current.trim().is_empty() && processed_games < max_games {
-        let mut has_valid_result = false;
-        for ln in current.lines() {
-            let ln = ln.trim();
-            if ln.starts_with("[Result ") {
-                if let Some(start) = ln.find('"') {
-                    if let Some(end) = ln[start+1..].find('"') {
-                        let val = &ln[start+1..start+1+end];
-                        if val != "*" && !val.trim().is_empty() {
-                            has_valid_result = true;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        if has_valid_result {
-            match pgn_to_batch_record(&current, span) {
-                Ok(batch) => {
-                    for pos in batch.positions {
-                        let game_idx = pos.game_index as usize;
-                        let game = if game_idx < batch.games.len() { Some(&batch.games[game_idx]) } else { None };
-                        let headers = game.map(|g| g.headers.clone()).unwrap_or_default();
-                        let site = headers_lookup(&headers, "Site").unwrap_or_default();
-                        let mut source_game_id = String::new();
-                        if site.starts_with("https://lichess.org/") {
-                            if let Some(idx) = site.rfind('/') { source_game_id = site[idx+1..].to_string(); }
-                        }
-                        if source_game_id.is_empty() {
-                            source_game_id = game.map(|g| g.source_game_id.clone()).unwrap_or_else(|| "".to_string());
-                        }
-                        let result_hdr = headers_lookup(&headers, "Result").unwrap_or_else(|| game.map(|g| g.result.clone()).unwrap_or_else(|| "*".to_string()));
-                        if result_hdr == "*" || result_hdr.trim().is_empty() { continue; }
-                        let white_elo = headers_lookup(&headers, "WhiteElo").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                        let black_elo = headers_lookup(&headers, "BlackElo").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                        let out = json!({
-                            "fen": pos.fen,
-                            "zobrist": pos.zobrist,
-                            "source_game_id": source_game_id,
-                            "ply": pos.ply,
-                            "white_elo": white_elo,
-                            "black_elo": black_elo,
-                            "result": result_hdr
-                        });
-                        println!("{}", out.to_string());
-                    }
-                }
-                Err(e) => eprintln!("pgn_to_batch_record error: {}", e),
-            }
-        }
+        process_game_block(&current, span);
     }
 
     Ok(())

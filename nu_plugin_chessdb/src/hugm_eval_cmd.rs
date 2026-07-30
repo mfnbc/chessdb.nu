@@ -2,10 +2,18 @@ use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, SyntaxShape, Type, Value};
 use rayon::prelude::*;
 
+use crate::eval::{
+    analyze_fen_with_engine_score, render_explanations, render_structured_explanations,
+    set_weights_from_file, PositionRecord,
+};
+use crate::utils::json_to_nu_value;
+use crate::ChessdbPlugin;
+use crate::PLUGIN_CATEGORY;
+
 pub struct HugmEval;
 
 impl PluginCommand for HugmEval {
-    type Plugin = crate::ChessdbPlugin;
+    type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str {
         "chessdb hugm-eval"
@@ -48,7 +56,7 @@ impl PluginCommand for HugmEval {
                 "Player ELO for concept gating and Socratic issue ranking",
                 Some('p'),
             )
-            .category(Category::Custom(crate::PLUGIN_CATEGORY.into()))
+            .category(Category::Custom(PLUGIN_CATEGORY.into()))
     }
 
     fn run(
@@ -65,13 +73,13 @@ impl PluginCommand for HugmEval {
         let player_elo: Option<i32> = call.get_flag("player-elo")?;
         let weights_file: Option<String> = call.get_flag("weights")?;
         if let Some(ref path) = weights_file {
-            crate::eval::set_weights_from_file(path).map_err(|e| LabeledError::new(e).with_label("weights load error", span))?;
+            set_weights_from_file(path).map_err(|e| LabeledError::new(e).with_label("weights load error", span))?;
         }
         let input_value = input.into_value(span)?;
 
         match input_value {
             Value::String { val, .. } => {
-                let record = crate::eval::analyze_fen_with_engine_score(&val, engine_score, player_elo)
+                let record = analyze_fen_with_engine_score(&val, engine_score, player_elo)
                     .map_err(|e| LabeledError::new(e.to_string()).with_label("eval error", span))?;
                 let value = build_output_value(&record, include_verbose, player_elo, span)?;
                 Ok(PipelineData::Value(value, None))
@@ -92,7 +100,7 @@ impl PluginCommand for HugmEval {
                 let results_res: Vec<Result<Value, LabeledError>> = fens
                     .par_iter()
                     .map(|fen| {
-                        let record = crate::eval::analyze_fen_with_engine_score(fen, engine_score, player_elo)
+                        let record = analyze_fen_with_engine_score(fen, engine_score, player_elo)
                             .map_err(|e| LabeledError::new(e.to_string()).with_label("eval error", span))?;
                         build_output_value(&record, include_verbose, player_elo, span)
                     })
@@ -123,7 +131,7 @@ impl PluginCommand for HugmEval {
 /// computed by `build_sensor_report` with this same `player_elo` — rather than
 /// recomputed via `extract_concepts`/`rank_issues_for_position` a second time.
 fn build_output_value(
-    record: &crate::eval::PositionRecord,
+    record: &PositionRecord,
     include_verbose: bool,
     player_elo: Option<i32>,
     span: nu_protocol::Span,
@@ -132,8 +140,8 @@ fn build_output_value(
         .map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
 
     if include_verbose {
-        let expl = crate::eval::render_explanations(record);
-        let structured = crate::eval::render_structured_explanations(record);
+        let expl = render_explanations(record);
+        let structured = render_structured_explanations(record);
         if let serde_json::Value::Object(ref mut map) = json_val {
             map.insert("explanations".to_string(), serde_json::Value::Array(expl.into_iter().map(serde_json::Value::String).collect()));
             map.insert("explanations_structured".to_string(), serde_json::Value::Array(structured));
@@ -146,5 +154,5 @@ fn build_output_value(
         }
     }
 
-    Ok(crate::utils::json_to_nu_value(json_val, span))
+    Ok(json_to_nu_value(json_val, span))
 }

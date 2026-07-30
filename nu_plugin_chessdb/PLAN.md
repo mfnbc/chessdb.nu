@@ -1308,3 +1308,97 @@ Verified throughout: full test suite green at every step (ended at 32 lib tests,
 31 after `position_encoder.rs`'s 4 tests were removed with the file, since the two new
 regression tests added 1 net beyond that), `cargo clippy --all-targets` clean on every
 touched file, STS smoke test passes.
+
+Third pass: re-audit for anything remaining (2026-07-30)
+
+Systematic re-check after the two passes above — Cargo.toml deps, discarded CLI params,
+the games.eco/opening pipeline, doc staleness, `moves.uci`, and the `src/bin/*` dev tools.
+Found and fixed:
+
+- **I broke my own fix from earlier the same day.** Fixing `ai/mod.nu`'s stale schema
+  (documented in the "fit-for-purpose" audit above) happened *before* the dead-column
+  drop (`board_pieces`/`updated_at`), so the "corrected" prompt immediately went stale
+  again the moment those columns were dropped. Same problem in `CLAUDE.md`'s canonical-
+  identity section (used `positions.board_pieces` as its worked example of a canonical
+  field). Fixed both. Lesson for next time: when a later step in a batch changes the
+  schema, re-check earlier steps in the *same* batch that described the schema, not just
+  what existed when each step was written.
+- **`player_baselines`'s AI-facing doc line was also incomplete** — the min-games fix
+  added a real `count` column that `ai/mod.nu`'s schema summary didn't mention at all
+  (never stale, just never updated). Added, with a note on what a low count means.
+- **Real duplication in `src/bin/pgn_to_jsonl.rs`**: the ~50-line "parse one PGN block,
+  emit one JSONL line per position" logic was written out twice verbatim — once for
+  blocks that end on a blank line, once for a trailing block with no final blank line.
+  Extracted `has_valid_result`/`process_game_block`; both call sites now share one
+  implementation. This is the same class of thing `pgn_to_jsonl.rs`'s sibling tools
+  didn't have — worth a second look if more `src/bin/*` tools get added later.
+- **Three small, genuinely harmless bits of dead plumbing**, fixed for completeness:
+  `core.rs::GameVisitor::new`'s unused `_span` parameter (removed; 2 call sites updated);
+  `hugm_harness.rs::RegressionRow::hugm_raw` (`#[allow(dead_code)]`'d by whoever wrote it —
+  already known-unused, just never deleted); a discarded `.get(...).unwrap_or(0)`
+  extraction in `position.rs`'s `king_tropism_present` test that asserted nothing (the
+  `assert!` one line above already covers what the test claims to check);
+  `lichess_to_jsonl.rs`'s `_created_at` variable (parsed from JSON, immediately discarded —
+  the code already explains it doesn't need an accurate date, so there was nothing to parse
+  in the first place).
+
+**Checked, not a bug — worth recording so it isn't re-litigated**: `game_parse.rs`'s
+`extract_eco_opening` (PGN-header/URL-derived, cheap, always available) and `db.nu`'s
+`enrich-openings` (deeper local-ECO-data FEN match, always overwrites the first when it
+finds any match) look redundant at a glance — the first's value is virtually always
+replaced in the normal `chess-sync` flow. But `enrich-openings` no-ops entirely if the
+`openings` table was never seeded (e.g. first run with no internet), in which case
+`extract_eco_opening`'s value is the *only* one populated — a legitimate degraded-mode
+fallback, not accidental duplication. Left as-is; flagging that the fallback relationship
+isn't documented anywhere a future reader would find it, in case someone wants to add a
+comment cross-referencing the two.
+
+**`moves.uci` re-checked**: genuinely zero readers in `chessdb/*.nu` today, same as
+`board_pieces` was — but unlike `board_pieces`, UCI notation is a standard, expected
+column for any chess-moves table and is reachable via `query_chess_db` for ad hoc use.
+Not the same class of finding; left alone.
+
+Verified: full suite green (32 tests, unchanged — none of this pass's fixes touched
+anything with its own tests), clippy clean, STS smoke test passes.
+
+Fourth pass: make the module graph self-documenting instead of hand-correcting it (2026-07-30)
+
+Used `cargo-modules` (installed via `cargo install cargo-modules`) to render the crate's
+module dependency graph and confirm it's a clean, acyclic, layered DAG — `canonical` and
+`eval::concept_types` at the bottom with zero internal dependencies, every plugin-command
+module at the top depended on by nothing. In doing that, found the tool undercounts:
+`core -> canonical`, `canonicalize_fen_cmd -> core`, and `zobrist -> core` were all real
+dependencies invisible in the graph, because those call sites only ever reference the
+target via a fully-qualified path (`crate::canonical::normalize_to_white_to_move(...)`)
+with no `use` import and no type-position reference anywhere else in the file — the one
+thing `cargo-modules` reliably resolves.
+
+Rather than keep a hand-annotated correction alongside the tool's output, fixed the root
+cause: converted every purely-fully-qualified `crate::module::item` call site across the
+whole crate to a proper `use` import — `core.rs`, `canonicalize_fen_cmd.rs`, `zobrist.rs`,
+`hugm_eval_cmd.rs`, `pgn_to_fens.rs`, `coach_derive_cmd.rs`, and within `eval/` itself
+(`position.rs`, `concepts.rs`). The `ChessdbPlugin`/`PLUGIN_CATEGORY` fully-qualified vs.
+`use`-imported split across command modules (some files did one, some the other, no
+reason for the difference) got the same treatment while at it — same principle, same fix.
+Re-ran `cargo-modules` afterward: all three previously-invisible edges now appear on their
+own, no manual correction needed, and the acyclic check is still clean (the one thing it
+flags — `ChessdbPlugin` <-> `ChessdbPlugin::new` — is the tool treating a struct and its
+own constructor as circular, a false positive unrelated to any of this).
+
+While doing this, the mechanical "just import it" fix surfaced one real structural issue
+rather than a pure style nit: `SensorReport` (`sensor.rs`) has a `gated_issues:
+Vec<GatedIssue>` field, but `GatedIssue` was defined in `concepts.rs` — a module that
+itself depends on `sensor.rs` (`SensorReport`). Adding the "obvious" `use
+crate::eval::concepts::GatedIssue;` to `sensor.rs` would have created a genuine new
+`sensor.rs` <-> `concepts.rs` cycle, not just satisfied the linter — the fully-qualified
+path had been silently hiding an inverted dependency the whole time, exactly the kind of
+thing this exercise was meant to surface. Fixed by moving `GatedIssue`'s definition to
+`concept_types.rs` (the shared foundational types module both `sensor.rs` and
+`concepts.rs` already depend on) — a plain data struct with no dependencies of its own, so
+the move was free. Updated `eval/mod.rs`'s public re-export (`pub use
+concept_types::GatedIssue;`) to match.
+
+Verified: full suite green (32 tests), clippy clean, STS smoke test passes, and
+`cargo-modules`'s own graph now matches reality without hand-editing — the actual goal,
+per the user's framing, being that the code expresses its own true structure rather than
+needing documentation (or a diagram's footnote) to explain what it really does.
