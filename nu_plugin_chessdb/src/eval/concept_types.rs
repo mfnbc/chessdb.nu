@@ -167,13 +167,3 @@ pub struct CenterControl {
     pub color: String,
     pub strength: i64,
 }
-
-/// A ranked concept extracted from a SensorReport.
-/// This is what the Concept Filter layer produces for the LLM Coach.
-#[derive(Debug, Clone, Serialize)]
-pub struct RankedConcept {
-    pub name: String,
-    pub severity: i64,
-    pub elo_min: i32,
-    pub data: serde_json::Value,
-}

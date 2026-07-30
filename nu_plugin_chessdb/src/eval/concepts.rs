@@ -11,6 +11,34 @@ pub struct Concept {
     pub elo_min: i32,
 }
 
+/// Push one `Concept` per side that has at least one matching entry in `items`,
+/// severity = count × `weight`. Covers the concepts whose shape is exactly
+/// "count colored instances, weight the count" — not every concept fits this
+/// (some sum a field instead of counting entries, some have an extra
+/// predicate beyond color), so this is a targeted helper, not a general
+/// registry; see the call sites below for which concepts use it.
+#[allow(clippy::too_many_arguments)]
+fn count_and_push_by_color<T>(
+    concepts: &mut Vec<Concept>,
+    items: &[T],
+    color_of: impl Fn(&T) -> &str,
+    us_color: &str,
+    them_color: &str,
+    name: &str,
+    weight: i64,
+    elo_min: i32,
+    phrase: impl Fn(&str, i64) -> String,
+) {
+    let us_n = items.iter().filter(|t| color_of(t) == us_color).count() as i64;
+    if us_n > 0 {
+        concepts.push(Concept { name: name.into(), severity: us_n * weight, side: us_color.into(), phrase: phrase(us_color, us_n), elo_min });
+    }
+    let them_n = items.iter().filter(|t| color_of(t) == them_color).count() as i64;
+    if them_n > 0 {
+        concepts.push(Concept { name: name.into(), severity: them_n * weight, side: them_color.into(), phrase: phrase(them_color, them_n), elo_min });
+    }
+}
+
 /// Extract all detected concepts from a position's typed SensorReport, ranked by severity
 /// descending. `groups` is consulted only for the handful of scalar (non-tag) magnitudes —
 /// `material_total.value`, `king_safety.blended`, `development.blended` — that already live
@@ -37,38 +65,24 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
     }
 
     // Tactical: forks (1000+), pins (1200+), skewers (1200+), discovered (1400+), hanging (600+)
-    let fork_us = sensor.tactical.forks.iter().filter(|f| f.attacker.color == us_color).count() as i64;
-    if fork_us > 0 { concepts.push(Concept { name: "fork".into(), severity: fork_us * 80, side: us_color.into(), phrase: format!("{} has {} fork(s)", us_color, fork_us), elo_min: 1000 }); }
-    let fork_them = sensor.tactical.forks.iter().filter(|f| f.attacker.color == them_color).count() as i64;
-    if fork_them > 0 { concepts.push(Concept { name: "fork".into(), severity: fork_them * 80, side: them_color.into(), phrase: format!("{} has {} fork(s)", them_color, fork_them), elo_min: 1000 }); }
+    count_and_push_by_color(&mut concepts, &sensor.tactical.forks, |f| f.attacker.color.as_str(), us_color, them_color,
+        "fork", 80, 1000, |side, n| format!("{} has {} fork(s)", side, n));
+    count_and_push_by_color(&mut concepts, &sensor.tactical.pins, |p| p.attacker.color.as_str(), us_color, them_color,
+        "pin", 50, 1200, |side, n| format!("{} has {} pin(s)", side, n));
+    count_and_push_by_color(&mut concepts, &sensor.tactical.skewers, |s| s.attacker.color.as_str(), us_color, them_color,
+        "skewer", 45, 1200, |side, n| format!("{} has {} skewer(s)", side, n));
+    count_and_push_by_color(&mut concepts, &sensor.tactical.discovered, |d| d.attacker.color.as_str(), us_color, them_color,
+        "discovered_attack", 60, 1400, |side, n| format!("{} has {} discovered attack(s)", side, n));
+    // Hanging pieces — typed data existed but this concept was never emitted before this session.
+    count_and_push_by_color(&mut concepts, &sensor.tactical.hanging, |h| h.piece.color.as_str(), us_color, them_color,
+        "hanging_piece", 60, 600, |side, n| format!("{} has {} hanging piece(s)", side, n));
 
-    let pin_us = sensor.tactical.pins.iter().filter(|p| p.attacker.color == us_color).count() as i64;
-    if pin_us > 0 { concepts.push(Concept { name: "pin".into(), severity: pin_us * 50, side: us_color.into(), phrase: format!("{} has {} pin(s)", us_color, pin_us), elo_min: 1200 }); }
-    let pin_them = sensor.tactical.pins.iter().filter(|p| p.attacker.color == them_color).count() as i64;
-    if pin_them > 0 { concepts.push(Concept { name: "pin".into(), severity: pin_them * 50, side: them_color.into(), phrase: format!("{} has {} pin(s)", them_color, pin_them), elo_min: 1200 }); }
+    // Pawn structure (ELO 1600+): isolated pawns, keyed by the pawn's real color (not us/them)
+    count_and_push_by_color(&mut concepts, &sensor.positional.isolated_pawns, |p| p.color.as_str(), "white", "black",
+        "isolated_pawn", 30, 1600, |side, n| format!("{} has {} isolated pawn(s)", side, n));
 
-    let skewer_us = sensor.tactical.skewers.iter().filter(|s| s.attacker.color == us_color).count() as i64;
-    if skewer_us > 0 { concepts.push(Concept { name: "skewer".into(), severity: skewer_us * 45, side: us_color.into(), phrase: format!("{} has {} skewer(s)", us_color, skewer_us), elo_min: 1200 }); }
-    let skewer_them = sensor.tactical.skewers.iter().filter(|s| s.attacker.color == them_color).count() as i64;
-    if skewer_them > 0 { concepts.push(Concept { name: "skewer".into(), severity: skewer_them * 45, side: them_color.into(), phrase: format!("{} has {} skewer(s)", them_color, skewer_them), elo_min: 1200 }); }
-
-    let disc_us = sensor.tactical.discovered.iter().filter(|d| d.attacker.color == us_color).count() as i64;
-    if disc_us > 0 { concepts.push(Concept { name: "discovered_attack".into(), severity: disc_us * 60, side: us_color.into(), phrase: format!("{} has {} discovered attack(s)", us_color, disc_us), elo_min: 1400 }); }
-    let disc_them = sensor.tactical.discovered.iter().filter(|d| d.attacker.color == them_color).count() as i64;
-    if disc_them > 0 { concepts.push(Concept { name: "discovered_attack".into(), severity: disc_them * 60, side: them_color.into(), phrase: format!("{} has {} discovered attack(s)", them_color, disc_them), elo_min: 1400 }); }
-
-    // Hanging pieces — typed data existed but this concept was never emitted before.
-    let hanging_us = sensor.tactical.hanging.iter().filter(|h| h.piece.color == us_color).count() as i64;
-    if hanging_us > 0 { concepts.push(Concept { name: "hanging_piece".into(), severity: hanging_us * 60, side: us_color.into(), phrase: format!("{} has {} hanging piece(s)", us_color, hanging_us), elo_min: 600 }); }
-    let hanging_them = sensor.tactical.hanging.iter().filter(|h| h.piece.color == them_color).count() as i64;
-    if hanging_them > 0 { concepts.push(Concept { name: "hanging_piece".into(), severity: hanging_them * 60, side: them_color.into(), phrase: format!("{} has {} hanging piece(s)", them_color, hanging_them), elo_min: 600 }); }
-
-    // Pawn structure (ELO 1600+): isolated / doubled pawns, keyed by the pawn's real color
-    let isolated_white = sensor.positional.isolated_pawns.iter().filter(|p| p.color == "white").count() as i64;
-    if isolated_white > 0 { concepts.push(Concept { name: "isolated_pawn".into(), severity: isolated_white * 30, side: "white".into(), phrase: format!("white has {} isolated pawn(s)", isolated_white), elo_min: 1600 }); }
-    let isolated_black = sensor.positional.isolated_pawns.iter().filter(|p| p.color == "black").count() as i64;
-    if isolated_black > 0 { concepts.push(Concept { name: "isolated_pawn".into(), severity: isolated_black * 30, side: "black".into(), phrase: format!("black has {} isolated pawn(s)", isolated_black), elo_min: 1600 }); }
-
+    // Doubled pawns: sums each entry's own `count` field rather than counting
+    // entries, so this doesn't fit count_and_push_by_color.
     let doubled_white: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == "white").map(|p| p.count as i64).sum();
     if doubled_white > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_white * 30, side: "white".into(), phrase: format!("white has {} doubled pawn(s)", doubled_white), elo_min: 1600 }); }
     let doubled_black: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == "black").map(|p| p.count as i64).sum();
@@ -78,8 +92,8 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
     for m in &sensor.positional.pawn_majority {
         concepts.push(Concept { name: "pawn_majority".into(), severity: m.count * 20, side: m.color.clone(), phrase: format!("{} has a pawn majority", m.color), elo_min: 1800 });
     }
-    let pawn_break_us = sensor.positional.pawn_breaks.iter().filter(|b| b.color == us_color).count() as i64;
-    if pawn_break_us > 0 { concepts.push(Concept { name: "pawn_break".into(), severity: pawn_break_us * 30, side: us_color.into(), phrase: format!("{} has {} pawn break candidate(s)", us_color, pawn_break_us), elo_min: 1800 }); }
+    count_and_push_by_color(&mut concepts, &sensor.positional.pawn_breaks, |b| b.color.as_str(), us_color, them_color,
+        "pawn_break", 30, 1800, |side, n| format!("{} has {} pawn break candidate(s)", side, n));
 
     // Minority attack (ELO 2000+)
     if let Some(m) = &sensor.positional.minority_attack {
@@ -87,16 +101,18 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
     }
 
     // Outposts (ELO 1600+)
-    let outpost_us = sensor.positional.outposts.iter().filter(|o| o.piece.color == us_color).count() as i64;
-    if outpost_us > 0 { concepts.push(Concept { name: "outpost".into(), severity: outpost_us * 40, side: us_color.into(), phrase: format!("{} has {} outpost(s)", us_color, outpost_us), elo_min: 1600 }); }
-    let outpost_them = sensor.positional.outposts.iter().filter(|o| o.piece.color == them_color).count() as i64;
-    if outpost_them > 0 { concepts.push(Concept { name: "outpost".into(), severity: outpost_them * 40, side: them_color.into(), phrase: format!("{} has {} outpost(s)", them_color, outpost_them), elo_min: 1600 }); }
+    count_and_push_by_color(&mut concepts, &sensor.positional.outposts, |o| o.piece.color.as_str(), us_color, them_color,
+        "outpost", 40, 1600, |side, n| format!("{} has {} outpost(s)", side, n));
 
-    // Rook activity (ELO 1400+)
+    // Rook activity (ELO 1400+): open_files has an extra rook_count > 0 predicate beyond
+    // color, and rook_on_seventh sums a `count` field — neither fits count_and_push_by_color.
     let rook_open_us = sensor.positional.open_files.iter().filter(|f| f.color == us_color && f.rook_count > 0).count() as i64;
     if rook_open_us > 0 { concepts.push(Concept { name: "rook_open_file".into(), severity: rook_open_us * 25, side: us_color.into(), phrase: format!("{} has rook(s) on open file(s)", us_color), elo_min: 1400 }); }
     for r in sensor.positional.rook_on_seventh.iter().filter(|r| r.color == us_color) {
         concepts.push(Concept { name: "rook_seventh".into(), severity: r.count as i64 * 30, side: us_color.into(), phrase: format!("{} has a rook on the 7th rank", us_color), elo_min: 1400 });
+    }
+    for r in sensor.positional.rook_on_seventh.iter().filter(|r| r.color == them_color) {
+        concepts.push(Concept { name: "rook_seventh".into(), severity: r.count as i64 * 30, side: them_color.into(), phrase: format!("{} has a rook on the 7th rank", them_color), elo_min: 1400 });
     }
 
     // King safety (ELO 1000-1400+)
@@ -250,6 +266,28 @@ const BIT_PASSED_PAWN: u32 = 12;
 const BIT_SKEWER: u32 = 13;
 const BIT_DISCOVERED: u32 = 14;
 
+/// One row per boolean bit: (bit position, predicate over the sensor report).
+/// Adding a new flag to `StateVector` means adding one row here and one field
+/// to the struct — `encode_state` and `decode_state_id` don't otherwise need
+/// to change. Checks aren't all textually identical (`BIT_FORK`'s is an OR of
+/// two conditions, `BIT_KING_EXPOSED`'s maps through an `Option`) — that's
+/// fine, each closure can differ; what matters is that bit position and check
+/// live in the same tuple, so they can't end up paired with the wrong bit the
+/// way two separately-maintained lists could.
+type SensorPredicate = fn(&crate::eval::sensor::SensorReport) -> bool;
+const BOOL_BITS: &[(u32, SensorPredicate)] = &[
+    (BIT_KING_EXPOSED, |s| s.positional.king_exposure.as_ref().map(|k| k.attacker_count > 0).unwrap_or(false)),
+    (BIT_IN_CHECK,     |s| s.in_check),
+    (BIT_FORK,         |s| !s.tactical.forks.is_empty() || !s.evaluated_forks.is_empty()),
+    (BIT_PIN,          |s| !s.tactical.pins.is_empty()),
+    (BIT_HANGING,      |s| !s.tactical.hanging.is_empty()),
+    (BIT_OUTPOST,      |s| !s.positional.outposts.is_empty()),
+    (BIT_OPEN_FILE,    |s| !s.positional.open_files.is_empty()),
+    (BIT_PASSED_PAWN,  |s| !s.positional.passed_pawns.is_empty()),
+    (BIT_SKEWER,       |s| !s.tactical.skewers.is_empty()),
+    (BIT_DISCOVERED,   |s| !s.tactical.discovered.is_empty()),
+];
+
 pub fn encode_state(sensor: &crate::eval::sensor::SensorReport, groups: &crate::eval::position::EvalGroups, phase: u8) -> StateVector {
     let phase_bits = match phase {
         0..=8 => 0u8,      // deep endgame
@@ -262,48 +300,19 @@ pub fn encode_state(sensor: &crate::eval::sensor::SensorReport, groups: &crate::
     let material_sign: i8 = if mat > 300 { 2 } else if mat > 100 { 1 }
         else if mat < -300 { -2 } else if mat < -100 { -1 } else { 0 };
 
-    let has_fork = !sensor.tactical.forks.is_empty() || !sensor.evaluated_forks.is_empty();
-    let has_pin = !sensor.tactical.pins.is_empty();
-    let has_hanging = !sensor.tactical.hanging.is_empty();
-    let king_exposed = sensor.positional.king_exposure.as_ref()
-        .map(|k| k.attacker_count > 0).unwrap_or(false);
-    let in_check = sensor.in_check;
-    let has_outpost = !sensor.positional.outposts.is_empty();
-    let open_file = !sensor.positional.open_files.is_empty();
-    let has_passed_pawn = !sensor.positional.passed_pawns.is_empty();
-    let has_skewer = !sensor.tactical.skewers.is_empty();
-    let has_discovered = !sensor.tactical.discovered.is_empty();
-
     // Pack into u16 bitfield
     let mut id: u16 = 0;
     id |= (phase_bits as u16 & 0x3) << BIT_PHASE;
     id |= ((material_sign + 2) as u16 & 0x7) << BIT_MATERIAL_SIGN;
-    id |= (king_exposed as u16) << BIT_KING_EXPOSED;
-    id |= (in_check as u16) << BIT_IN_CHECK;
-    id |= (has_fork as u16) << BIT_FORK;
-    id |= (has_pin as u16) << BIT_PIN;
-    id |= (has_hanging as u16) << BIT_HANGING;
-    id |= (has_outpost as u16) << BIT_OUTPOST;
-    id |= (open_file as u16) << BIT_OPEN_FILE;
-    id |= (has_passed_pawn as u16) << BIT_PASSED_PAWN;
-    id |= (has_skewer as u16) << BIT_SKEWER;
-    id |= (has_discovered as u16) << BIT_DISCOVERED;
-
-    StateVector {
-        state_id: id,
-        phase: phase_bits,
-        material_sign,
-        king_exposed,
-        in_check,
-        has_fork,
-        has_pin,
-        has_hanging,
-        has_outpost,
-        open_file,
-        has_passed_pawn,
-        has_skewer,
-        has_discovered,
+    for &(bit, check) in BOOL_BITS {
+        if check(sensor) { id |= 1 << bit; }
     }
+
+    // Build the named fields by decoding what was just packed — packer and
+    // decoder are mutually verifying by construction this way: if
+    // decode_state_id ever disagreed with the bits above, encode_state's own
+    // output would immediately look wrong too.
+    decode_state_id(id)
 }
 
 /// Unpack a previously-encoded `state_id` back into a `StateVector`. Shares
@@ -342,18 +351,6 @@ pub enum SensorTier {
     Threat,      // 1000-1400: forks, pins, skewers, discovered attacks
     Positional,  // 1400-1800: outposts, open files, pawn structure
     Strategic,   // 1800-2000+: minority attack, pawn majority, bishop pair
-}
-
-/// Classify a concept name into its sensor tier.
-pub fn tier_for_concept(name: &str) -> SensorTier {
-    match name {
-        "material_imbalance" | "king_in_check" | "hanging_piece" => SensorTier::Survival,
-        "fork" | "pin" | "skewer" | "discovered_attack" => SensorTier::Threat,
-        "rook_open_file" | "rook_seventh" | "outpost" | "isolated_pawn"
-        | "doubled_pawn" | "passed_pawn" | "king_exposed" | "development" => SensorTier::Positional,
-        "bishop_pair" | "pawn_majority" | "pawn_break" | "minority_attack" => SensorTier::Strategic,
-        _ => SensorTier::Positional,
-    }
 }
 
 /// Attenuation factor per tier given the chaos coefficient (0.0 = clean, 1.0 = chaotic).

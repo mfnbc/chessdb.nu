@@ -383,6 +383,117 @@ Done:
   manual hex-format call sites (`GameVisitor::san`, `pgn_to_batch_record`)
   now call the existing `get_canonical_hash` helper instead of re-deriving.
 
+Concept/StateVector simplification — scoped and implemented 2026-07-29
+
+User's framing: after the consistency pass, "a simpler expression of functions
+is struggling to get out... as if the bitmaps and discovery of the points
+could be consolidated and smoothed." Went concept-by-concept through all 20
+named concepts in `extract_concepts` to see what would actually simplify vs.
+what would just relocate complexity.
+
+**Concept inventory (why a full generic registry doesn't pay for itself):**
+- 8 are a uniform shape — count `Vec<T>` entries matching a color, severity =
+  count × fixed weight: fork, pin, skewer, discovered_attack, hanging_piece,
+  isolated_pawn, outpost, passed_pawn.
+- 2 look like that shape but sum a `.count` field per entry instead of
+  counting entries: doubled_pawn, rook_on_seventh.
+- 1 has an extra predicate beyond color: rook_open_file (`color == us_color
+  && rook_count > 0`).
+- 2 fit a different clean shape — single `Option<T>` with `{color,
+  strength}`: minority_attack, center_control.
+- 5 are pure scalar arithmetic, no `Vec<T>` involved at all: material_imbalance,
+  bishop_pair (two bools, not a Vec), king_in_check, king_exposed, development.
+- **Decision needed**: `pawn_break` and `rook_on_seventh` only ever check
+  `us_color`, never `them_color`, unlike all 8 siblings in the first bucket.
+  No principled reason found for the asymmetry — looks like an oversight.
+  Recommend making them symmetric (check both sides, matching every other
+  concept's pattern) but flagging it here since it's a behavior change
+  (previously-silent opponent-side pawn-break/rook-on-7th concepts would
+  start firing), not pure refactor.
+
+Given that spread, a single generic table covering all 20 would need
+per-entry closures for the count/sum/predicate variation anyway — in Rust,
+without macros, that's about as much code as today's inline blocks, just
+relocated into a table's closure fields. Not pursuing a full registry;
+instead, three narrow, verified-in-place simplifications:
+
+**1. `encode_state`'s boolean-flag packing.** Re-checked and this isn't
+*fully* uniform either (`has_fork` is an OR of two conditions, `king_exposed`
+maps through an `Option`) — a table of `(bit, fn(&SensorReport) -> bool)`
+pairs handles that fine since each closure can differ; the win is
+structural, not textual: bit position and check land in the same tuple, so
+they can't be paired wrong the way two separately-ordered lists could drift.
+Bigger win found while designing this: `encode_state` can call its own
+`decode_state_id` to build the returned `StateVector`'s named fields, instead
+of hand-writing ten `let has_x = ...` bindings that duplicate what decoding
+the just-packed bits would already tell you. Concretely:
+```rust
+let mut id: u16 = 0;
+id |= (phase_bits as u16 & 0x3) << BIT_PHASE;
+id |= ((material_sign + 2) as u16 & 0x7) << BIT_MATERIAL_SIGN;
+for &(bit, check) in BOOL_BITS { if check(sensor) { id |= 1 << bit; } }
+decode_state_id(id)
+```
+This makes packing and unpacking mutually verifying by construction — if
+`decode_state_id` ever had a bug, `encode_state`'s own output would
+immediately look wrong too, since it's built by calling the same decoder.
+Roughly 35 lines → ~10. Adding a new bit becomes "one row in `BOOL_BITS`,"
+not "one `let`, one bit constant, one pack line, one unpack line, one struct
+field" scattered across the function.
+
+**2. `tier_for_concept` — correction, not the plan from last message.**
+Checked every caller in the repo (Rust and Nu): `tier_for_concept(name: &str)`
+is **dead code**, never called anywhere. The live chaos-attenuation system
+(`SensorTier`/`attenuation`) is entirely separate and operates at the
+`EvalGroups` *group* level inside `position.rs`'s `compute_aggregates`
+(hardcoding `SensorTier::Positional`/`Strategic` per score group — pawn
+structure, king safety, etc.), not per individual `Concept`. So "move tier
+onto `Concept` at construction" would be adding new, currently-unused
+plumbing, not fixing a live re-discovery bug — there's no live bug here.
+Corrected recommendation: delete `tier_for_concept` as dead code (same
+disposition as `RankedConcept` below), and leave the working group-level
+attenuation system untouched. If per-concept chaos attenuation for
+`GatedIssue` scoring is ever wanted, that's new functionality to design
+separately — not part of this cleanup.
+
+**3. A small local helper for the 8 uniform concepts** (not a registry) —
+collapses each concept's current 2 lines (us-side + them-side count-and-push)
+into 1 call:
+```rust
+fn count_and_push_by_color<T>(
+    concepts: &mut Vec<Concept>, items: &[T], color_of: impl Fn(&T) -> &str,
+    us_color: &str, them_color: &str, name: &str, weight: i64, elo_min: i32,
+    phrase: impl Fn(&str, i64) -> String,
+)
+```
+called once per concept for `us_color` and once for `them_color` internally.
+Cuts roughly 32 lines to 8 call sites across fork/pin/skewer/
+discovered_attack/hanging_piece/isolated_pawn/outpost/passed_pawn.
+doubled_pawn/rook_on_seventh (sum-based) and rook_open_file (extra predicate)
+stay hand-written — forcing them through this helper would need extra knobs
+that erase the simplification.
+
+**Also found**: `concept_types.rs`'s `RankedConcept` struct is dead code —
+never constructed anywhere, fully superseded by `Concept`/`GatedIssue`. Delete.
+
+All four items implemented as scoped, plus a small clippy cleanup along the
+way (`#[allow(clippy::too_many_arguments)]` on `count_and_push_by_color`,
+9 args; a `SensorPredicate` type alias for `BOOL_BITS`'s function-pointer
+tuple, which clippy flagged as too complex inline).
+
+Verified properly, not just compiled: captured `extract_concepts` +
+`encode_state` output on 4 canonical FENs (the fork/tactical position,
+starting position, an Italian-opening middlegame, and the queenside-majority
+position from earlier sessions) *before* touching anything, then diffed
+against the same run after all four changes landed. The diff was exactly
+one line — `pawn_break` now also firing for the opponent side on the fork
+position, precisely the deliberate symmetry fix — with every `state_id`
+byte-identical across all 4 positions, confirming the `encode_state`/
+`decode_state_id` restructuring is fully behavior-preserving. Full `cargo
+test` (27 passing) and `cargo clippy --tests` (no new warnings beyond one
+pre-existing `sort_by_key` suggestion, unrelated to this pass) stayed clean
+throughout.
+
 Follow-up fixed (2026-07-29): `chessdb/sync.nu`/`chessdb/profile.nu`'s SQL-side
 state_id bit-shift duplication
 
