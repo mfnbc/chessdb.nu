@@ -5,17 +5,17 @@ use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 use crate::stockfish::StockfishEngine;
 
-pub struct NnueEval;
+pub struct StockfishEval;
 
-impl PluginCommand for NnueEval {
+impl PluginCommand for StockfishEval {
     type Plugin = ChessdbPlugin;
 
     fn name(&self) -> &str {
-        "chessdb nnue-eval"
+        "chessdb stockfish-eval"
     }
 
     fn description(&self) -> &str {
-        "Evaluate chess positions using Stockfish NNUE. Accepts a FEN string or list of FEN strings."
+        "Evaluate chess positions via Stockfish (external oracle, not HUGM). Accepts a FEN string or list of FEN strings."
     }
 
     fn signature(&self) -> Signature {
@@ -73,7 +73,7 @@ impl PluginCommand for NnueEval {
             let score = engine.eval_fen(fen.trim()).map_err(LabeledError::new)?.unwrap_or(0);
             let record = nu_protocol::record! {
                 "fen" => Value::string(fen, span),
-                "nnue_score" => Value::int(score, span),
+                "stockfish_score" => Value::int(score, span),
             };
             results.push(Value::record(record, span));
         }

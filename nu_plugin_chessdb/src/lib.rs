@@ -10,7 +10,7 @@ pub mod eval;
 pub mod pgn_to_fens;
 pub mod process_corpus;
 pub mod game_parse;
-pub mod nnue_eval_cmd;
+pub mod stockfish_eval_cmd;
 pub mod coach_derive_cmd;
 pub mod stockfish;
 pub mod utils;
@@ -48,7 +48,7 @@ impl Plugin for ChessdbPlugin {
             Box::new(pgn_to_fens::PgnToBatch),
             Box::new(pgn_to_fens::PgnToFens),
             Box::new(process_corpus::ProcessCorpus),
-            Box::new(nnue_eval_cmd::NnueEval),
+            Box::new(stockfish_eval_cmd::StockfishEval),
             Box::new(coach_derive_cmd::DeriveCoachSignals),
             Box::new(zobrist::Zobrist),
             Box::new(canonicalize_fen_cmd::CanonicalizeFen),

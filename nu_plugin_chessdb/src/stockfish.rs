@@ -1,5 +1,5 @@
 //! Minimal UCI client for talking to a Stockfish subprocess. Extracted out of
-//! `nnue_eval_cmd.rs`'s `PluginCommand::run` — spawning a process and
+//! `stockfish_eval_cmd.rs`'s `PluginCommand::run` — spawning a process and
 //! hand-rolling a UCI handshake is engine-communication logic, not Nu plugin
 //! wiring, and it's unit-testable in isolation once it's not tangled up with
 //! `Value`/`LabeledError` construction.
