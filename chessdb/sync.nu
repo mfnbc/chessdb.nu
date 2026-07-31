@@ -118,22 +118,44 @@ def review-game [game_id: int, db: string] {
 # same small mapping, since that function is private and operates on
 # aggregated Concepts, not per-instance structs; same kind of known,
 # deferred duplication as the confidence-tier match arms (PLAN.md).
+#
+# Deliberately does NOT read positions.fen -- that column is canonical
+# (White-always-to-move); real per-ply FENs are reconstructed by replaying
+# moves.uci (real terms) from the real starting position instead. See the
+# real-fen-reconstruction comment below and PLAN.md's entry for the bug
+# this fixes.
 export def "chess-tactical-events" [
     game_id: int
     --db: string = "./chess.db"
 ] {
-    let rows = (open $db | query db "
-        SELECT m.ply, p.fen
-        FROM moves m
-        JOIN positions p ON m.next_position_id = p.zobrist
-        WHERE m.game_id = ?
-        ORDER BY m.ply ASC
+    let move_rows = (open $db | query db "
+        SELECT ply, uci
+        FROM moves
+        WHERE game_id = ?
+        ORDER BY ply ASC
     " --params [$game_id])
 
-    if ($rows | is-empty) {
+    if ($move_rows | is-empty) {
         print $"No moves found for game ($game_id)."
         return {game_id: $game_id, events: 0}
     }
+
+    # positions.fen is stored in canonical (White-always-to-move) frame --
+    # for any ply where the true side to move is Black, it's a rank-mirrored,
+    # color-swapped view of the real position, not the real position (see
+    # CLAUDE.md's canonical-identity section, and PLAN.md's entry for the
+    # real bug this was: an early version of this function fed
+    # positions.fen straight into hugm-eval and got square/color labels that
+    # didn't match the real game past the very first ply). moves.uci is
+    # stored in real terms, so replay it from the real starting position
+    # instead, one ply at a time (each step genuinely depends on the last --
+    # this is why it's `reduce`, not `enumerate`: new state being computed,
+    # not a previous row being read back).
+    let initial_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    let rows = ($move_rows | reduce -f {fen: $initial_fen, rows: []} { |row, acc|
+        let real_fen = ($acc.fen | chessdb apply-uci --uci $row.uci)
+        {fen: $real_fen, rows: ($acc.rows | append {ply: $row.ply, fen: $real_fen})}
+    }).rows
 
     let stage = {hanging_piece: 1, outnumbered: 2, overloaded: 3, false_defense: 3, false_safety: 4}
 

@@ -1,3 +1,4 @@
+pub mod apply_uci_cmd;
 pub mod canonical;
 pub mod canonicalize_fen_cmd;
 pub mod chess;
@@ -52,6 +53,7 @@ impl Plugin for ChessdbPlugin {
             Box::new(zobrist::Zobrist),
             Box::new(canonicalize_fen_cmd::CanonicalizeFen),
             Box::new(collapse_criticality_cmd::CollapseCriticalityCmd),
+            Box::new(apply_uci_cmd::ApplyUci),
         ]
     }
 }

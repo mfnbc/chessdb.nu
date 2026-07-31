@@ -3046,3 +3046,61 @@ Verified: `cargo check`/`test`/`clippy --all-targets` all clean post-bump (48 li
 tests, zero warnings); STS smoke test passes; live plugin round-trip confirmed via
 `collapse-criticality`, `hugm-eval`, and `chess-tactical-events` against both a hand-built
 position and a real imported game.
+
+## 2026-08-01: real bug caught by testing against recognizable games — canonical fen fed to hugm-eval
+
+User asked to run two more real, recognizable games (Scholar's Mate re-verified, plus the
+Fried Liver Attack main line through move 7) through `chess-tactical-events` as further live
+verification. This is exactly why testing against *known, checkable* games is valuable — it
+caught a real bug the Scholar's Mate test's first pass had already produced but nobody had
+manually verified square-by-square yet.
+
+**The bug**: `chess-tactical-events` queried `positions.fen` and fed it straight into
+`hugm-eval`. But `positions.fen` is stored in *canonical* (White-always-to-move) frame — for
+any ply where the true side to move is Black, it's a rank-mirrored, color-swapped view of the
+real position, not the real position. CLAUDE.md's own canonical-identity section says exactly
+this and exactly warns against this mistake ("nothing in canonical form tells you who is
+actually White or Black in a real game... never infer real color from the shape of a
+canonical FEN/zobrist itself"). Confirmed empirically before fixing anything: queried the
+stored fen after `3.Nf3` (real position: only `e4 e5 Nf3` played, Black to move next) and
+found a black knight already sitting on `f6` — impossible in reality, since `Nf6` isn't played
+until ply 6. That's the canonical mirror of White's real `Nf3` (rank 3 → mirrored to rank 6,
+color-swapped), not a real board fact.
+
+**The fix**: `positions.fen`/`pgn_to_fens`'s own `fen` field are *both* canonical (confirmed by
+reading `core.rs`'s `GameVisitor::san` — it explicitly canonicalizes before storing, "Store
+this position's identity in canonical... frame"). Nothing in the existing schema stores real
+per-ply FENs. `moves.uci`, however, *is* stored in real terms. Added a new plugin command,
+`chessdb apply-uci` (`src/apply_uci_cmd.rs`, thin wrapper over the already-existing but
+never-wired-up `core::apply_uci`) — plays one UCI move on a FEN and returns the result, same
+frame in as out, no canonicalization either direction. `chess-tactical-events` now replays
+`moves.uci` from the real starting position via `reduce` (genuinely sequential state, not a
+previous-row read — the right tool per CLAUDE.md's own `enumerate`-vs-`reduce` guidance) to
+reconstruct real per-ply FENs, and uses those instead of `positions.fen`.
+
+**Re-verified both games after the fix, by hand, not just by re-running**: Scholar's Mate now
+shows `Qh5` immediately hanging Black's `e5` pawn (real, well-known point of `2.Qh5`); the
+`f7` double-attack (`Bc4`+`Qh5` vs. king only) appearing exactly when `3.Bc4` is played; and
+`Qh5` itself becoming hanging once `3...Nf6` is played (the actual reason Scholar's Mate
+needs immediate follow-through — hesitate and Black just takes the queen). Fried Liver showed
+a genuinely subtle correct result that needed re-deriving by hand to confirm: after `4...d5`,
+White's `e4` pawn is attacked by both `Nf6` and the `d5` pawn but shows `defender_count: 1`,
+not 0 — re-checking the position by hand found the missed defender: `Ng5` (the same knight
+that played `Nf3`-`Ng5`) defends `e4` via a *second* knight-move geometry from g5, simultaneous
+with its attack on `f7`. The tool was right; my first manual check was incomplete — a good
+concrete demonstration of exactly the kind of exhaustive-enumeration mistake this whole system
+exists to avoid making silently.
+
+Also noted, not fixed (pre-existing, unrelated to this bug): `find_hanging` doesn't exclude
+kings, so a checked king with no piece able to interpose/capture reads as "hanging" too (seen
+at ply 13 of the Fried Liver line, `f7 hanging severity 20000` — literally the king's piece
+value, right after `7.Qf3+`). Already known and already handled specifically for
+`newly_hanging` (kings filtered there, PLAN.md's earlier `collapse_criticality` entry) but
+`sensor.tactical.hanging` itself was never filtered — out of scope for this fix, flagged for
+whenever that gets revisited.
+
+Verified: `cargo check`/`test`/`clippy --all-targets` clean (48 lib, 28 motif, zero warnings)
+post-fix; STS smoke test passes; `chessdb apply-uci` verified directly
+(`e2e4` from the start position returns the correct resulting FEN); both games re-run live
+through the corrected `chess-tactical-events` and spot-checked by hand against real chess
+theory, not just "it ran without erroring."
