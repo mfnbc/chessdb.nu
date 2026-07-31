@@ -11,11 +11,16 @@
 //!   shared `attackers_to[sq]`, not two independently-meaningful maps. This
 //!   is the shared substrate `position.rs`'s scoring functions
 //!   (`king_safety_score`, `development_space_score`, `piece_activity_score`,
-//!   `detect_outposts`) and `find_hanging` read directly, instead of each
-//!   independently re-deriving the same attack facts via its own
-//!   `board.attacks_to`/`attacks_from` call. See PLAN.md's "continuity map"
-//!   thread for the full migration history — and which call sites still
-//!   don't use it (`detect_skewers`, the legacy `detect_forks`).
+//!   `detect_outposts`) read directly, instead of each independently
+//!   re-deriving the same attack facts via its own `board.attacks_to`/
+//!   `attacks_from` call. See PLAN.md's "continuity map" thread for the full
+//!   migration history — and which call sites still don't use it
+//!   (`detect_skewers`, the legacy `detect_forks`). `find_hanging` and
+//!   `find_outnumbered` are the two most direct piece-safety applications of
+//!   `control` itself — zero defenders vs. attackers simply outnumbering
+//!   real defenders, respectively; `find_outnumbered` was the completeness
+//!   gap noticed only after the fancier cross-references below were already
+//!   built (PLAN.md).
 //! - **Pricing — `see`/`see_chain`, consumed by `find_forks`.** A genuinely
 //!   different question: not "who's here" but "what would this be worth."
 //!   Runs an actual capture/recapture simulation. Has a known, unfixed
@@ -37,9 +42,90 @@
 //! second, independent `detect_forks` also exists in `position.rs` purely
 //! for the legacy scoring engine, with a threshold that can disagree with
 //! this one (PLAN.md).
+//!
+//! - **Cross-reference — `find_overloaded`, `find_false_defense`,
+//!   `find_false_safety`.** A third family, deliberately distinct from
+//!   pricing: notice when two already-known facts overlap, instead of
+//!   simulating or pricing anything. `find_overloaded` is self-contained
+//!   (pure `attackers_to`, the mirror of a fork: one piece, multiple
+//!   critical defensive responsibilities). `find_false_defense` genuinely
+//!   needs external input — the `pins` list `position.rs` already computed —
+//!   to ask "is this piece's only defender pinned in a way that actually
+//!   stops it from recapturing here" (not just "is it pinned at all": a
+//!   pinned piece can still legally move along its own pin line, so this
+//!   checks `attacks::between(attacker, king)`, not just pin-list
+//!   membership). All three are concrete instances of the "pathfind the
+//!   graph, don't calculate the exchange" principle in PLAN.md — a
+//!   deliberate design stance, not a shortcut taken because the pricing
+//!   layer above is currently buggy.
+//!
+//! ## The failure lattice: a ladder of validation, not a flat concept list
+//!
+//! `hanging_piece` → `outnumbered` → `overloaded`/`false_defense` →
+//! `false_safety` are not four unrelated detectors; they're rungs of one
+//! question — "is this piece actually safe?" — asked at increasing depth,
+//! each rung catching a miss the previous one couldn't see:
+//! 1. **Attacked at all?** The shared precondition every rung below checks
+//!    first — not a concept by itself.
+//! 2. **Defended at all?** `find_hanging` (0 raw defenders) and
+//!    `find_outnumbered` (>0 raw defenders, still fewer than attackers) are
+//!    two halves of the same raw-count comparison, split only because the
+//!    certainty differs (0 defenders is a guaranteed loss, worth exact piece
+//!    value; outnumbered-but-nonzero is a softer signal).
+//! 3. **Is a raw defender actually free to help?** `find_overloaded` (from
+//!    the defender's side: am I already the sole defender of something
+//!    else?) and `find_false_defense` (from the attacked piece's side: are
+//!    *all* my defenders pinned off the recapture line?) are siblings, not
+//!    one step — different anchor point, different strength of constraint
+//!    (overload is soft/costly, pin is hard/illegal).
+//! 4. **Does that change the verdict the raw count gave?** `find_false_safety`
+//!    is the rung above both: it fires exactly when the raw count alone said
+//!    "safe" (`raw_defender_count >= attacker_count`) but discounting
+//!    defenders that are pinned-off-line *or* overloaded elsewhere reverses
+//!    that verdict. This is the fact a player who "counted correctly" can
+//!    still miss — the count was right, the commitments on the pieces doing
+//!    the defending weren't seen. Every struct in this family carries both
+//!    the raw and revised numbers (not just a conclusion) so a coaching
+//!    report — and the database rows derived from it — can show exactly
+//!    which layer of the ladder a given position exercises, and eventually
+//!    which layer a given player's mistakes cluster at. Positional guides
+//!    (center, flanks, king-safety-as-a-zone) are the next tier above this
+//!    one, not yet built — this lattice stays purely material/tactical.
 
-use shakmaty::{Bitboard, Board, Chess, Color, Piece, Position, Role, Square};
+use shakmaty::{attacks, Bitboard, Board, CastlingMode, Chess, Color, FromSetup, Piece, Position, Role, Setup, Square};
 use crate::eval::concept_types::*;
+
+/// Feed a hypothetical board into shakmaty for the one thing the graph
+/// genuinely can't answer itself: checkmate needs legal move generation,
+/// not just attack geometry. (Check no longer needs this at all —
+/// `ThreatGraph::checkers`/`is_in_check` answer that directly off the graph,
+/// identities included, no shakmaty round-trip.) `Chess::from_setup`
+/// validates full legality (exactly one king per side, the side not to move
+/// isn't in check, etc.) and simply rejects anything that doesn't hold —
+/// most commonly here, a king that was itself part of the cleared cluster
+/// (`collapse_criticality` builds exactly these ad-hoc boards) and isn't the
+/// candidate being tested, so it's just missing. Rejection reads as "not
+/// checkmate" rather than propagated as an error — best-effort, not a
+/// replacement for anything reliable.
+fn is_checkmate_via_shakmaty(board: &Board, turn: Color) -> bool {
+    let setup = Setup { board: board.clone(), turn, castling_rights: Bitboard::EMPTY, ..Setup::empty() };
+    Chess::from_setup(setup, CastlingMode::Standard)
+        .map(|chess| chess.is_checkmate())
+        .unwrap_or(false)
+}
+
+/// The squares a king could move to plus its own square — "the box he's
+/// being put in by the opponent." Pure board geometry, relocated here from
+/// `position.rs` (where `king_safety_score`/`piece_activity_score` still use
+/// it as a mobility mask) since it's a zone *definition* that belongs next
+/// to the primitive (`zone_control`) that reads zones, not with the legacy
+/// scoring functions that happen to consume it.
+pub fn king_ring(board: &Board, color: Color) -> Bitboard {
+    let Some(king_sq) = board.king_of(color) else {
+        return Bitboard::EMPTY;
+    };
+    attacks::king_attacks(king_sq) | Bitboard::from(king_sq)
+}
 
 /// Complete attack adjacency for a position.
 #[derive(Debug, Clone)]
@@ -61,7 +147,18 @@ pub struct ThreatGraph {
 impl ThreatGraph {
     /// Build the attack graph from a shakmaty Chess position.
     pub fn build(chess: &Chess) -> Self {
-        let board = chess.board().clone();
+        Self::build_from_board(chess.board().clone(), chess.turn())
+    }
+
+    /// Build the attack graph from a bare `Board` + whose turn it notionally
+    /// is — everything this needs (`attacks_from`, `attacks_to`, `king_of`)
+    /// is pure board geometry, none of it depends on a legal `Chess`
+    /// position (castling rights, move history, check status). This is what
+    /// lets `collapse_king_zone_swing` build a graph on a *hypothetical*
+    /// board — one piece captured, the capturer moved onto its square, both
+    /// via direct `Board` surgery — without that board ever needing to be a
+    /// legally reachable position.
+    pub fn build_from_board(board: Board, turn: Color) -> Self {
         let mut attacks_from = [Bitboard::EMPTY; 64];
         let mut attackers_to = [Bitboard::EMPTY; 64];
         let mut pieces: [Option<Piece>; 64] = [None; 64];
@@ -80,7 +177,6 @@ impl ThreatGraph {
         }
 
         let kings = (board.king_of(Color::White), board.king_of(Color::Black));
-        let turn = chess.turn();
         ThreatGraph { attacks_from, attackers_to, pieces, turn, kings, board }
     }
 
@@ -128,15 +224,32 @@ impl ThreatGraph {
         self.attacks_from[Self::idx(sq)]
     }
 
+    /// Which piece(s) are giving check to `color`'s king — the identity
+    /// behind `is_in_check`, same "read it off the graph already built,
+    /// don't make a second shakmaty call" reasoning, generalized from a
+    /// yes/no to naming names. Empty if not in check, or if `color` has no
+    /// king on the board at all (`collapse_criticality` builds exactly
+    /// these — a king that was part of the cleared cluster and isn't the
+    /// candidate being tested).
+    pub fn checkers(&self, color: Color) -> Vec<PieceRef> {
+        let king_sq = if color.is_white() { self.kings.0 } else { self.kings.1 };
+        let Some(king_sq) = king_sq else { return Vec::new() };
+        self.attackers(king_sq, color.other()).into_iter().filter_map(|sq| {
+            self.pieces[Self::idx(sq)].map(|p| PieceRef {
+                role: role_name(p.role), color: Side::from(p.color), square: sq.to_string(),
+            })
+        }).collect()
+    }
+
     /// Whether `color`'s king is currently attacked — mathematically the same
     /// fact shakmaty's own `Position::checkers().any()` computes
     /// (`king_attackers` there is just `board().attacks_to(...)`, the same
     /// primitive `attackers_to` is built from — see PLAN.md), read here from
     /// the graph already built for this position instead of a second,
-    /// separate shakmaty call.
+    /// separate shakmaty call. Defined in terms of `checkers` — one
+    /// computation, not two that happen to agree.
     pub fn is_in_check(&self, color: Color) -> bool {
-        let king_sq = if color.is_white() { self.kings.0 } else { self.kings.1 };
-        king_sq.map(|sq| self.attackers(sq, color.other()).any()).unwrap_or(false)
+        !self.checkers(color).is_empty()
     }
 
     /// `control`, summed over every square in `zone` — the zone-level
@@ -316,8 +429,12 @@ impl ThreatGraph {
         best.map(|(p, _)| p)
     }
 
-    /// Find hanging pieces: attacked with 0 defenders.
-    pub fn find_hanging(&self) -> Vec<HangingPiece> {
+    /// Raw hanging-piece scan, `safe_to_capture` left as a placeholder —
+    /// `collapse_criticality`'s own baseline computation calls this instead
+    /// of `find_hanging`, since `find_hanging` calls `collapse_criticality`
+    /// per candidate to fill that field in; going through the public
+    /// `find_hanging` here would recurse forever.
+    fn find_hanging_raw(&self) -> Vec<HangingPiece> {
         let mut out = Vec::new();
         for sq in Square::ALL {
             let idx = Self::idx(sq);
@@ -336,6 +453,318 @@ impl ThreatGraph {
                         square: sq.to_string(),
                     },
                     attacker_count: attacker_count as u8,
+                    value: Self::piece_value(piece.role),
+                    safe_to_capture: true,
+                });
+            }
+        }
+        out
+    }
+
+    /// Find hanging pieces: attacked with 0 defenders — and, per candidate,
+    /// whether any attacker could actually capture here without exposing
+    /// its own king (`collapse_criticality`). "Brilliant move looks like a
+    /// hanging piece" (user's phrase): a raw zero-defender count says this
+    /// piece is lost, but if *every* attacker that could take it would walk
+    /// into check, nobody safely can — `safe_to_capture: false` is that
+    /// case, checked here so `extract_concepts` doesn't need graph access
+    /// itself to act on it.
+    pub fn find_hanging(&self) -> Vec<HangingPiece> {
+        self.find_hanging_raw().into_iter().map(|mut h| {
+            let Ok(sq) = Square::from_ascii(h.piece.square.as_bytes()) else { return h };
+            let attacker_color = h.piece.color.other();
+            h.safe_to_capture = self.collapse_criticality(sq).iter()
+                .any(|r| r.piece.color == attacker_color && !r.own_king_in_check);
+            h
+        }).collect()
+    }
+
+    /// Find outnumbered pieces: real defenders exist (unlike `find_hanging`),
+    /// but attackers still outnumber them. The most direct application of
+    /// `control` to piece safety — deliberately checked before the fancier
+    /// cross-references (`find_overloaded`, `find_false_defense`) even
+    /// though it was built after them; see PLAN.md.
+    pub fn find_outnumbered(&self) -> Vec<Outnumbered> {
+        let mut out = Vec::new();
+        for sq in Square::ALL {
+            let idx = Self::idx(sq);
+            let Some(piece) = self.pieces[idx] else { continue };
+            let attacker_count = (self.attackers_to[idx]
+                & self.board.by_color(piece.color.other())).count();
+            if attacker_count == 0 { continue; }
+            let defender_count = (self.attackers_to[idx]
+                & self.board.by_color(piece.color)
+                & !Bitboard::from(sq)).count();
+            if defender_count == 0 { continue; } // find_hanging's job, not this one
+            if attacker_count > defender_count {
+                out.push(Outnumbered {
+                    piece: PieceRef {
+                        role: role_name(piece.role),
+                        color: Side::from(piece.color),
+                        square: sq.to_string(),
+                    },
+                    attacker_count: attacker_count as u8,
+                    defender_count: defender_count as u8,
+                    value: Self::piece_value(piece.role),
+                });
+            }
+        }
+        out
+    }
+
+    /// Find overloaded pieces: the mirror image of a fork. One piece
+    /// attacking 2+ enemy targets is a fork; one piece being the *sole*
+    /// defender of 2+ of its own side's currently-attacked pieces is an
+    /// overload. Pure `attackers_to` lookup — no search, no cross-reference
+    /// with any other detector needed (contrast the pin/false-defense case,
+    /// which does need one — see PLAN.md).
+    pub fn find_overloaded(&self, color: Color) -> Vec<Overloaded> {
+        let mut out = Vec::new();
+        let enemy = color.other();
+        for (sq, piece) in self.pieces_of(color) {
+            let mut critical_for: Vec<PieceRef> = Vec::new();
+            let mut critical_value = 0i64;
+            for (t_sq, t_piece) in self.pieces_of(color) {
+                if t_sq == sq { continue; }
+                let t_idx = Self::idx(t_sq);
+                let attacker_count = (self.attackers_to[t_idx] & self.board.by_color(enemy)).count();
+                if attacker_count == 0 { continue; }
+                let defenders = self.attackers_to[t_idx] & self.board.by_color(color);
+                let is_sole_defender = defenders.count() == 1 && (defenders & Bitboard::from(sq)).any();
+                if is_sole_defender {
+                    critical_value += Self::piece_value(t_piece.role);
+                    critical_for.push(PieceRef {
+                        role: role_name(t_piece.role),
+                        color: Side::from(color),
+                        square: t_sq.to_string(),
+                    });
+                }
+            }
+            if critical_for.len() >= 2 {
+                out.push(Overloaded {
+                    piece: PieceRef {
+                        role: role_name(piece.role),
+                        color: Side::from(color),
+                        square: sq.to_string(),
+                    },
+                    critical_for,
+                    critical_value,
+                });
+            }
+        }
+        out
+    }
+
+    /// Find pieces whose raw defenders (nonzero, so `find_hanging` passes
+    /// them) are all pinned *and* unable to legally recapture here, because
+    /// this square isn't on their own pin's attacker–king line. Needs the
+    /// already-detected `pins` as input — `ThreatGraph` doesn't detect pins
+    /// itself (see this file's own module doc) — so this is a genuine
+    /// cross-reference between two independently-computed facts, not a
+    /// self-contained graph query the way `find_hanging`/`find_overloaded`
+    /// are. Still no search, no exchange priced: just checking whether an
+    /// already-known line covers an already-known square.
+    pub fn find_false_defense(&self, color: Color, pins: &[Pin]) -> Vec<FalseDefense> {
+        let mut out = Vec::new();
+        let enemy = color.other();
+        for sq in Square::ALL {
+            let idx = Self::idx(sq);
+            let Some(piece) = self.pieces[idx] else { continue };
+            if piece.color != color { continue; }
+            let attacker_count = (self.attackers_to[idx] & self.board.by_color(enemy)).count();
+            if attacker_count == 0 { continue; }
+            let defenders = self.attackers_to[idx] & self.board.by_color(color) & !Bitboard::from(sq);
+            if defenders == Bitboard::EMPTY { continue; } // find_hanging's job, not this one
+
+            let mut pinned_defenders: Vec<PieceRef> = Vec::new();
+            let mut all_ineffective = true;
+            for d_sq in defenders {
+                let Some(pin) = pins.iter().find(|p| p.pinned.square == d_sq.to_string() && p.pinned.color == Side::from(color)) else {
+                    all_ineffective = false; break; // a genuinely unpinned defender — real defense exists
+                };
+                let (Ok(attacker_sq), Ok(king_sq)) = (
+                    Square::from_ascii(pin.attacker.square.as_bytes()),
+                    Square::from_ascii(pin.shielded.square.as_bytes()),
+                ) else { all_ineffective = false; break; };
+                // Legal squares for a pinned piece are strictly between the
+                // attacker and its own king (plus capturing the attacker
+                // itself) — NOT the full infinite ray::ray() line, which
+                // extends past both endpoints. Moving to a square beyond the
+                // king, on the far side from the attacker, would expose the
+                // king exactly as much as moving off the line entirely.
+                let legal_pin_squares = attacks::between(attacker_sq, king_sq) | Bitboard::from(attacker_sq);
+                if (legal_pin_squares & Bitboard::from(sq)).any() {
+                    all_ineffective = false; break; // sq is on the pin line — this defender can legally recapture
+                }
+                if let Some(d_piece) = self.pieces[Self::idx(d_sq)] {
+                    pinned_defenders.push(PieceRef {
+                        role: role_name(d_piece.role),
+                        color: Side::from(color),
+                        square: d_sq.to_string(),
+                    });
+                }
+            }
+            if all_ineffective && !pinned_defenders.is_empty() {
+                out.push(FalseDefense {
+                    piece: PieceRef { role: role_name(piece.role), color: Side::from(color), square: sq.to_string() },
+                    attacker_count: attacker_count as u8,
+                    pinned_defenders,
+                    value: Self::piece_value(piece.role),
+                });
+            }
+        }
+        out
+    }
+
+    /// Clear the whole local contest at `sq`, then test each candidate
+    /// individually against that clean board — not move-by-move simulation,
+    /// no capture order, no recapture choice. For every piece currently
+    /// attacking, defending, or occupying `sq`: discard the *entire*
+    /// cluster first, then place just this one candidate back onto `sq`,
+    /// rebuild the graph, and read what that final configuration looks
+    /// like — as if this piece were the one left standing once everyone
+    /// else contesting the square had traded off, regardless of what order
+    /// that happened in. This identifies false defenders directly: a piece
+    /// whose own king ends up in check (or checkmate) once *it's* the one
+    /// occupying `sq` cannot actually go there safely, no matter what the
+    /// raw attacker/defender count said.
+    ///
+    /// This is the general mechanism `find_overloaded`/`find_false_defense`
+    /// are each one special case of: a pin is exactly "placing this piece
+    /// here leaves its own king in check"; an overload is "placing this
+    /// piece here swings control of some *other* square sharply." One
+    /// clear-and-place operation, not two separately-built detectors. Feeds
+    /// `HangingPiece.safe_to_capture` (wired into `extract_concepts`);
+    /// otherwise still experimental.
+    pub fn collapse_criticality(&self, sq: Square) -> Vec<PieceCriticality> {
+        let idx = Self::idx(sq);
+        let mut cluster: Vec<Square> = self.attackers_to[idx].into_iter().collect();
+        if self.pieces[idx].is_some() && !cluster.contains(&sq) { cluster.push(sq); }
+        if cluster.is_empty() { return Vec::new(); }
+
+        let mut clean_slate = self.board.clone();
+        for &p_sq in &cluster { clean_slate.discard_piece_at(p_sq); }
+
+        let white_zone_before = self.zone_control(king_ring(&self.board, Color::White), Color::White);
+        let black_zone_before = self.zone_control(king_ring(&self.board, Color::Black), Color::Black);
+        // Baseline for "more pieces threatened": whatever's already hanging
+        // in the real position doesn't count as a new consequence of this
+        // particular collapse.
+        let baseline_hanging = self.find_hanging_raw();
+
+        cluster.iter().filter_map(|&p_sq| {
+            let piece = self.pieces[Self::idx(p_sq)]?;
+            let mut hypo = clean_slate.clone();
+            hypo.set_piece_at(sq, piece);
+            let graph = ThreatGraph::build_from_board(hypo.clone(), self.turn);
+
+            let square_control_delta = graph.control(sq, piece.color) - self.control(sq, piece.color);
+            let white_zone_after = graph.zone_control(king_ring(&graph.board, Color::White), Color::White);
+            let black_zone_after = graph.zone_control(king_ring(&graph.board, Color::Black), Color::Black);
+
+            // Check and its identity come straight off the graph, no
+            // shakmaty round-trip needed (ThreatGraph::checkers). Only
+            // checkmate genuinely needs shakmaty's legal move generation.
+            let own_king_checked_by = graph.checkers(piece.color);
+            let delivers_check_via = graph.checkers(piece.color.other());
+            let own_king_checkmated = is_checkmate_via_shakmaty(&hypo, piece.color);
+            let delivers_checkmate = is_checkmate_via_shakmaty(&hypo, piece.color.other());
+
+            // Reuse find_hanging (already-built, already-tested) on the
+            // hypothetical itself instead of a bespoke "is this piece now
+            // undefended" check — anything it reports that wasn't already
+            // hanging in the real position is a fresh consequence of this
+            // specific candidate ending up on `sq`. Kings excluded: a king
+            // with an unanswerable attacker and 0 "defenders" is just
+            // check, already reported explicitly and more clearly via
+            // own_king_in_check/delivers_check above — find_hanging doesn't
+            // special-case the king's role, so without this filter a fresh
+            // check would double-count as a "newly hanging" entry too.
+            // find_hanging_raw, not find_hanging: only the piece list is
+            // used below, not safe_to_capture, so there's no reason to pay
+            // for (and recurse one level deeper into) the full
+            // collapse_criticality enrichment on this hypothetical too.
+            let newly_hanging: Vec<PieceRef> = graph.find_hanging_raw().into_iter()
+                .filter(|h| h.piece.role != "King")
+                .filter(|h| !baseline_hanging.iter().any(|b| b.piece.square == h.piece.square && b.piece.color == h.piece.color))
+                .map(|h| h.piece)
+                .collect();
+
+            Some(PieceCriticality {
+                piece: PieceRef { role: role_name(piece.role), color: Side::from(piece.color), square: sq.to_string() },
+                square_control_delta,
+                white_king_zone_delta: white_zone_after - white_zone_before,
+                black_king_zone_delta: black_zone_after - black_zone_before,
+                own_king_in_check: !own_king_checked_by.is_empty(),
+                own_king_checked_by,
+                own_king_checkmated,
+                delivers_check: !delivers_check_via.is_empty(),
+                delivers_check_via,
+                delivers_checkmate,
+                newly_hanging,
+            })
+        }).collect()
+    }
+
+    /// Find pieces where the raw count looks safe
+    /// (`raw_defender_count >= attacker_count`, so neither `find_hanging` nor
+    /// `find_outnumbered` flag them) but isn't once defenders already spoken
+    /// for elsewhere are discounted: pinned off the recapture line
+    /// (`find_false_defense`'s per-defender fact, generalized here to a
+    /// partial count instead of requiring *every* defender compromised) or
+    /// the sole defender of another piece (`find_overloaded`'s fact). This is
+    /// the rung above both: each already reports its own fact standalone (a
+    /// specific pin, a specific overload); this asks whether combining them
+    /// with the raw count changes the verdict a bare-count read would give.
+    /// Needs both `pins` and `overloaded` as input — a genuine
+    /// cross-reference of two already-computed facts, same shape as
+    /// `find_false_defense`, just widened to partial discounting instead of
+    /// all-or-nothing.
+    pub fn find_false_safety(&self, color: Color, pins: &[Pin], overloaded: &[Overloaded]) -> Vec<FalseSafety> {
+        let mut out = Vec::new();
+        let enemy = color.other();
+        for sq in Square::ALL {
+            let idx = Self::idx(sq);
+            let Some(piece) = self.pieces[idx] else { continue };
+            if piece.color != color { continue; }
+            let attacker_count = (self.attackers_to[idx] & self.board.by_color(enemy)).count();
+            if attacker_count == 0 { continue; }
+            let defenders = self.attackers_to[idx] & self.board.by_color(color) & !Bitboard::from(sq);
+            let raw_defender_count = defenders.count();
+            // find_hanging's job (0 defenders) or find_outnumbered's job
+            // (already outnumbered on the raw count) — this rung only fires
+            // when the raw count alone would have said "safe."
+            if raw_defender_count == 0 || attacker_count > raw_defender_count { continue; }
+
+            let mut compromised: Vec<PieceRef> = Vec::new();
+            for d_sq in defenders {
+                let pinned_off_line = pins.iter()
+                    .find(|p| p.pinned.square == d_sq.to_string() && p.pinned.color == Side::from(color))
+                    .is_some_and(|pin| {
+                        let (Ok(attacker_sq), Ok(king_sq)) = (
+                            Square::from_ascii(pin.attacker.square.as_bytes()),
+                            Square::from_ascii(pin.shielded.square.as_bytes()),
+                        ) else { return false; };
+                        let legal_pin_squares = attacks::between(attacker_sq, king_sq) | Bitboard::from(attacker_sq);
+                        !(legal_pin_squares & Bitboard::from(sq)).any()
+                    });
+                let is_overloaded = overloaded.iter()
+                    .any(|ov| ov.piece.square == d_sq.to_string() && ov.piece.color == Side::from(color));
+                if pinned_off_line || is_overloaded {
+                    if let Some(d_piece) = self.pieces[Self::idx(d_sq)] {
+                        compromised.push(PieceRef { role: role_name(d_piece.role), color: Side::from(color), square: d_sq.to_string() });
+                    }
+                }
+            }
+            if compromised.is_empty() { continue; }
+            let effective_defender_count = raw_defender_count - compromised.len();
+            if effective_defender_count < attacker_count {
+                out.push(FalseSafety {
+                    piece: PieceRef { role: role_name(piece.role), color: Side::from(color), square: sq.to_string() },
+                    attacker_count: attacker_count as u8,
+                    raw_defender_count: raw_defender_count as u8,
+                    effective_defender_count: effective_defender_count as u8,
+                    compromised_defenders: compromised,
                     value: Self::piece_value(piece.role),
                 });
             }
@@ -517,6 +946,121 @@ mod tests {
         let not_in_check = pos("6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1");
         assert!(!not_in_check.is_check());
         assert!(!ThreatGraph::build(&not_in_check).is_in_check(Color::White));
+    }
+
+    // Regression for the corrected collapse experiment: a black knight on
+    // h4 blocks White's Rh1 from the h-file, and is the sole attacker of a
+    // white pawn on f5. Clear both (pawn + knight), then test each
+    // candidate individually against that clean board. If the *pawn* is
+    // the one left standing, the knight is simply gone from the position --
+    // and the h-file is wide open regardless, so black is already in
+    // check. If the *knight* is the one left standing (as if it had
+    // captured on f5), its own king is now in check too: the knight cannot
+    // actually recapture here without exposing its own king, even though a
+    // naive count would just call the pawn "hanging."
+    #[test]
+    fn collapse_criticality_finds_the_false_defender_via_check() {
+        let chess = pos("7k/8/8/5P2/7n/8/8/4K2R w - - 0 1");
+        let graph = ThreatGraph::build(&chess);
+        let f5 = Square::from_ascii(b"f5").unwrap();
+
+        let results = graph.collapse_criticality(f5);
+        assert_eq!(results.len(), 2, "cluster is {{pawn f5, knight h4}}, one entry per candidate, got {results:?}");
+
+        let pawn_candidate = results.iter().find(|r| r.piece.role == "Pawn").expect("pawn candidate should be present");
+        assert_eq!(pawn_candidate.square_control_delta, 1, "with the knight gone entirely, nothing attacks f5 any more");
+        assert_eq!(pawn_candidate.white_king_zone_delta, 0);
+        assert_eq!(pawn_candidate.black_king_zone_delta, -2, "the knight's total absence still reopens the h-file");
+        assert!(!pawn_candidate.own_king_in_check, "White's own king is untouched by any of this");
+        assert!(pawn_candidate.delivers_check, "Rh1 checks Black with the knight simply absent");
+        assert_eq!(pawn_candidate.delivers_check_via.len(), 1);
+        assert_eq!(pawn_candidate.delivers_check_via[0].square, "h1", "the checking piece should be identified, not just a bare bool");
+        assert_eq!(pawn_candidate.delivers_check_via[0].role, "Rook");
+
+        let knight_candidate = results.iter().find(|r| r.piece.role == "Knight").expect("knight candidate should be present");
+        assert_eq!(knight_candidate.square_control_delta, -1, "black loses its only attacker of f5 once it's the knight standing there instead of attacking from h4");
+        assert_eq!(knight_candidate.white_king_zone_delta, 0, "the knight never touches White's king ring from f5 either");
+        assert_eq!(knight_candidate.black_king_zone_delta, -1);
+        assert!(knight_candidate.own_king_in_check, "the knight vacating h4 to stand on f5 leaves its own king in check -- a false defender");
+        assert_eq!(knight_candidate.own_king_checked_by.len(), 1);
+        assert_eq!(knight_candidate.own_king_checked_by[0].square, "h1", "same rook, now checking via the reopened file instead of being blocked");
+        assert_eq!(knight_candidate.own_king_checked_by[0].role, "Rook");
+        assert!(!knight_candidate.delivers_check, "a knight on f5 doesn't attack e1");
+        assert!(knight_candidate.delivers_check_via.is_empty());
+
+        // Neither case is actually checkmate here -- Black's king still has
+        // g7/g8 to run to -- so the best-effort checkmate check should
+        // agree it's "just" check, not propagate an error or false-positive.
+        assert!(!pawn_candidate.own_king_checkmated);
+        assert!(!pawn_candidate.delivers_checkmate);
+        assert!(!knight_candidate.own_king_checkmated);
+        assert!(!knight_candidate.delivers_checkmate);
+
+        // Sanity: attackers()/control() on the real graph agree with what
+        // the hand-derived deltas above assume about the starting position.
+        assert_eq!(graph.control(f5, Color::Black), 1, "knight is f5's sole attacker before any removal");
+        assert!(!graph.is_in_check(Color::Black), "Rh1 is blocked by the knight before any removal");
+    }
+
+    // Regression: when a king itself is part of the local cluster (here,
+    // Black's own king on h8 defends its knight on g7, attacked by White's
+    // queen on g1 -- cluster is {queen g1, king h8, knight g7}), testing
+    // any candidate *other than the king* leaves that king missing from the
+    // board entirely. Check itself (ThreatGraph::checkers) handles this
+    // fine -- king_sq is just None, checkers() returns empty -- but
+    // checkmate genuinely needs Chess::from_setup, which must reject a
+    // missing king cleanly (reads as "not checkmate") rather than panic.
+    #[test]
+    fn collapse_criticality_checkmate_check_degrades_gracefully_when_a_king_is_in_the_cluster() {
+        let chess = pos("7k/6n1/8/8/8/8/8/6QK w - - 0 1");
+        let graph = ThreatGraph::build(&chess);
+        let g7 = Square::from_ascii(b"g7").unwrap();
+        let results = graph.collapse_criticality(g7);
+        assert_eq!(results.len(), 3, "cluster is {{queen g1, king h8, knight g7}}, got {results:?}");
+        for r in &results {
+            // Whichever candidate is tested, at least one other cluster
+            // member is simply absent; when that member is a king,
+            // from_setup must fail cleanly rather than panic.
+            let _ = r.own_king_checkmated;
+            let _ = r.delivers_checkmate;
+        }
+    }
+
+    // Regression for "more pieces threatened, not just the king": Black's
+    // rook on g2 is currently defended once (Nh4, a knight move away) and
+    // attacked once (Bc6, a clear diagonal) -- 1v1, not hanging in the real
+    // position. Nh4 is *also* the pawn f5's sole attacker, so it's part of
+    // that square's cluster. In every collapse_criticality(f5) candidate,
+    // h4 ends up empty (either the knight is absent entirely, or it's been
+    // relocated to f5) -- so g2's rook loses its only defender regardless
+    // of which candidate is tested, and becomes newly hanging as a side
+    // effect of a collapse happening on a completely different square.
+    #[test]
+    fn collapse_criticality_surfaces_other_pieces_newly_hanging_as_a_side_effect() {
+        let chess = pos("7k/8/2B5/5P2/7n/8/6r1/4K2R w - - 0 1");
+        let graph = ThreatGraph::build(&chess);
+        let f5 = Square::from_ascii(b"f5").unwrap();
+        let g2 = Square::from_ascii(b"g2").unwrap();
+
+        assert!(graph.find_hanging().iter().all(|h| h.piece.square != "g2"), "g2's rook has a real defender in the actual position, must not be hanging yet");
+        assert_eq!(graph.control(g2, Color::Black), 0, "one attacker (Bc6), one defender (Nh4) -- net zero control");
+
+        let results = graph.collapse_criticality(f5);
+        assert_eq!(results.len(), 2, "cluster is {{pawn f5, knight h4}}, got {results:?}");
+        for r in &results {
+            assert_eq!(r.newly_hanging.len(), 1, "g2's rook should newly hang once h4 is empty, for candidate {:?}", r.piece);
+            assert_eq!(r.newly_hanging[0].square, "g2");
+            assert_eq!(r.newly_hanging[0].color, Side::Black);
+            assert_eq!(r.newly_hanging[0].role, "Rook");
+        }
+    }
+
+    #[test]
+    fn collapse_criticality_is_empty_off_an_unattacked_undefended_square() {
+        let chess = pos("4k3/8/8/8/8/8/8/4K2R w - - 0 1");
+        let graph = ThreatGraph::build(&chess);
+        let a1 = Square::from_ascii(b"a1").unwrap();
+        assert!(graph.collapse_criticality(a1).is_empty(), "empty, unattacked square has no cluster to collapse");
     }
 }
 

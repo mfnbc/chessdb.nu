@@ -87,7 +87,7 @@ impl PluginCommand for DeriveCoachSignals {
     }
 }
 
-struct MoveRecord { game_id: String, ply: i64, fen: String, hugm_score: i64, player: String, state_id: Option<u16>, eval_arr: Option<Vec<i64>> }
+struct MoveRecord { game_id: String, ply: i64, fen: String, hugm_score: i64, player: String, state_id: Option<u32>, eval_arr: Option<Vec<i64>> }
 
 fn parse_move_record(v: &Value) -> Option<MoveRecord> {
     let rec = v.as_record().ok()?;
@@ -95,7 +95,7 @@ fn parse_move_record(v: &Value) -> Option<MoveRecord> {
         .and_then(|v| v.as_int().ok())
         .unwrap_or(0);
     let player = rec.get("player").and_then(|v| v.as_str().ok()).unwrap_or("unknown").to_string();
-    let state_id = rec.get("state_id").and_then(|v| v.as_int().ok()).map(|x| x as u16);
+    let state_id = rec.get("state_id").and_then(|v| v.as_int().ok()).map(|x| x as u32);
     let eval_arr = rec.get("hugm_eval_arr")
         .and_then(|v| v.as_str().ok())
         .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok());
@@ -155,6 +155,10 @@ fn state_vector_to_value(game_id: &str, ply: i64, state: &StateVector, span: nu_
         "has_passed_pawn" => Value::bool(state.has_passed_pawn, span),
         "has_skewer"      => Value::bool(state.has_skewer, span),
         "has_discovered"  => Value::bool(state.has_discovered, span),
+        "has_outnumbered"    => Value::bool(state.has_outnumbered, span),
+        "has_overloaded"     => Value::bool(state.has_overloaded, span),
+        "has_false_defense"  => Value::bool(state.has_false_defense, span),
+        "has_false_safety"   => Value::bool(state.has_false_safety, span),
     }, span)
 }
 
@@ -253,6 +257,17 @@ fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(St
                 ("skewer",            s.has_skewer),
                 ("discovered_attack", s.has_discovered),
                 ("king_exposed",      s.king_exposed),
+                // Failure-lattice rungs (threat_graph.rs module doc,
+                // PLAN.md): raw-count outnumbered, commitment-elsewhere
+                // (overloaded/false_defense), and the composite rung above
+                // both (false_safety) — baselined the same way as every
+                // other binary state-vector concept above, so a player's
+                // eval-swing tendency at each specific rung becomes visible,
+                // not just an aggregate "missed a tactic" signal.
+                ("outnumbered",       s.has_outnumbered),
+                ("overloaded",        s.has_overloaded),
+                ("false_defense",     s.has_false_defense),
+                ("false_safety",      s.has_false_safety),
             ] {
                 if flag {
                     baselines.entry((rd.player.clone(), phase_bucket, concept.to_string()))
@@ -283,7 +298,7 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
 
         // Binary state-vector anomalies (eval swing when pattern was present)
         if rd.delta >= ANOMALY_CANDIDATE_CP {
-            let check_concepts: [(&str, bool); 10] = [
+            let check_concepts: [(&str, bool); 14] = [
                 ("hugm_delta",        true),
                 ("fork",              s.has_fork),
                 ("pin",               s.has_pin),
@@ -294,6 +309,10 @@ fn detect_anomalies(rows: &[MoveRecord], states: &[StateVector], baselines: &Has
                 ("skewer",            s.has_skewer),
                 ("discovered_attack", s.has_discovered),
                 ("king_exposed",      s.king_exposed),
+                ("outnumbered",       s.has_outnumbered),
+                ("overloaded",        s.has_overloaded),
+                ("false_defense",     s.has_false_defense),
+                ("false_safety",      s.has_false_safety),
             ];
             for (concept, should_check) in &check_concepts {
                 if !should_check { continue; }

@@ -149,7 +149,8 @@ def "tactical-concepts" [username: string --db: string = "./chess.db"] {
                ROUND(AVG(z_score), 2) as avg_z,
                ROUND(MAX(severity), 0) as peak_severity_cp
         FROM move_anomalies
-        WHERE username = ? AND concept_name IN ('fork', 'pin', 'hanging_piece', 'skewer', 'discovered_attack')
+        WHERE username = ? AND concept_name IN ('fork', 'pin', 'hanging_piece', 'skewer', 'discovered_attack',
+            'outnumbered', 'overloaded', 'false_defense', 'false_safety')
         GROUP BY concept_name
         ORDER BY hurt_count DESC
     " --params [$username]
@@ -165,7 +166,8 @@ def "tactical-phase-breakdown" [username: string --db: string = "./chess.db"] {
                ROUND(AVG(ma.z_score), 2) as avg_z
         FROM move_anomalies ma
         JOIN move_states ms ON ms.game_id = ma.game_id AND ms.ply = ma.ply
-        WHERE ma.username = ? AND ma.concept_name IN ('fork', 'pin', 'hanging_piece', 'skewer', 'discovered_attack')
+        WHERE ma.username = ? AND ma.concept_name IN ('fork', 'pin', 'hanging_piece', 'skewer', 'discovered_attack',
+            'outnumbered', 'overloaded', 'false_defense', 'false_safety')
         GROUP BY ms.phase_bucket, ma.concept_name
         ORDER BY ms.phase_bucket, hurt_rate DESC
     " --params [$username]
@@ -177,7 +179,11 @@ def "tactical-win-impact" [username: string --db: string = "./chess.db"] {
             SELECT ms.game_id,
                    MAX(ms.has_fork) as had_fork,
                    MAX(ms.has_pin) as had_pin,
-                   MAX(ms.has_hanging) as had_hanging
+                   MAX(ms.has_hanging) as had_hanging,
+                   MAX(ms.has_outnumbered) as had_outnumbered,
+                   MAX(ms.has_overloaded) as had_overloaded,
+                   MAX(ms.has_false_defense) as had_false_defense,
+                   MAX(ms.has_false_safety) as had_false_safety
             FROM move_states ms
             JOIN moves m ON m.game_id = ms.game_id AND m.ply = ms.ply
             JOIN games g ON g.game_id = ms.game_id
@@ -188,7 +194,11 @@ def "tactical-win-impact" [username: string --db: string = "./chess.db"] {
             SELECT ms.game_id,
                    MAX(ms.has_fork) as had_fork,
                    MAX(ms.has_pin) as had_pin,
-                   MAX(ms.has_hanging) as had_hanging
+                   MAX(ms.has_hanging) as had_hanging,
+                   MAX(ms.has_outnumbered) as had_outnumbered,
+                   MAX(ms.has_overloaded) as had_overloaded,
+                   MAX(ms.has_false_defense) as had_false_defense,
+                   MAX(ms.has_false_safety) as had_false_safety
             FROM move_states ms
             JOIN moves m ON m.game_id = ms.game_id AND m.ply = ms.ply
             JOIN games g ON g.game_id = ms.game_id
@@ -207,11 +217,27 @@ def "tactical-win-impact" [username: string --db: string = "./chess.db"] {
             UNION ALL
             SELECT 'hanging_piece',             'player',          pf.had_hanging,             pg.result FROM player_flags pf JOIN player_games pg ON pg.game_id = pf.game_id
             UNION ALL
+            SELECT 'outnumbered',               'player',          pf.had_outnumbered,         pg.result FROM player_flags pf JOIN player_games pg ON pg.game_id = pf.game_id
+            UNION ALL
+            SELECT 'overloaded',                'player',          pf.had_overloaded,          pg.result FROM player_flags pf JOIN player_games pg ON pg.game_id = pf.game_id
+            UNION ALL
+            SELECT 'false_defense',             'player',          pf.had_false_defense,       pg.result FROM player_flags pf JOIN player_games pg ON pg.game_id = pf.game_id
+            UNION ALL
+            SELECT 'false_safety',              'player',          pf.had_false_safety,        pg.result FROM player_flags pf JOIN player_games pg ON pg.game_id = pf.game_id
+            UNION ALL
             SELECT 'fork',                      'opponent',        of.had_fork,                pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
             UNION ALL
             SELECT 'pin',                       'opponent',        of.had_pin,                 pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
             UNION ALL
             SELECT 'hanging_piece',             'opponent',        of.had_hanging,             pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
+            UNION ALL
+            SELECT 'outnumbered',               'opponent',        of.had_outnumbered,         pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
+            UNION ALL
+            SELECT 'overloaded',                'opponent',        of.had_overloaded,          pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
+            UNION ALL
+            SELECT 'false_defense',             'opponent',        of.had_false_defense,       pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
+            UNION ALL
+            SELECT 'false_safety',              'opponent',        of.had_false_safety,        pg.result FROM opp_flags of JOIN player_games pg ON pg.game_id = of.game_id
         )
         GROUP BY concept, who, present
         ORDER BY concept, who, present
@@ -229,7 +255,8 @@ def "tactical-worst-games" [username: string --db: string = "./chess.db"] {
                GROUP_CONCAT(DISTINCT ma.concept_name) as concepts
         FROM move_anomalies ma
         WHERE ma.username = ?
-          AND ma.concept_name IN ('fork', 'pin', 'hanging_piece', 'skewer', 'discovered_attack')
+          AND ma.concept_name IN ('fork', 'pin', 'hanging_piece', 'skewer', 'discovered_attack',
+            'outnumbered', 'overloaded', 'false_defense', 'false_safety')
           AND ma.consumed = 0
         GROUP BY ma.game_id
         HAVING hurt_moves > 0

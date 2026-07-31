@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nu-plugin = "0.111"
-nu-protocol = "0.111"
+nu-plugin = "0.114"
+nu-protocol = "0.114"
 
 shakmaty = "0.26"
 pgn-reader = "0.24"

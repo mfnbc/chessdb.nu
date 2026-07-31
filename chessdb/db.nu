@@ -136,6 +136,41 @@ export def init-db [db: string] {
         "
     } catch { }
 
+    # The failure-lattice rungs (threat_graph.rs module doc, PLAN.md): raw
+    # miscount (outnumbered), a defender already committed elsewhere
+    # (overloaded, false_defense), and the composite rung above both
+    # (false_safety) that fires when the raw count alone said "safe" but
+    # isn't once those commitments are discounted. Same bit-column pattern
+    # as has_outpost/has_open_file/has_passed_pawn above — added when
+    # state_id was widened from u16 to u32 (bits 15-18) to make room.
+    for col_sql in [
+        "ALTER TABLE move_states ADD COLUMN has_outnumbered   BOOLEAN"
+        "ALTER TABLE move_states ADD COLUMN has_overloaded    BOOLEAN"
+        "ALTER TABLE move_states ADD COLUMN has_false_defense BOOLEAN"
+        "ALTER TABLE move_states ADD COLUMN has_false_safety  BOOLEAN"
+    ] { try { open $db | query db $col_sql } catch { } }
+    # Same backfill pattern as above, with one honest caveat: rows whose
+    # positions.state_id was computed before this widening will backfill to
+    # false here regardless of whether the position actually had the
+    # pattern — those bits didn't exist yet to be set. Only newly (re-)
+    # evaluated positions carry real values for bits 15-18; historic rows
+    # need `chessdb derive-coach-signals` re-run over freshly re-evaluated
+    # positions to pick these up, the same limitation any bit added to an
+    # already-populated state_id column would have.
+    try {
+        open $db | query db "
+            UPDATE move_states
+            SET has_outnumbered   = (COALESCE(p.state_id, 0) >> 15) & 1,
+                has_overloaded    = (COALESCE(p.state_id, 0) >> 16) & 1,
+                has_false_defense = (COALESCE(p.state_id, 0) >> 17) & 1,
+                has_false_safety  = (COALESCE(p.state_id, 0) >> 18) & 1
+            FROM moves m JOIN positions p ON m.next_position_id = p.zobrist
+            WHERE move_states.game_id = m.game_id AND move_states.ply = m.ply
+              AND (move_states.has_outnumbered IS NULL OR move_states.has_overloaded IS NULL
+                   OR move_states.has_false_defense IS NULL OR move_states.has_false_safety IS NULL)
+        "
+    } catch { }
+
     open $db | query db "
         CREATE TABLE IF NOT EXISTS player_baselines (
             username     TEXT    NOT NULL,
@@ -205,6 +240,41 @@ export def init-db [db: string] {
             ON move_anomalies(username, game_id, ply, concept_name)
         "
     } catch { }
+
+    # tactical_events: one row per individual failure-lattice finding
+    # (hanging/outnumbered/overloaded/false_defense/false_safety instance),
+    # not an aggregate. The flat columns (square, concept_name, side,
+    # severity, stage) are what's quantifiable and worth indexing/graphing
+    # across a game; `detail` is the fully-identifiable structured payload
+    # (named pieces, king-zone deltas, checkers — the actual
+    # ThreatGraph::collapse_criticality/HangingPiece-shaped JSON) for a
+    # human or LLM to read at review time. Deliberately no narrative/
+    # description column: synthesizing "why this matters" from these facts
+    # is interpretation, not quantification, and belongs at read time, not
+    # frozen into a row that could only ever serve one framing — see
+    # PLAN.md's "what can be described vs. what can be detected" entry.
+    open $db | query db "
+        CREATE TABLE IF NOT EXISTS tactical_events (
+            event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id      INTEGER NOT NULL,
+            ply          INTEGER NOT NULL,
+            square       TEXT    NOT NULL,
+            concept_name TEXT    NOT NULL,
+            side         TEXT    NOT NULL,
+            severity     INTEGER NOT NULL DEFAULT 0,
+            stage        INTEGER NOT NULL DEFAULT 0,
+            detail       TEXT,
+            created_at   TEXT    DEFAULT (datetime('now'))
+        )
+    " | ignore
+    # Unique constraint makes re-derive idempotent, same pattern as move_anomalies.
+    try {
+        open $db | query db "
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tactical_events_unique
+            ON tactical_events(game_id, ply, square, concept_name)
+        "
+    } catch { }
+    open $db | query db "CREATE INDEX IF NOT EXISTS idx_tactical_events_game ON tactical_events(game_id, ply)" | ignore
 }
 
 # Download ecoA–E.json from JeffML/eco.json and populate the openings table. No-op if already seeded.

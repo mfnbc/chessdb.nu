@@ -29,7 +29,8 @@ def import-records [games: list, username: string, db: string] {
             open $db | query db "
                 INSERT OR IGNORE INTO move_states
                     (game_id, ply, state_id, phase_bucket, has_fork, has_pin, has_hanging, king_exposed,
-                     has_outpost, has_open_file, has_passed_pawn)
+                     has_outpost, has_open_file, has_passed_pawn,
+                     has_outnumbered, has_overloaded, has_false_defense, has_false_safety)
                 SELECT m.game_id, m.ply,
                     COALESCE(p.state_id, 0),
                     (COALESCE(p.state_id, 0) & 3),
@@ -39,7 +40,11 @@ def import-records [games: list, username: string, db: string] {
                     ((COALESCE(p.state_id, 0) >> 5) & 1),
                     ((COALESCE(p.state_id, 0) >> 10) & 1),
                     ((COALESCE(p.state_id, 0) >> 11) & 1),
-                    ((COALESCE(p.state_id, 0) >> 12) & 1)
+                    ((COALESCE(p.state_id, 0) >> 12) & 1),
+                    ((COALESCE(p.state_id, 0) >> 15) & 1),
+                    ((COALESCE(p.state_id, 0) >> 16) & 1),
+                    ((COALESCE(p.state_id, 0) >> 17) & 1),
+                    ((COALESCE(p.state_id, 0) >> 18) & 1)
                 FROM moves m JOIN positions p ON m.next_position_id = p.zobrist
             " | ignore
         } catch { }
@@ -93,6 +98,100 @@ def review-game [game_id: int, db: string] {
             Δ_strategic: ($d | get 7)
         }
     }
+}
+
+# Compute and persist tactical_events (failure-lattice findings, fully
+# identifiable) for one game's moves. One row per individual finding
+# (hanging_piece/outnumbered/overloaded/false_defense/false_safety
+# instance), not an aggregate -- `square`/`concept_name`/`side`/`severity`/
+# `stage` are quantifiable and worth graphing across the game; `detail`
+# carries the underlying structured payload (for hanging pieces,
+# ThreatGraph::collapse_criticality's per-candidate breakdown -- named
+# checkers, king-zone deltas -- via `chessdb collapse-criticality`; for the
+# other four concepts, the instance itself) so a human or the LLM can read
+# exactly why, without recomputation. No player-elo needed -- this is the
+# raw lattice, not the elo-gated coaching shortlist (see PLAN.md). Safe to
+# re-run: idempotent via tactical_events' own unique index, same pattern as
+# move_anomalies.
+#
+# stage mirrors concepts.rs's ladder_stage() -- a second place with this
+# same small mapping, since that function is private and operates on
+# aggregated Concepts, not per-instance structs; same kind of known,
+# deferred duplication as the confidence-tier match arms (PLAN.md).
+export def "chess-tactical-events" [
+    game_id: int
+    --db: string = "./chess.db"
+] {
+    let rows = (open $db | query db "
+        SELECT m.ply, p.fen
+        FROM moves m
+        JOIN positions p ON m.next_position_id = p.zobrist
+        WHERE m.game_id = ?
+        ORDER BY m.ply ASC
+    " --params [$game_id])
+
+    if ($rows | is-empty) {
+        print $"No moves found for game ($game_id)."
+        return {game_id: $game_id, events: 0}
+    }
+
+    let stage = {hanging_piece: 1, outnumbered: 2, overloaded: 3, false_defense: 3, false_safety: 4}
+
+    let events = $rows | each { |row|
+        let tactical = try { $row.fen | chessdb hugm-eval | get sensor_report.tactical } catch { null }
+        if ($tactical == null) { return [] }
+
+        let hanging = $tactical.hanging? | default [] | each { |h|
+            let collapse = try { $row.fen | chessdb collapse-criticality --square $h.piece.square } catch { [] }
+            {
+                game_id: $game_id, ply: $row.ply, square: $h.piece.square,
+                concept_name: "hanging_piece", side: $h.piece.color,
+                severity: $h.value, stage: $stage.hanging_piece,
+                detail: ({piece: $h, collapse: $collapse} | to json -r)
+            }
+        }
+        let outnumbered = $tactical.outnumbered? | default [] | each { |o|
+            {
+                game_id: $game_id, ply: $row.ply, square: $o.piece.square,
+                concept_name: "outnumbered", side: $o.piece.color,
+                severity: $o.value, stage: $stage.outnumbered,
+                detail: ($o | to json -r)
+            }
+        }
+        let overloaded = $tactical.overloaded? | default [] | each { |o|
+            {
+                game_id: $game_id, ply: $row.ply, square: $o.piece.square,
+                concept_name: "overloaded", side: $o.piece.color,
+                severity: $o.critical_value, stage: $stage.overloaded,
+                detail: ($o | to json -r)
+            }
+        }
+        let false_defense = $tactical.false_defense? | default [] | each { |f|
+            {
+                game_id: $game_id, ply: $row.ply, square: $f.piece.square,
+                concept_name: "false_defense", side: $f.piece.color,
+                severity: $f.value, stage: $stage.false_defense,
+                detail: ($f | to json -r)
+            }
+        }
+        let false_safety = $tactical.false_safety? | default [] | each { |f|
+            {
+                game_id: $game_id, ply: $row.ply, square: $f.piece.square,
+                concept_name: "false_safety", side: $f.piece.color,
+                severity: $f.value, stage: $stage.false_safety,
+                detail: ($f | to json -r)
+            }
+        }
+
+        [$hanging, $outnumbered, $overloaded, $false_defense, $false_safety] | flatten
+    } | flatten
+
+    if ($events | is-empty) {
+        return {game_id: $game_id, events: 0}
+    }
+
+    db-merge $db "tactical_events" $events ["game_id" "ply" "square" "concept_name" "side" "severity" "stage" "detail"]
+    {game_id: $game_id, events: ($events | length)}
 }
 
 # Download all chess.com games for a player and store them with HUGM evaluations.

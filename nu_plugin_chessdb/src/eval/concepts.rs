@@ -97,8 +97,14 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
     // hanging piece of the same size, even though the rest aren't lost on the
     // very next move — they tend to linger and accumulate if not addressed.
     for side in [us_color, them_color] {
+        // safe_to_capture: false is "brilliant move looks like a hanging
+        // piece" (ThreatGraph::collapse_criticality) -- every attacker that
+        // could take this piece would expose its own king, so nobody
+        // safely can. Not really a hanging piece a player should be
+        // expected to see as lost, so it doesn't count toward this concept
+        // at all -- checked before flagging, not after.
         let mut values: Vec<i64> = sensor.tactical.hanging.iter()
-            .filter(|h| h.piece.color == side)
+            .filter(|h| h.piece.color == side && h.safe_to_capture)
             .map(|h| h.value)
             .collect();
         if values.is_empty() { continue; }
@@ -112,6 +118,79 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
             format!("{} has {} hanging pieces (biggest worth {} centipawns)", side, values.len(), max)
         };
         concepts.push(Concept { name: "hanging_piece".into(), severity, side, phrase, elo_min: 600 });
+    }
+
+    // Outnumbered pieces (ELO 800+): real defenders exist (find_hanging
+    // doesn't touch these), but attackers still outnumber them — the most
+    // direct application of ThreatGraph::control to piece safety. Sits
+    // between hanging_piece (600, no defenders at all) and fork (1000,
+    // needs seeing a double-attack pattern): counting attackers vs
+    // defenders when both are nonzero is a genuinely intermediate skill.
+    // Lower confidence than hanging_piece (0.7, not 0.9) since piece values
+    // could still make the actual trade fine — that's exactly the pricing
+    // question this system deliberately doesn't calculate.
+    for on in &sensor.tactical.outnumbered {
+        concepts.push(Concept {
+            name: "outnumbered".into(),
+            severity: on.value,
+            side: on.piece.color,
+            phrase: format!("{}'s {} has a defender, so it isn't simply hanging, but is still outnumbered ({} attackers vs {} defenders)", on.piece.color, on.piece.role, on.attacker_count, on.defender_count),
+            elo_min: 800,
+        });
+    }
+
+    // Overloaded pieces (ELO 1400+): the mirror image of a fork — one piece
+    // solely defending 2+ currently-attacked pieces at once. Not a search
+    // result: pure attackers_to lookup (ThreatGraph::find_overloaded).
+    // Severity is what's jointly at risk if this piece's coordination
+    // breaks down (critical_value, summed where the real Role enum is on
+    // hand — not re-derived from role-name strings here).
+    for ov in &sensor.tactical.overloaded {
+        concepts.push(Concept {
+            name: "overloaded".into(),
+            severity: ov.critical_value,
+            side: ov.piece.color,
+            phrase: format!("{}'s {} is overloaded, defending {} pieces at once", ov.piece.color, ov.piece.role, ov.critical_for.len()),
+            elo_min: 1400,
+        });
+    }
+
+    // False defense (ELO 1600+): a piece find_hanging didn't flag (it has a
+    // nonzero raw defender count) but every defender is pinned and unable to
+    // legally recapture here — the pin line doesn't cover this square. Not a
+    // search result: cross-references two already-detected facts
+    // (attackers_to and the pins list) via ThreatGraph::find_false_defense.
+    // Higher ELO than plain hanging_piece (600) because it needs pin
+    // recognition (1200) plus the extra inferential step of realizing that
+    // changes the picture — one concept per instance, not aggregated the
+    // way hanging_piece's multi-piece severity is, since this pattern is
+    // rarer and doesn't need that refinement yet.
+    for fd in &sensor.tactical.false_defense {
+        concepts.push(Concept {
+            name: "false_defense".into(),
+            severity: fd.value,
+            side: fd.piece.color,
+            phrase: format!("{}'s {} looks defended but its defender is pinned and can't actually recapture", fd.piece.color, fd.piece.role),
+            elo_min: 1600,
+        });
+    }
+
+    // False safety (ELO 1800+): the rung above both overloaded and
+    // false_defense — the raw defender count alone said this piece was safe
+    // (defender_count >= attacker_count, so outnumbered doesn't flag it) but
+    // isn't once defenders pinned off-line or overloaded elsewhere are
+    // discounted (ThreatGraph::find_false_safety). Higher ELO than either
+    // constituent fact (1400/1600) because it requires composing them with a
+    // count that, read alone, looks fine — the specific miss of "getting the
+    // numbers right and still missing the tactic."
+    for fs in &sensor.tactical.false_safety {
+        concepts.push(Concept {
+            name: "false_safety".into(),
+            severity: fs.value,
+            side: fs.piece.color,
+            phrase: format!("{}'s {} looks defended by the count ({} vs {}) but {} defender(s) are already committed elsewhere", fs.piece.color, fs.piece.role, fs.raw_defender_count, fs.attacker_count, fs.compromised_defenders.len()),
+            elo_min: 1800,
+        });
     }
 
     // Pawn structure (ELO 1600+): isolated pawns, keyed by the pawn's real color (not us/them)
@@ -204,6 +283,22 @@ pub fn concepts_for_elo(concepts: &[Concept], elo: i32) -> Vec<&Concept> {
     concepts.iter().filter(|c| c.elo_min <= elo).collect()
 }
 
+/// Which rung of the piece-safety ladder a concept name belongs to
+/// (`threat_graph.rs`'s "failure lattice" module doc), for `GatedIssue.stage`.
+/// 0 for everything outside that specific ladder — this is not a general
+/// concept taxonomy, just the progression-of-calculation marker the coach
+/// needs to say *how deep* a correct check had to go, not merely that one
+/// was missed.
+fn ladder_stage(name: &str) -> u8 {
+    match name {
+        "hanging_piece" => 1,
+        "outnumbered" => 2,
+        "overloaded"|"false_defense" => 3,
+        "false_safety" => 4,
+        _ => 0,
+    }
+}
+
 /// Gate concepts for a single position (no delta history).
 /// Ranks by severity × elo_relevance × confidence. Returns top 1-3.
 pub fn rank_issues_for_position(concepts: &[Concept], player_elo: i32) -> Vec<GatedIssue> {
@@ -213,15 +308,15 @@ pub fn rank_issues_for_position(concepts: &[Concept], player_elo: i32) -> Vec<Ga
         let confidence = match c.name.as_str() {
             "mate_in_1"|"fork"|"pin"|"skewer"|"discovered_attack"|"king_in_check" => 1.0,
             "hanging_piece"|"passed_pawn"|"material_imbalance" => 0.9,
-            "rook_open_file"|"rook_seventh"|"outpost"|"development" => 0.8,
-            "king_exposed"|"isolated_pawn"|"doubled_pawn"|"pawn_islands" => 0.7,
+            "rook_open_file"|"rook_seventh"|"outpost"|"development"|"overloaded"|"false_defense"|"false_safety" => 0.8,
+            "king_exposed"|"isolated_pawn"|"doubled_pawn"|"pawn_islands"|"outnumbered" => 0.7,
             _ => 0.6,
         };
         let score = c.severity as f64 * elo_relevance * confidence;
         if score < 1.0 { return None; }
         Some(GatedIssue { name: c.name.clone(), severity: c.severity, elo_min: c.elo_min,
             magnitude: 1.0, elo_relevance, confidence, score,
-            phrase: c.phrase.clone(), side: c.side })
+            phrase: c.phrase.clone(), side: c.side, stage: ladder_stage(&c.name) })
     }).collect();
     issues.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     let has_critical = issues.iter().any(|i| i.severity >= 80 && i.elo_min <= 1000 && i.score > 10.0);
@@ -245,13 +340,14 @@ pub fn rank_issues_for_player(
         let confidence = match c.name.as_str() {
             "mate_in_1"|"fork"|"pin"|"skewer"|"discovered_attack"|"king_in_check" => 1.0,
             "hanging_piece"|"passed_pawn"|"material_imbalance" => 0.9,
-            "rook_open_file"|"rook_seventh"|"outpost"|"development" => 0.8,
-            "king_exposed"|"isolated_pawn"|"doubled_pawn"|"pawn_islands" => 0.7,
+            "rook_open_file"|"rook_seventh"|"outpost"|"development"|"overloaded"|"false_defense"|"false_safety" => 0.8,
+            "king_exposed"|"isolated_pawn"|"doubled_pawn"|"pawn_islands"|"outnumbered" => 0.7,
             _ => 0.6,
         };
         let score = magnitude * c.severity as f64 * elo_relevance * confidence;
         Some(GatedIssue { name: c.name.clone(), severity: c.severity, elo_min: c.elo_min,
-            magnitude, elo_relevance, confidence, score, phrase: c.phrase.clone(), side: c.side })
+            magnitude, elo_relevance, confidence, score, phrase: c.phrase.clone(), side: c.side,
+            stage: ladder_stage(&c.name) })
     }).collect();
     issues.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     let has_critical = issues.iter().any(|i| i.severity >= 80 && i.elo_min <= 1000 && i.score > 10.0);
@@ -263,10 +359,13 @@ pub fn rank_issues_for_player(
 // ── Markov StateVector: compact position encoding for transition tracking ──
 
 /// Compact state ID for a chess position. Deterministic — same position → same state.
-/// Encodes phase, material balance, tactical flags, and positional features into ~13 bits.
+/// Encodes phase, material balance, tactical flags, and positional features into 19 bits.
+/// Widened from u16 to u32 when the failure-lattice rungs (`outnumbered`,
+/// `overloaded`, `false_defense`, `false_safety`) were added — u16 had
+/// exactly one free bit left, not four (PLAN.md).
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct StateVector {
-    pub state_id: u16,
+    pub state_id: u32,
     pub phase: u8,
     pub material_sign: i8,
     pub king_exposed: bool,
@@ -279,6 +378,10 @@ pub struct StateVector {
     pub has_passed_pawn: bool,
     pub has_skewer: bool,
     pub has_discovered: bool,
+    pub has_outnumbered: bool,
+    pub has_overloaded: bool,
+    pub has_false_defense: bool,
+    pub has_false_safety: bool,
 }
 
 /// Encode a position into a compact state ID from the sensor report and groups.
@@ -299,6 +402,15 @@ const BIT_OPEN_FILE: u32 = 11;
 const BIT_PASSED_PAWN: u32 = 12;
 const BIT_SKEWER: u32 = 13;
 const BIT_DISCOVERED: u32 = 14;
+// The failure-lattice rungs (PLAN.md, threat_graph.rs module doc): raw-count
+// (outnumbered), commitment-elsewhere (overloaded, false_defense), and the
+// composite rung above both (false_safety) — added together so a position's
+// full ladder depth is visible from state_id alone, not just its topmost
+// triggered rung.
+const BIT_OUTNUMBERED: u32 = 15;
+const BIT_OVERLOADED: u32 = 16;
+const BIT_FALSE_DEFENSE: u32 = 17;
+const BIT_FALSE_SAFETY: u32 = 18;
 
 /// One row per boolean bit: (bit position, predicate over the sensor report).
 /// Adding a new flag to `StateVector` means adding one row here and one field
@@ -320,6 +432,10 @@ const BOOL_BITS: &[(u32, SensorPredicate)] = &[
     (BIT_PASSED_PAWN,  |s| !s.positional.passed_pawns.is_empty()),
     (BIT_SKEWER,       |s| !s.tactical.skewers.is_empty()),
     (BIT_DISCOVERED,   |s| !s.tactical.discovered.is_empty()),
+    (BIT_OUTNUMBERED,    |s| !s.tactical.outnumbered.is_empty()),
+    (BIT_OVERLOADED,     |s| !s.tactical.overloaded.is_empty()),
+    (BIT_FALSE_DEFENSE,  |s| !s.tactical.false_defense.is_empty()),
+    (BIT_FALSE_SAFETY,   |s| !s.tactical.false_safety.is_empty()),
 ];
 
 pub fn encode_state(sensor: &SensorReport, groups: &EvalGroups, phase: u8) -> StateVector {
@@ -334,10 +450,10 @@ pub fn encode_state(sensor: &SensorReport, groups: &EvalGroups, phase: u8) -> St
     let material_sign: i8 = if mat > 300 { 2 } else if mat > 100 { 1 }
         else if mat < -300 { -2 } else if mat < -100 { -1 } else { 0 };
 
-    // Pack into u16 bitfield
-    let mut id: u16 = 0;
-    id |= (phase_bits as u16 & 0x3) << BIT_PHASE;
-    id |= ((material_sign + 2) as u16 & 0x7) << BIT_MATERIAL_SIGN;
+    // Pack into u32 bitfield
+    let mut id: u32 = 0;
+    id |= (phase_bits as u32 & 0x3) << BIT_PHASE;
+    id |= ((material_sign + 2) as u32 & 0x7) << BIT_MATERIAL_SIGN;
     for &(bit, check) in BOOL_BITS {
         if check(sensor) { id |= 1 << bit; }
     }
@@ -353,7 +469,7 @@ pub fn encode_state(sensor: &SensorReport, groups: &EvalGroups, phase: u8) -> St
 /// the `BIT_*` constants above with `encode_state`, so this and the packer
 /// can never disagree about the layout — unlike the ad hoc bit-shifting that
 /// used to live independently in `coach_derive_cmd.rs`'s "fast path".
-pub fn decode_state_id(sid: u16) -> StateVector {
+pub fn decode_state_id(sid: u32) -> StateVector {
     let bit = |b: u32| (sid >> b) & 1 != 0;
     StateVector {
         state_id: sid,
@@ -369,6 +485,10 @@ pub fn decode_state_id(sid: u16) -> StateVector {
         has_passed_pawn: bit(BIT_PASSED_PAWN),
         has_skewer: bit(BIT_SKEWER),
         has_discovered: bit(BIT_DISCOVERED),
+        has_outnumbered: bit(BIT_OUTNUMBERED),
+        has_overloaded: bit(BIT_OVERLOADED),
+        has_false_defense: bit(BIT_FALSE_DEFENSE),
+        has_false_safety: bit(BIT_FALSE_SAFETY),
     }
 }
 
@@ -397,5 +517,28 @@ pub fn attenuation(tier: SensorTier, chaos: f64) -> f64 {
         SensorTier::Threat => 1.0,
         SensorTier::Positional => 1.0 - chaos * 0.5,
         SensorTier::Strategic => (1.0 - chaos).max(0.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tested directly against ladder_stage rather than through
+    // rank_issues_for_position: every hand-built tactical test position in
+    // motif_canonical.rs also has a material imbalance (they're constructed
+    // around a specific tactic, not balance), which trips has_critical's
+    // "a critical low-ELO issue suppresses higher-level coaching" gate and
+    // filters overloaded/false_defense/false_safety (elo_min > 1200) out of
+    // the ranked output regardless of player_elo -- a real, deliberate
+    // behavior of that gate, just not what this test needs to exercise.
+    #[test]
+    fn ladder_stage_orders_the_five_piece_safety_rungs() {
+        assert_eq!(ladder_stage("hanging_piece"), 1);
+        assert_eq!(ladder_stage("outnumbered"), 2);
+        assert_eq!(ladder_stage("overloaded"), 3);
+        assert_eq!(ladder_stage("false_defense"), 3);
+        assert_eq!(ladder_stage("false_safety"), 4);
+        assert_eq!(ladder_stage("fork"), 0, "concepts outside this specific ladder must report stage 0, not be mistaken for rung 1");
     }
 }

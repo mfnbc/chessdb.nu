@@ -13,7 +13,7 @@
 #   plugin add nu_plugin_chessdb/target/release/nu_plugin_chessdb
 
 export use db.nu      [chess-init chess-status chess-seed-openings]
-export use sync.nu    [chess-sync chess-recent chess-review chess-explore]
+export use sync.nu    [chess-sync chess-recent chess-review chess-explore chess-tactical-events]
 export use derive.nu  [chess-derive chess-validate]
 export use profile.nu [
     chess-profile

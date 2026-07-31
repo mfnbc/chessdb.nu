@@ -14,7 +14,7 @@ struct PendingPos {
     fen: String,
     hugm_score: i64,
     hugm_eval_arr: String,
-    state_id: u16,
+    state_id: u32,
     mate_in_1: i64,
     is_checkmate: i64,
 }
@@ -168,7 +168,7 @@ impl PluginCommand for ProcessCorpus {
                                 serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string());
                             (rec.final_score, json_str, sid, mi1, cm)
                         }
-                        Err(_) => (0, "[]".to_string(), 0u16, 0, 0),
+                        Err(_) => (0, "[]".to_string(), 0u32, 0, 0),
                     };
                 PendingPos {
                     zobrist: fe.zobrist.clone(),

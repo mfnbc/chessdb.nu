@@ -7,7 +7,7 @@ use crate::eval::threat_graph::EvaluatedFork;
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SensorReport {
     pub fen: String,
-    pub state_id: u16,
+    pub state_id: u32,
     pub material: MaterialConceptReport,
     pub tactical: TacticalReport,
     pub positional: PositionalReport,
@@ -38,6 +38,10 @@ pub struct TacticalReport {
     pub skewers: Vec<Skewer>,
     pub discovered: Vec<DiscoveredAttack>,
     pub hanging: Vec<HangingPiece>,
+    pub outnumbered: Vec<Outnumbered>,
+    pub overloaded: Vec<Overloaded>,
+    pub false_defense: Vec<FalseDefense>,
+    pub false_safety: Vec<FalseSafety>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

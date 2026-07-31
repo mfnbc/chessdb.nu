@@ -2328,3 +2328,721 @@ separately-scoped piece of work). Production functions now reading from the shar
 `ThreatGraph` continuity map: `hanging_piece`, `detect_outposts`, `in_check`,
 `king_safety_score`, `development_space_score`, `piece_activity_score` — six, up from
 zero at the start of this thread.
+
+Design principle: pathfind the graph, don't calculate the exchange
+
+Stated explicitly by the user and binding for everything downstream of this point:
+**HUGM detects and cross-references patterns; it does not search or calculate exchanges
+precisely — that's the real engine's job.** The reasoning given: a real engine
+integration is coming later, and this system isn't meant to compete with it — it's
+closer to a fast, approximate "does this look right" signal (the NNUE comparison) than a
+calculator. This directly changes how the deferred `see_chain` bug should eventually be
+handled: the fix is correcting the wrong operand (price what's captured, not who's
+capturing), *not* adding the standard algorithm's backward-minimax refinement (whether a
+rational side actually keeps recapturing) — that refinement is exactly the "brute-force
+precision" this system is deliberately not chasing.
+
+The concrete design direction that follows from the principle: several tactical patterns
+that look like they need calculation actually reduce to *structural* queries against the
+`attackers_to` graph already built — noticing when two already-known facts overlap,
+rather than simulating anything. Two instances, both scoped here:
+
+**1. Overload** — the mirror image of a fork. A fork is one piece attacking 2+ enemy
+targets; overload is one piece being the *sole* defender of 2+ of its own side's
+currently-attacked pieces. If that piece is captured, distracted, or pinned, everything
+it was solely covering becomes as undefended as a zero-defender hanging piece today.
+Pure `attackers_to` lookup, no cross-referencing another detector needed: for each of
+`color`'s pieces `D`, find every other piece `T` (of the same color, currently attacked
+by the enemy) where `D` is `T`'s *only* defender; if `D` is sole defender for 2+ such
+`T`, `D` is overloaded.
+
+**2. False defense (pin cross-reference)** — a piece can pass `hanging_piece`'s
+zero-defender check and still not really be defended, if its only defender is pinned.
+Real subtlety, checked before implementing rather than assumed: a pinned piece *can*
+still legally recapture if the recapture square lies on the same line as the pin itself
+(pin restricts moving *off* the attacker–king line, not moving *along* it) — so "defender
+appears in the pins list" alone isn't sufficient; needs an actual collinearity check
+(`attacks::ray(pin.attacker, pin.shielded)` contains the target square) or it will
+produce real false positives in a common pattern (recapturing along the same file/
+diagonal the pin sits on). Scoped for the immediate next pass, not yet implemented in
+this one — starting with the simpler, self-contained `overload` first and verifying it
+completely before taking on the collinearity subtlety.
+
+Both are explicitly *not* search: no move is simulated, no position is played out, no
+exchange is priced beyond reusing each target's already-known `piece_value`. Just
+noticing what the graph already implies.
+
+Implemented: overload — the first "pathfind the graph" concept
+
+**New**: `ThreatGraph::find_overloaded(color) -> Vec<Overloaded>`. For each of `color`'s
+pieces `D`, check every other same-color piece `T`: if `T` is currently attacked by the
+enemy and `D` is `T`'s *sole* defender (`attackers_to[T] & own_color` has exactly one
+member and it's `D`), `T` goes in `D`'s `critical_for` list. `D` is overloaded once
+`critical_for.len() >= 2`. `critical_value` (sum of `critical_for`'s piece values) is
+computed right there, where the real `Role` enum is on hand — same reasoning as
+`HangingPiece.value`, not re-derived from `PieceRef.role` strings later.
+
+New types: `Overloaded{piece, critical_for, critical_value}` (`concept_types.rs`),
+`TacticalReport.overloaded: Vec<Overloaded>` (`sensor.rs`), wired into
+`build_sensor_report` (both colors, same pattern as `find_hanging`) and
+`unflip_sensor_report` (both `piece` and every entry in `critical_for` need the
+color/square correction, not just the first — verified explicitly, see below). New
+concept in `extract_concepts`: `"overloaded"`, ELO 1400 (needs the same "what happens if
+I remove this piece" coordination insight as `discovered_attack`, which sits at the same
+tier), severity = `critical_value`, confidence tier 0.8 (alongside
+`rook_open_file`/`outpost`/`development` — a real vulnerability but one step short of a
+forcing tactic, since the opponent still has to actually target both pieces to cash it
+in, unlike `fork`/`pin`/`skewer` at the top tier).
+
+Verified precisely before trusting it, same discipline as everything else in this
+thread — not just "compiles and tests pass":
+- Hand-built a position (`rr2k3/8/8/1R6/R7/2N5/8/4K3 w - - 0 1`) where a White knight on
+  c3 is provably the sole defender of two rooks (a4 via the open a-file, b5 via the open
+  b-file) — checked by hand that rooks don't defend each other diagonally, so the knight
+  is genuinely the only common link, not a construction artifact. Confirmed detected,
+  `critical_value = 1000` (500+500).
+- Negative case: added a second defender for one of the two targets (a rook on b1 also
+  covering b5) — confirmed the knight drops out of the overloaded list entirely, since
+  it's now sole-responsible for only one target (the `>= 2` threshold is the actual
+  definition, not "defends something").
+- Flip-invariance: hand-built the Black-to-move mirror of the identical physical fact and
+  confirmed the mirrored knight reports as `Side::Black` at real square `c6` (not
+  White/c3), and every `critical_for` entry — not just checked in aggregate, each
+  square/color individually asserted — comes back in real terms too. This is exactly the
+  kind of bug `unflip_sensor_report` would produce if the `critical_for` loop were
+  forgotten (easy to do, since it's a `Vec` nested inside the flipped struct, not a single
+  field).
+
+All three verifications promoted to permanent tests: `overloaded_piece_is_detected`,
+`single_responsibility_is_not_overloaded`, `overloaded_piece_survives_the_flip_with_real_terms`.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (43 lib unchanged, 17
+motif tests up from 14 — all three new); `cargo clippy --all-targets` zero warnings; STS
+smoke test passes.
+
+**Not yet implemented**: the false-defense (pin cross-reference) design from the entry
+above — scoped, including the collinearity subtlety, but not started. Natural next step
+in this thread.
+
+Implemented: false_defense — and caught a real geometry bug before it ever ran
+
+**New**: `ThreatGraph::find_false_defense(color, pins: &[Pin]) -> Vec<FalseDefense>`. For
+each of `color`'s attacked-but-defended pieces (nonzero raw defender count, so
+`find_hanging` doesn't touch them), checks every defender: is it in the `pins` list's
+`pinned` set, and if so, is the defended square on that pin's legal recapture line? Only
+if *every* defender is pinned-and-off-line does the piece count as falsely defended.
+Takes `pins: &[Pin]` as a parameter rather than detecting them itself — `ThreatGraph`
+doesn't know about pins (see this file's own module doc); this is a genuine
+cross-reference between two independently-computed facts, the first instance of that
+shape in this thread rather than a self-contained graph query like `find_overloaded`.
+
+**Caught before ever running a test, by re-deriving the chess rule from first
+principles instead of trusting the first implementation**: the initial version used
+`attacks::ray(attacker, king)` for "is this square on the pin line" — wrong.
+`attacks::ray()` returns the *infinite* line through both points, extending past both
+endpoints in both directions. A pinned piece can only legally move to squares *strictly
+between* the attacker and its own king, or capture the attacker itself — moving to a
+square beyond the king, on the far side from the attacker, exposes the king exactly as
+much as moving off the line entirely (confirmed by tracing a concrete example by hand:
+a rook pinned on a file, moved past its own king to the far side, no longer shields it
+at all). Fixed to `attacks::between(attacker, king) | Bitboard::from(attacker)` — the
+correct legal-squares primitive — before writing a single test against it.
+
+**A second, more interesting thing verified while designing the test**: tried to
+construct a position where a pinned defender *could* legally recapture on-line (to prove
+the collinearity check's positive branch actually works), and discovered it's
+architecturally impossible given this codebase's `detect_pins` implementation. `detect_pins`
+requires the *entire* segment between attacker and king to be clear except for the one
+candidate blocker (it checks `before`/`after` attack patterns with that whole segment's
+real occupancy) — so any third piece sitting anywhere on the pin line prevents the pin
+from being detected at all, before the collinearity question can even arise. Verified this
+directly, not just reasoned about it: built a position with a third piece deliberately
+placed on the segment and confirmed `detect_pins` reports zero pins for it. So the
+`between`-based collinearity check is correct and worth keeping (defensive, and would
+matter if `detect_pins` is ever generalized to x-ray/relative pins), but its positive
+branch is currently unreachable through this codebase's own pin detector — not a bug,
+just a fact about the current system worth recording so it isn't mistaken for untested
+dead code later.
+
+Verified with three hand-built positions (same discipline as `overloaded`): a real
+false-defense (`Ba5` pins `Nc3` to `Ke1` along the `a5–e1` diagonal; `Nc3` is `Rb1`'s only
+defender, but `b1` isn't on that diagonal — flagged, `value: 500`), an unpinned-defender
+negative (remove the pinning bishop, keep the attacking rook — correctly not flagged), and
+a mixed-defenders negative (add a second, unpinned defender alongside the pinned one —
+one real defender is enough, correctly not flagged). Flip-invariance verified the same
+way as `overloaded` — hand-built the Black-to-move mirror, confirmed both the
+falsely-defended piece and `pinned_defenders` come back in real terms, not just the
+piece's own field.
+
+New concept `false_defense` (ELO 1600 — needs pin recognition at 1200 plus the extra
+inferential step that changes the picture; confidence tier 0.8, alongside `overloaded`).
+All five verifications promoted to permanent tests:
+`false_defense_is_detected_when_the_only_defender_is_pinned_off_line`,
+`unpinned_defender_is_not_a_false_defense`,
+`one_real_defender_among_several_is_enough_to_not_be_false_defense`,
+`false_defense_survives_the_flip_with_real_terms`.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (43 lib unchanged, 21
+motif tests up from 17 — four new); `cargo clippy --all-targets` zero warnings; STS smoke
+test passes.
+
+Both concepts scoped in the "pathfind the graph" design entry are now implemented. This
+thread (mate_in_1 → material_score → hanging_piece → ThreatGraph continuity primitives →
+six migrated production functions → overload → false_defense) has been building
+continuously since the ELO-ladder walkthrough began; nothing in it is committed yet.
+
+Completeness gap found and closed: outnumbered
+
+User's question, "is this complete?", answered precisely rather than just agreed with:
+no — `find_hanging` (zero defenders) and `find_false_defense` (defenders exist but are
+all pinned-and-ineffective) leave a real gap between them: a piece with *some* real,
+unpinned defenders where attackers simply outnumber them (e.g. 2 attackers, 1 defender)
+isn't caught by either. That's `control(sq, color) < 0` on an occupied square — the
+single most direct application of the `control` primitive built first in this whole
+thread, skipped over in favor of the two more elaborate cross-references. No good excuse
+beyond: built bottom-up (migrate existing code, then pivot to new patterns), and reached
+for the flashier compound patterns before the plain direct one.
+
+**New**: `ThreatGraph::find_outnumbered() -> Vec<Outnumbered>` — same calling convention
+as `find_hanging` (no color parameter, single pass over `Square::ALL`, not
+`find_overloaded`/`find_false_defense`'s per-color-call shape), since it's structurally
+`find_hanging`'s closest sibling: same per-square attacker/defender count check, just
+`>` instead of `== 0`. `Outnumbered{piece, attacker_count, defender_count, value}`. New
+concept `outnumbered`, ELO 800 — between `hanging_piece` (600, no defenders at all) and
+`fork` (1000, needs seeing a double-attack pattern) — confidence tier 0.7 (lower than
+`hanging_piece`'s 0.9, since piece values could still make the actual trade fine; that's
+exactly the pricing question this system deliberately doesn't calculate).
+
+Verified with the same discipline as `overloaded`/`false_defense`: a hand-built position
+(white pawn d4, attacked by `Rd8` open-file and `Ba7` diagonal = 2 attackers, defended
+only by `Rd1` = 1 defender) confirmed detected; two negative cases (2-attackers-2-defenders,
+and 1-vs-1 with the second attacker removed) confirmed *not* flagged — "outnumbered"
+means strictly more attackers than defenders, not "is attacked at all"; flip-invariance
+confirmed with a hand-built Black-to-move mirror. Four new permanent tests:
+`outnumbered_piece_is_detected`, `equal_attacker_defender_count_is_not_outnumbered`,
+`outnumbered_piece_survives_the_flip_with_real_terms`.
+
+Also confirmed, precisely rather than by assumption: pin/skewer/fork's relationship to
+`control` is not uniform. Fork (`attacks_from[sq]`, one piece's reach) and skewer
+(alignment of two enemy pieces on one ray) are sibling queries over the same graph data,
+not derived from `control` specifically. Pin genuinely is a `control`-derivative hiding
+in plain sight — "does removing this piece flip control of my king's square from safe to
+attacked" is exactly what `detect_pins`'s before/after `rook_attacks`/`bishop_attacks`
+comparison already computes, just not through `ThreatGraph.control()` (pins are "not
+built from this graph at all," per this file's own module doc). A
+`control_if_removed(sq, color, removed_sq)` primitive would make that relationship
+explicit and could genuinely replace `detect_pins`'s implementation — scoped as a future
+direction, not started.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (43 lib unchanged, 24
+motif tests up from 21 — four new); `cargo clippy --all-targets` zero warnings; STS smoke
+test passes. `threat_graph.rs`'s module doc updated to describe `find_outnumbered`
+alongside `find_hanging` as the two direct `control` applications.
+
+## 2026-07-30: the failure lattice — `false_safety`, and reporting every rung to the database
+
+User's framing, verbatim, after the `outnumbered`/`overloaded`/`false_defense` work above:
+"I feel like it is a 'threat' with a ladder of validation. Sure its under attack, but is
+it defended, and if it is how well is it defended vs attacked, and if there is overlap are
+any of the involved pieces committed to protecting the king (pin) or another piece
+(overload), and later into positional guides like center or flanks... it is increasingly
+nuanced and strategic all the way up." Then, asked to consolidate, document, and make sure
+the database can report every layer of that ladder — explicitly so a coaching system can
+distinguish "you counted attackers vs defenders correctly and still missed the tactic
+(because you didn't see a commitment)" from "you didn't even count right" — a genuine
+skill-level diagnostic, not just a flat list of concept names.
+
+**The lattice, precisely, confirmed against the code that already existed:**
+1. Attacked at all? Shared precondition every rung below checks first, not a concept.
+2. Defended at all? `find_hanging` (0 raw defenders) and `find_outnumbered` (>0 raw
+   defenders, still fewer than attackers) are two halves of one raw-count comparison,
+   split only because certainty differs.
+3. Is a raw defender actually free to help? `find_overloaded` (from the defender's side:
+   am I already the sole defender of something else?) and `find_false_defense` (from the
+   attacked piece's side: are *all* my defenders pinned off the recapture line?) are
+   siblings, not one step — different anchor point, different strength of constraint
+   (overload is soft/costly, pin is hard/illegal).
+4. Does that change the verdict the raw count gave? This rung was missing — nothing
+   cross-referenced `overloaded`/`false_defense`-style commitment facts back against a
+   raw count that, read alone, said "safe." That's the specific miss the user described:
+   "you have more attacking than defending... but failed to recognize the other
+   commitments of those pieces" when the *raw numbers* looked fine.
+
+**New: `ThreatGraph::find_false_safety(color, pins, overloaded) -> Vec<FalseSafety>`**
+(`threat_graph.rs`). Fires exactly when `raw_defender_count >= attacker_count` (so neither
+`find_hanging` nor `find_outnumbered` touch it — this rung only exists where the raw count
+alone would have said "safe") but discounting defenders that are pinned off-line *or*
+overloaded elsewhere drops the effective count below the attacker count. Deliberately a
+*partial*-discount generalization of `find_false_defense`'s all-or-nothing check, not a
+replacement for it — `false_defense` still reports its own narrower fact (every defender
+compromised) standalone; `false_safety` is the new, wider net that also catches the
+partial case (2 of 3 defenders fine, but 1 compromised one flips a borderline count) and
+folds in overload as a second compromise source pin-only `false_defense` never considered.
+`FalseSafety{piece, attacker_count, raw_defender_count, effective_defender_count,
+compromised_defenders, value}` — both counts carried, not just the conclusion, exactly so
+a report (or a database row) can show the gap between what the bare numbers said and
+what's actually true. New concept `false_safety`, ELO 1800 (above both `overloaded`/1400
+and `false_defense`/1600 — it requires composing either with a count that looks fine on
+its own), confidence tier 0.8 (same as its two constituent facts).
+
+Verified with a deliberately non-overlapping test position (`threat_graph.rs`'s own
+"pathfind the graph" discipline extended to test design too): white pawn d4 attacked by
+`Rd8` + `Ba7` (2 attackers), defended by `Rd1` (genuinely free) and `Nb3` (defends d4 by
+knight-move, but pinned to `Kb1` by `Rb8` along the b-file — d4 isn't on that line) = 2 raw
+defenders, 1 effective. Chosen specifically so only 1 of 2 defenders is compromised —
+`false_defense`'s all-or-nothing check does *not* also fire on this position, confirmed in
+the test itself, so the two concepts are shown to report genuinely different facts, not
+duplicates. Negative test: same position plus a third free defender (`Bb2`) restores
+effective count to exactly the attacker count — not flagged (boundary is strict `<`, not
+`<=`). Flip-invariance test confirmed both the piece and every `compromised_defenders`
+entry unflip correctly. Three new permanent tests in `motif_canonical.rs`.
+
+**Database reporting — preserving every rung, not collapsing them into one signal.**
+Traced the actual reporting path (it's `chessdb/*.nu`, not anything inside the Rust
+crate — no sqlite/rusqlite code lives in `nu_plugin_chessdb` itself): `StateVector`
+(`concepts.rs`) packs a compact per-position bitfield, stored as `positions.state_id` and
+decoded once into named `move_states` boolean columns (`chessdb/db.nu`,
+`chessdb/sync.nu`) — never re-shifted downstream, per the existing convention documented
+in both files. `coach_derive_cmd.rs`'s `compute_baselines`/`detect_anomalies` read those
+booleans to build per-player, per-phase Welford baselines (`player_baselines`) and flag
+eval-swing anomalies (`move_anomalies.concept_name`), which `chessdb/profile.nu` then
+aggregates into player-facing KPIs (`tactical-concepts`, `tactical-phase-breakdown`,
+`tactical-win-impact`, `profile-concepts`, `concept-examples`).
+
+That pipeline only reports what's in `StateVector` — and `state_id` was a `u16` with
+exactly **one** free bit (bits 0-14 already used: 2 for phase, 3 for material sign, 10
+single-purpose flags; bit 15 was the last one). Four new rungs need four new bits.
+Widened `StateVector.state_id` (and `SensorReport.state_id`, and every `u16` call site
+that touched it: `process_corpus.rs`'s `PendingPos.state_id`, `coach_derive_cmd.rs`'s
+`MoveRecord.state_id`) from `u16` to `u32` — bits 15-18 now `BIT_OUTNUMBERED`,
+`BIT_OVERLOADED`, `BIT_FALSE_DEFENSE`, `BIT_FALSE_SAFETY`. `encode_state`/`decode_state_id`
+needed no logic change beyond the wider integer type, by design (this is exactly what
+their "add one row to `BOOL_BITS`, one field to the struct" contract was built for).
+
+Wired the four new booleans through every layer that already handled the existing ten,
+same shape, no new abstraction:
+- `coach_derive_cmd.rs`: added to both `check_concepts` arrays (`compute_baselines`,
+  `detect_anomalies`) and `state_vector_to_value`'s field list. The fast/slow-path
+  agreement test (`fast_path_and_slow_path_agree_on_state_id`) needed no changes — it
+  compares whole `StateVector`s field-by-field already, so it started exercising the new
+  bits automatically.
+- `chessdb/db.nu`: four new `move_states` columns (`has_outnumbered`, `has_overloaded`,
+  `has_false_defense`, `has_false_safety`), same `ALTER TABLE ADD COLUMN` + backfill
+  pattern as the existing `has_outpost`/`has_open_file`/`has_passed_pawn` migration —
+  with one honest caveat written into the comment: rows whose `positions.state_id` was
+  computed before this widening backfill to `false` regardless of the position's real
+  properties, because those bits simply didn't exist yet to be set. Historic data needs
+  positions re-evaluated (not just `move_states` re-derived) to get real values here —
+  same limitation any bit added to an already-populated cache column has.
+- `chessdb/sync.nu`: the same four bit-shifts added to `import-records`'s `move_states`
+  INSERT.
+- `chessdb/profile.nu`: widened the three tactical `concept_name IN (...)` allow-lists
+  (`tactical-concepts`, `tactical-phase-breakdown`, `tactical-worst-games`) to include the
+  four new names, and extended `tactical-win-impact`'s hand-rolled pivot (both
+  `player_flags`/`opp_flags` CTEs, eight new `UNION ALL` blocks) the same mechanical way
+  its existing fork/pin/hanging_piece rows were built. `profile-concepts` and
+  `concept-examples` needed no changes — they already select all `concept_name != 'hugm_delta'`
+  rather than hardcoding a list, so they pick up the new rungs automatically.
+
+The result: a player's specific failure depth is now a queryable fact, not just an
+aggregate "missed a tactic" signal — `tactical-concepts`/`tactical-phase-breakdown` can
+show whether a player's anomalies cluster at `outnumbered` (can't count) vs `false_safety`
+(counts fine, misses commitments) vs `overloaded`/`false_defense` (sees the commitment
+type but not the count interaction) — the actual skill-ladder diagnostic the user asked
+for, not a proxy for it.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (43 lib, 27 motif tests —
+three new); `cargo clippy --all-targets` zero warnings; STS smoke test passes; `nu -c "use
+chessdb *"` confirms `db.nu`/`sync.nu`/`profile.nu` still parse after the schema and query
+changes. `threat_graph.rs`'s module doc gained a "failure lattice" section laying out the
+four rungs explicitly, matching this entry.
+
+## 2026-07-31: correction — "know," not "save"; and `GatedIssue.stage`
+
+User pushback on the entry above, verbatim: "I think you took me too literally. I want to
+be able to know each condition not necessarily save each condition. Its all part of the
+ladder, at what point do you check more deeply." Then, once asked whether the LLM coach
+could discover these patterns itself instead of being told: "we have to tell the LLM at
+least through the tactical layer, and possibly much through the strategic layer." Then,
+concretely: "we need to communicate where on the progression of calculation the player
+failed."
+
+**What this actually corrected**: not the Rust-side detection (`find_false_safety` etc.
+stays exactly as built), but the DB persistence layer added right after it — widening
+`state_id`, four new `move_states` columns, `coach_derive_cmd.rs` baseline/anomaly wiring,
+`profile.nu`'s win-impact extension. That whole apparatus treats each rung as its own
+independently-tracked, independently-baselined cross-game statistic (Welford means,
+z-scores, win-rate pivots) — a different question ("does this player historically blunder
+more when overloaded") than what's actually needed ("does the coach, looking at *this*
+position, know the full ladder to explain *this* mistake"). The second is already answered
+by `chessdb hugm-eval`'s `gated_issues` (`hugm_eval_cmd.rs:153`, copied straight from
+`sensor_report.gated_issues`) — no schema needed. The DB layer stays in the tree
+(reverting it wasn't asked for either — "not necessarily save" leaves room for it) but
+isn't the mechanism doing the actual coaching-time communication.
+
+**The three-layer framing, user's words, mapped onto real code**: control (the geometric
+map, `ThreatGraph.control`) → tactical value of control net of the opponent's (where
+exchanges/blunders happen — the whole failure lattice, `hanging`→`outnumbered`→
+`overloaded`/`false_defense`→`false_safety`) → strategic value of control net of the
+opponent's (center/flank/king-zone importance — substrate exists as `zone_control`, no
+concept built on it yet). Resolved where the LLM-vs-precompute line falls, and it isn't
+"tactical vs strategic": it's whether producing the fact requires **exhaustive, exact
+enumeration across the board** (must be computed and told — this is every rung of the
+ladder, and will be true of strategic zone-control numbers too) vs. **classification of a
+few already-clean summary numbers** (fine to hand the LLM raw and let it reason — e.g.
+phase-from-material-count, which turned out to not even be LLM-facing today: grepped
+`sensor.rs`/`concept_types.rs`/`hugm_eval_cmd.rs`, `phase` appears in none of them — it's
+internal engine plumbing for `compute_groups`'s tapered-eval weight blending and
+`encode_state`'s phase bucket, never a coaching fact, so nothing was actually undermined
+by concluding the LLM could do that judgment itself).
+
+**Concrete fix for "communicate where the progression failed"**: checked the five ladder
+concepts' existing phrases. `false_defense`/`false_safety` already narrate the progression
+explicitly ("looks defended but..."/"looks defended by the count... but..."). `outnumbered`
+didn't — rewrote its phrase to `"{color}'s {role} has a defender, so it isn't simply
+hanging, but is still outnumbered (...)"`, stating the shallower check (not hanging) that
+passed before the one that failed. `hanging_piece` needs no such framing (rung 1, nothing
+shallower exists). `overloaded` is anchored on the *defender's* vantage point, not a
+specific victim's verdict, so it can't take the same "looks X but Y" shape without
+picking one arbitrary target from `critical_for` — left as its own standalone fact; the
+connection to a specific victim's false verdict is already made explicitly wherever
+`false_safety`/`false_defense` name that defender in `compromised_defenders`/
+`pinned_defenders`.
+
+Also added a machine-legible anchor, not just prose: `GatedIssue.stage: u8`
+(`concept_types.rs`) — 1=`hanging_piece`, 2=`outnumbered`, 3=`overloaded`/`false_defense`,
+4=`false_safety`, 0 for everything outside this specific ladder. Computed by a new
+`ladder_stage(name) -> u8` helper (`concepts.rs`), called from both
+`rank_issues_for_position` and `rank_issues_for_player` right where `confidence` is
+already matched on `c.name` — same pattern, same place. Deliberately not a new field on
+`Concept` (would have required touching every one of the ~15 `Concept{...}` construction
+sites for a field only 5 of them need) — `GatedIssue` is built via `filter_map` in exactly
+two places already, so the derivation lives there instead.
+
+Verification note: tried testing `stage` through `rank_issues_for_position` on the existing
+`overloaded`/`false_defense`/`false_safety` test positions first — all three failed, because
+every hand-built tactical test FEN has *some* material imbalance (they're built around one
+specific tactic, not material balance), and `rank_issues_for_position`'s existing
+`has_critical` gate ("a critical low-ELO issue suppresses higher-level coaching") retains
+only `elo_min <= 1200` whenever a `severity >= 80, elo_min <= 1000, score > 10` issue
+coexists — which `material_imbalance` (`elo_min: 600`) always does in these positions,
+regardless of player_elo. That's a real, deliberate, pre-existing behavior (worth noting: it's
+itself a form of the same "communicate the right depth" principle — don't hand a beginner
+false_safety-level nuance when they're one move from losing a whole piece for free) — just
+not the thing these particular tests needed to exercise. Moved the `stage` check to a
+direct unit test of `ladder_stage()` in a new `concepts.rs::tests` module instead
+(`ladder_stage_orders_the_five_piece_safety_rungs`), and kept the `rank_issues_for_position`-
+based stage checks only on `hanging_piece`/`outnumbered` (`elo_min` 600/800, both survive
+the retain) in `motif_canonical.rs`. Also added a phrase-content assertion on the rewritten
+`outnumbered` phrase.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (44 lib — one new; 27 motif
+tests, phrase assertion added, no new test count change); `cargo clippy --all-targets` zero
+warnings; STS smoke test passes.
+
+## 2026-07-31: `collapse_criticality` — clear the cluster, place each candidate back, no move order
+
+Motivating problem, user's example: "a brilliant move can look like a hanging piece." A
+queen sac with zero raw defenders fires `find_hanging` at rung 1 — the shallowest, most
+confident-looking signal in the whole lattice — but "zero defenders" says nothing about
+whether the capturing piece then walks into disaster. Closing that gap by actually
+simulating the position after the capture is exactly the search this system was built to
+avoid ("I don't want to compete with the real engine").
+
+**Two design attempts, both caught and corrected before landing:**
+
+1. First attempt: pick the *least-valuable attacker* and substitute it onto the victim's
+   square (discard victim, discard capturer's origin, place capturer on the square). User
+   caught this immediately: "you are still thinking too much like an engine... this looks
+   almost entirely like a move by move calculation." Choosing *which* piece recaptures is a
+   move decision, the exact thing every other primitive in this file avoids.
+2. Second attempt: remove cluster members one at a time from the otherwise-unchanged board
+   (see the superseded design notes originally here). User corrected this too: "it shouldn't
+   remove just one piece, it should remove all related pieces controlling that square, and
+   then put each in that square." Removing one piece while the rest of the cluster still
+   sits on the board doesn't cleanly answer "if this piece is the one left standing once
+   everyone else contesting the square had traded off, is that safe for it" — the other
+   still-present cluster members confound the reading.
+
+**The mechanic that stuck**: clear the *entire* local cluster first — every attacker, every
+defender, the occupant, all removed in one pass, giving a clean board. Then, one candidate
+at a time, place *just that piece* back onto the contested square and rebuild the graph
+fresh. No capture order, no recapture choice, nobody moves anywhere except the one
+placement being tested — a structural "if this is the piece left standing here, is that
+actually safe for it," independent of which order any real exchange would happen in. This
+identifies false defenders directly and generally: a piece whose own king ends up in check
+(or checkmate) once it's the one occupying the square cannot actually go there safely,
+whatever the raw attacker/defender count said — the same underlying fact `find_false_defense`
+narrowly checks via pin-list membership, now discoverable for *any* piece via one clear-and-
+place operation. "Those can live just as counts and which piece that delta came from" (user,
+verbatim) — no verdict baked in, just readings for the caller to interpret.
+
+**Implementation** (`threat_graph.rs`):
+- `ThreatGraph::build` split into `build(chess: &Chess)` (now one line) and
+  `build_from_board(board: Board, turn: Color)` — the actual construction logic, which never
+  touched anything legality-dependent (castling rights, move history) to begin with, just
+  `board.attacks_from`/`attacks_to`/`king_of`. Lets a graph be built on a *hypothetical*,
+  not-necessarily-legally-reachable board.
+- `king_ring` relocated from `position.rs` (`pub fn`, unchanged body) — a zone *definition*
+  ("the box he's being put in," user's phrase), belongs next to `zone_control`, not bundled
+  with the legacy scoring functions that happen to consume it as a mobility mask.
+- `PieceCriticality` (`concept_types.rs`, marked EXPERIMENTAL, not wired into
+  `TacticalReport`/`extract_concepts`): `piece: PieceRef` (the candidate being tested),
+  `square_control_delta`, `white_king_zone_delta`, `black_king_zone_delta`,
+  `own_king_in_check`, `own_king_checkmated`, `delivers_check`, `delivers_checkmate`.
+- `ThreatGraph::collapse_criticality(&self, sq: Square) -> Vec<PieceCriticality>`: builds the
+  cluster from `attackers_to[sq]` plus the occupant, discards the whole cluster into a
+  `clean_slate` board once, then for each cluster member clones `clean_slate`, places that
+  one piece back on `sq`, rebuilds via `build_from_board`, and reads `control`/`zone_control`
+  deltas against the real position plus `is_in_check` for both colors on the hypothetical.
+- Checkmate is a best-effort enrichment on top of the always-reliable `is_in_check`, not a
+  replacement: `is_checkmate_best_effort(board, turn)` builds a `Setup` and calls
+  `Chess::from_setup` — which validates full legality (exactly one king per side, etc.) —
+  and treats any rejection as simply "not checkmate" rather than propagating an error. This
+  matters concretely: whenever a *king* is itself part of the cluster (common near actual
+  king safety questions), every other candidate's hypothetical is missing that king
+  entirely, and `from_setup` correctly refuses to call that a position at all.
+- Folds in the "check, capture, control" hierarchy (checks, then captures, then
+  positional control — the priority order for scanning a position, user's framing) directly
+  into the three kinds of readings returned, rather than a separate classification pass:
+  `own_king_in_check`/`checkmated` and `delivers_check`/`checkmate` are the check tier;
+  `square_control_delta` is the capture tier; the king-zone deltas are the control tier.
+
+**Verified** with a hand-derived, then code-confirmed position: `"7k/8/8/5P2/7n/8/8/4K2R w
+- - 0 1"` — White `Rh1`+`Pf5`+`Ke1`, Black `Nh4`+`Kh8`. The knight on h4 is the pawn f5's
+sole attacker *and* blocks White's rook from the entire h-file. Cluster is `{pawn f5, knight
+h4}`; clean slate removes both. Hand-derived every `control`/`zone_control` value
+square-by-square for both candidates before writing the test, then let the actual run
+confirm — passed on the first run both times this session (this design and its
+predecessor), no arithmetic corrections needed:
+- Pawn candidate (knight simply absent from this hypothetical): `square_control_delta: 1`
+  (nothing attacks f5 any more), `black_king_zone_delta: -2`, `delivers_check: true` — the
+  h-file is open regardless of who's on f5, since the knight's absence alone reopens it.
+- Knight candidate (as if it had captured and were the one standing on f5):
+  `square_control_delta: -1`, `black_king_zone_delta: -1`, `own_king_in_check: true` — the
+  knight vacating h4 to occupy f5 leaves *its own* king in check. This is the precise shape
+  of "brilliant move looks like a hanging piece": the piece that would do the capturing is
+  the one that can't actually afford to.
+- Neither candidate is checkmate in this position (Black's king still has g7/g8) — both
+  `own_king_checkmated`/`delivers_checkmate` correctly read false, confirming the
+  best-effort checkmate check agrees with "just check" rather than over- or under-calling it.
+- A second position (`"7k/6n1/8/8/8/8/8/6QK w - - 0 1"`, cluster `{queen g1, king h8,
+  knight g7}`) confirms the king-in-cluster case degrades gracefully: every candidate but
+  the king itself leaves Black's king missing from the hypothetical, and the checkmate
+  check reads false without panicking, for all three candidates.
+- A negative control: an empty, unattacked square returns an empty cluster.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (47 lib — three new; 27
+motif tests unchanged); `cargo clippy --all-targets` zero warnings; STS smoke test passes.
+
+**Explicitly not done yet** (stays an experiment per the user's framing, "right now this is
+an experiment"): not wired into `TacticalReport`, `extract_concepts`, or the failure lattice.
+Open questions before it could be: what swing magnitude is "significant" enough to flag as
+compensating for an apparent hang; whether this should run automatically for every
+`find_hanging`/`find_outnumbered`/`find_false_safety` hit (expensive — one `ThreatGraph`
+rebuild per cluster member) or only on demand; and whether the several readings returned
+should combine into one severity number or stay separate for the caller to weigh.
+
+### Same day, follow-up: consolidate through shakmaty, and surface more than just the king
+
+Two more corrections, same design, both from continuing to question "are we reinventing
+something shakmaty already gives us, and are we only looking at the king?"
+
+**Consolidated check/checkmate through one shakmaty round-trip.** Original version ran two
+separate mechanisms per candidate: the graph's own `is_in_check` (cheap, geometry-only) for
+"check," and a *separate* `Chess::from_setup` construction only for "checkmate" — user asked
+directly whether this was reinventing something shakmaty already answers. It wasn't fully —
+`is_in_check` already existed specifically *because* it avoids "a second, separate shakmaty
+call" (its own doc comment, from earlier this session) — but running a second, independent
+shakmaty construction alongside it for checkmate, without also trusting that same
+construction's `is_check()`, was an inconsistency worth fixing. `is_checkmate_best_effort`
+replaced with `check_and_mate_via_shakmaty(board, turn) -> Option<(bool, bool)>`: one
+`Chess::from_setup` per color now answers *both* questions when it succeeds (`chess.is_check()`
+and `chess.is_checkmate()`, both cheap reads off the same constructed position); falls back to
+`graph.is_in_check(...)` only when `from_setup` rejects the hypothetical outright (still no
+fallback for checkmate — that genuinely needs shakmaty's legal move generation, nothing
+graph-native replicates it). Net effect: half as many shakmaty constructions per candidate,
+same answers (all four existing assertions on the check-based test still passed unchanged).
+
+**`newly_hanging`: reusing `find_hanging` on the hypothetical itself.** User: "It should tell
+us if there are more pieces threatened, checked, checkmated, etc." — the king-zone-only view
+missed the general case: clearing a cluster can undefend some *completely different* piece
+elsewhere on the board, not just open lines toward a king. Added `PieceCriticality.newly_hanging:
+Vec<PieceRef>` — for each candidate's hypothetical, calls `graph.find_hanging()` (the
+already-built, already-tested primitive, not a bespoke re-check) and reports entries absent
+from `self.find_hanging()` on the real position, i.e. genuinely new consequences of this
+specific candidate's placement, not pieces that were already hanging regardless.
+
+One real finding from testing this, not just a test-writing slip: `find_hanging` doesn't
+special-case the king's role, so a king left in check with no "defender" (in the loose
+attacker/defender-count sense) reads as "hanging" too — caught when a hand-built test
+expected exactly one new entry (a rook that lost its knight-defender) and got two, the second
+being the king itself, now in check because the same collapse reopened a file onto it.
+Correct behavior, redundant signal: check is already reported explicitly and more clearly via
+`own_king_in_check`/`delivers_check`. Filtered `role != "King"` out of `newly_hanging` so it
+stays focused on genuinely new information, not a second, murkier phrasing of a fact already
+covered elsewhere in the struct.
+
+Verified with a purpose-built position (`Bc6` attacking, `Nh4` defending a black rook on
+`g2` — 1-for-1, not hanging in the real position; `Nh4` is *also* part of `f5`'s collapse
+cluster from the earlier test) confirming `g2`'s rook shows up in `newly_hanging` for both
+candidates once `h4` is vacated either way, and confirming the king-filter removes the
+redundant check-as-hanging duplicate. `cargo check --all-targets` clean; `cargo test` green
+(48 lib — one more than the previous entry; 27 motif tests unchanged); `cargo clippy
+--all-targets` zero warnings; STS smoke test passes.
+
+### Same day, second follow-up: wired into `extract_concepts` — `hanging_piece` checks first
+
+User: "wire it into extract_concepts so hanging_piece checks this before flagging." This is
+the point of building `collapse_criticality` at all — the failure lattice's rung 1
+(`hanging_piece`) was a raw zero-defender count with no way to distinguish a real blunder
+from a brilliant sacrifice, and now it can.
+
+**The recursion problem, caught before it shipped**: `collapse_criticality` already calls
+`self.find_hanging()` for its `newly_hanging` baseline. Having `find_hanging` call
+`collapse_criticality` (to compute the new field) would recurse forever —
+`find_hanging → collapse_criticality → find_hanging → collapse_criticality → ...`. Fixed by
+splitting: `find_hanging_raw` (the original scan, unenriched, `safe_to_capture: true`
+placeholder) is what `collapse_criticality`'s baseline and `newly_hanging` computation both
+call; the public `find_hanging` calls `find_hanging_raw` once, then for each entry calls
+`collapse_criticality(sq)` to fill in `safe_to_capture`. No cycle: `find_hanging_raw` depends
+on nothing else in this family; `collapse_criticality` depends only on `find_hanging_raw`;
+`find_hanging` depends on both, in that order.
+
+**`HangingPiece.safe_to_capture: bool`** (`concept_types.rs`): true iff at least one attacker
+of this piece could capture it without its own king ending up in check
+(`collapse_criticality(sq)`, filtered to candidates of the attacking color, `.any(!own_king_in_check)`).
+`extract_concepts`'s `hanging_piece` loop (`concepts.rs`) now filters `sensor.tactical.hanging`
+to `h.safe_to_capture` *before* collecting values/severity/pushing the concept — a piece
+nobody can safely take doesn't count toward this concept at all, checked before flagging, not
+as an afterthought correction.
+
+Verified against the exact position from the `collapse_criticality` work (`Nh4` both attacks
+`Pf5` with zero defenders *and* blocks `Rh1` from Black's own king): `pawn.safe_to_capture`
+is `false`, and `hanging_piece` no longer fires for White in this position. Caught one thing
+while writing the test: the knight on h4 is *also* independently hanging (`Rh1` attacks it
+directly) and genuinely safe for White to take — confirms the suppression is scoped to the
+specific piece/side affected, not a blanket "no hanging pieces here" — a real
+`hanging_piece` concept for Black still fires correctly. Also added `safe_to_capture: true`
+assertions to the pre-existing `hanging_piece_severity_is_anchored_on_the_biggest_at_risk`
+test as a positive control (ordinary hanging pieces must still be reported).
+
+Performance: hanging pieces are rare per position, so the added `collapse_criticality` calls
+(one `ThreatGraph` rebuild per cluster member, per hanging piece found) didn't show up in
+the STS timing (~0.8s before and after, ~1499 real positions) — the cost this was flagged as
+an open question about in the first `collapse_criticality` entry turned out to be
+negligible in practice.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (48 lib unchanged; 28 motif
+tests — one new); `cargo clippy --all-targets` zero warnings; STS smoke test passes,
+timing unaffected.
+
+## 2026-07-31, continued: checker identity, and "what can be described vs. detected"
+
+**Checker identity.** `own_king_in_check`/`delivers_check` were plain booleans — a real gap,
+since naming *which* piece delivers a check is exactly the kind of identifiability this whole
+system exists for. Added `ThreatGraph::checkers(color) -> Vec<PieceRef>` — same "read it off
+the graph, don't make a second shakmaty call" reasoning `is_in_check` already used, generalized
+from yes/no to naming names. Redefined `is_in_check` in terms of `checkers` (one computation,
+not two that happen to agree — the same discipline `control`'s doc comment already states).
+This also simplified `collapse_criticality`: check no longer needs shakmaty at all, only
+checkmate does (genuinely needs legal move generation) — `check_and_mate_via_shakmaty`
+collapsed into `is_checkmate_via_shakmaty`, a plain bool, no `Option` ceremony. `PieceCriticality`
+gained `own_king_checked_by`/`delivers_check_via: Vec<PieceRef>` alongside the existing bools.
+Verified against the existing h4/f5 test: both directions correctly identify White's `Rh1` as
+the checking piece (via the reopened h-file), whether it's blocked (pawn candidate, `Rh1`
+checks Black directly with the knight simply absent) or the knight itself walks into it
+(knight candidate, same rook, now via the square it vacated). 48 lib tests, 28 motif tests,
+zero clippy, STS unaffected.
+
+**"What can be described vs. what can be detected/quantified"** — user's framing, verbatim,
+for the persistence design. Everything `collapse_criticality` produces decomposes into typed
+fields without loss: which piece, which square, checkmate or not, by how much a zone swung —
+that's structure, not a description of structure. But synthesizing those facts into "why this
+matters" — weighing several named facts into one narrative account — doesn't have a canonical
+structured form; forcing it into more columns just produces more structure *about* the facts,
+never the account of them. This wasn't a new problem: `Concept`/`GatedIssue` already draws
+this line (typed fields next to one `phrase: String`) — it just never had to do real
+interpretive work, since existing phrases are mechanical renderings of the numbers beside them
+("2 attackers vs 1 defender"), not synthesis. The design conclusion: persist the structured,
+identifiable facts; don't try to also pre-bake a narrative at write time, since any fixed
+account can only serve one framing and the real interpretive work (tailoring an explanation to
+a specific player at a specific moment) belongs at read time — the same "let the LLM
+interpret, don't make it enumerate" principle from the phase-classification discussion,
+applied to the *output* side instead of the input side this time.
+
+**Implementation — three new pieces, wired together:**
+- **`tactical_events` table** (`chessdb/db.nu`): one row per *individual* finding (a specific
+  hanging piece, a specific outnumbered piece — not the aggregated per-side `Concept`), since
+  `square` only means something at that granularity. Flat columns
+  (`game_id`, `ply`, `square`, `concept_name`, `side`, `severity`, `stage`) for graphing/SQL
+  aggregation; `detail TEXT` for the fully-identifiable JSON payload. Deliberately no
+  description/narrative column. `stage` mirrors `concepts.rs`'s `ladder_stage()` — a second,
+  small copy of that mapping, since `ladder_stage` is private and built for aggregated
+  `Concept`s, not raw per-instance structs; logged as the same *kind* of known, deferred
+  duplication as the confidence-tier match arms, not fixed here. Unique index on
+  `(game_id, ply, square, concept_name)`, same idempotent-re-derive pattern as
+  `move_anomalies`. Verified: fresh `init-db` produces the correct schema and both indexes.
+- **`chessdb collapse-criticality` plugin command** (`src/collapse_criticality_cmd.rs`):
+  `collapse_criticality` was Rust-only with no Nu-facing exposure at all. Takes a FEN (pipeline)
+  and `--square`, returns the `Vec<PieceCriticality>` as JSON — thin glue over two
+  already-thoroughly-tested pieces (`collapse_criticality` itself, `json_to_nu_value`), no new
+  logic beyond FEN/square parsing. Registered in `lib.rs`'s command list alongside the others.
+- **`chess-tactical-events` Nu command** (`chessdb/sync.nu`, exported via `mod.nu`): for one
+  game's moves, calls `hugm-eval` (no `--player-elo` — this is the raw lattice, not the
+  elo-gated shortlist) per resulting position, and for each of the five ladder concepts builds
+  one row per instance; hanging pieces additionally call `collapse-criticality` on their
+  square and fold the full per-candidate breakdown into `detail`. `db-merge`'s existing
+  `INSERT OR IGNORE` gives idempotent re-runs for free, same pattern as `chess-derive`.
+
+**Verification gap, disclosed rather than papered over**: the installed `nu` CLI in this
+environment is 0.114.0; `nu_plugin_chessdb`'s `Cargo.toml` pins `nu-plugin`/`nu-protocol` to
+0.111 — a pre-existing mismatch, not something this work introduced (confirmed: only one `nu`
+binary present, `plugin add` succeeds but `plugin use` then fails to load with an explicit
+version-compatibility error). This means `chessdb hugm-eval`/`chessdb collapse-criticality`
+could not be invoked live in this session to verify `chess-tactical-events`'s actual per-move
+computation end-to-end. What *was* verified: the Rust command's logic is thin, well-typed glue
+over already-tested primitives; `chess-tactical-events`'s no-moves-found path runs correctly
+against a real (empty) database; the whole `chessdb` module, including the new function,
+parses cleanly; the `tactical_events` schema (table + both indexes) is confirmed correct via
+direct `PRAGMA table_info`/`index_list` queries against a freshly initialized database. The
+actual live round-trip (real game, real moves, real plugin calls, rows landing in
+`tactical_events`) needs to be run once the plugin is rebuilt against a matching `nu` version,
+or the installed `nu` is downgraded/matched to 0.111 — flagged here rather than assumed to work.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (48 lib, 28 motif tests,
+unchanged from the prior entry — no Rust logic changed in this persistence pass beyond the
+new thin command); `cargo clippy --all-targets` zero warnings; STS smoke test passes.
+
+### Same day: version mismatch fixed, full pipeline verified live
+
+Bumped `nu-plugin`/`nu-protocol` from `"0.111"` to `"0.114"` (`Cargo.toml`) to match the
+installed `nu` CLI (0.114.0) — the crate's API surface turned out fully compatible, zero
+code changes needed (`cargo check --all-targets` clean immediately after `cargo update -p
+nu-plugin -p nu-protocol`). Rebuilt the release binary, `plugin add`/`plugin use` succeeded
+this time.
+
+**Live verification, not just parse-checking:**
+- `chessdb collapse-criticality --square f5` on the h4/f5 test position returned exactly the
+  hand-derived, Rust-test-verified values (both candidates' every field byte-for-byte
+  matching), confirming the actual nu-plugin wire protocol round-trip, not just the Rust logic.
+- `chessdb hugm-eval`'s `sensor_report.tactical.hanging` on the same FEN correctly showed
+  `safe_to_capture: true` for the knight, `false` for the pawn.
+- Built a real game through the actual import pipeline (`chessdb process-corpus` on a
+  Scholar's Mate PGN, `db-merge`d into a fresh scratch database — not synthetic rows) and ran
+  `chess-tactical-events` against it live. Result: 6 real, correct findings — notably, at ply
+  6 (after 3...Nf6), `outnumbered` on Black's `f7` pawn (`Bc4`+`Qh5` vs. just the king — the
+  actual tactical point that makes the mate work) and `hanging_piece` on White's own `Qh5`
+  (`Nf6` attacks it, nothing defends it — genuinely true at that exact position, White just
+  gets to move first). Confirmed idempotent: re-running produced the same 6 rows, not 12.
+  Confirmed the `detail` JSON for the hanging queen correctly nests the full
+  `collapse_criticality` breakdown (both candidates, all fields, `safe_to_capture: true`).
+
+The verification gap from the previous entry is closed — this is no longer "should work,
+parses correctly" but confirmed working end to end: real PGN → real import → real plugin
+calls over the wire → real rows in `tactical_events`, idempotent, fully identifiable.
+
+Verified: `cargo check`/`test`/`clippy --all-targets` all clean post-bump (48 lib, 28 motif
+tests, zero warnings); STS smoke test passes; live plugin round-trip confirmed via
+`collapse-criticality`, `hugm-eval`, and `chess-tactical-events` against both a hand-built
+position and a real imported game.

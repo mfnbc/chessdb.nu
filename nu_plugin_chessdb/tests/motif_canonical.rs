@@ -322,12 +322,298 @@ fn hanging_piece_severity_is_anchored_on_the_biggest_at_risk() {
     assert_eq!(hanging.len(), 2, "expected both the queen and knight to be detected hanging, got {hanging:?}");
     let queen = hanging.iter().find(|h| h.piece.role == "Queen").expect("queen should be hanging");
     assert_eq!(queen.value, 900, "HangingPiece.value should be the real piece value, not a flat placeholder");
+    assert!(queen.safe_to_capture, "Rd1xd8 doesn't expose White's own king to anything");
     let knight = hanging.iter().find(|h| h.piece.role == "Knight").expect("knight should be hanging");
     assert_eq!(knight.value, 320);
+    assert!(knight.safe_to_capture, "Ra1xa4 doesn't expose White's own king to anything");
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let concept = concepts.iter().find(|c| c.name == "hanging_piece").expect("hanging_piece concept should be present");
     assert_eq!(concept.side, Side::Black);
     // max (900) + 0.3 * rest (320) = 996, not a flat 60*2=120 or a naive sum of 1220.
     assert_eq!(concept.severity, 996, "severity should be max-anchored with a smaller weight for the second piece, got {}", concept.severity);
+
+    // GatedIssue.stage is the failure-lattice rung this issue represents --
+    // hanging_piece is the base case, rung 1 (nothing shallower to check).
+    let issues = rank_issues_for_position(&concepts, 2000);
+    let issue = issues.iter().find(|i| i.name == "hanging_piece").expect("hanging_piece issue should be present");
+    assert_eq!(issue.stage, 1);
+}
+
+// Regression for wiring ThreatGraph::collapse_criticality into extract_concepts,
+// checked before hanging_piece flags anything: "a brilliant move can look like a
+// hanging piece" (user, verbatim). White's pawn f5 has a raw attacker (Nh4) and
+// zero defenders -- find_hanging's own textbook definition -- but the knight is
+// also the sole thing blocking White's Rh1 from Black's own king on the h-file.
+// If the knight actually captures on f5, it walks straight into check. Nobody can
+// safely take this "hanging" piece, so it must not be reported as one.
+//
+// Note the knight on h4 is *also* independently hanging (Rh1 attacks it directly
+// along the h-file, 0 defenders) -- and genuinely safe for White to take (nothing
+// bad happens), so a hanging_piece concept for Black legitimately still fires.
+// This test is specifically about White's side -- the pawn -- being suppressed.
+#[test]
+fn hanging_piece_is_suppressed_when_no_attacker_can_safely_capture() {
+    let fen = "7k/8/8/5P2/7n/8/8/4K2R w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+
+    let hanging = &rec.sensor_report.tactical.hanging;
+    let pawn = hanging.iter().find(|h| h.piece.square == "f5").expect("f5 pawn should still be raw-hanging (0 defenders)");
+    assert!(!pawn.safe_to_capture, "the only attacker (Nh4) would expose its own king by capturing here");
+    let knight = hanging.iter().find(|h| h.piece.square == "h4").expect("h4 knight should also be raw-hanging (Rh1 attacks it directly)");
+    assert!(knight.safe_to_capture, "Rxh4 is completely safe for White, unrelated to the pawn's false hang");
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    assert!(concepts.iter().all(|c| !(c.name == "hanging_piece" && c.side == Side::White)),
+        "no attacker can safely capture White's pawn, so hanging_piece must not fire for White, got {concepts:?}");
+    assert!(concepts.iter().any(|c| c.name == "hanging_piece" && c.side == Side::Black),
+        "Black's knight is genuinely, safely hanging and should still be reported");
+}
+
+// Regression for the "pathfind the graph" design pass (2026-07-30): overload
+// is the mirror image of a fork -- one piece is the *sole* defender of 2+
+// currently-attacked pieces. Pure attackers_to lookup (ThreatGraph::
+// find_overloaded), no search, no SEE. White knight c3 is the only thing
+// defending both Ra4 (attacked via the open a-file) and Rb5 (attacked via
+// the open b-file) -- rooks don't defend each other diagonally, so the
+// knight is genuinely the sole common link, not an artifact of the position.
+#[test]
+fn overloaded_piece_is_detected() {
+    let fen = "rr2k3/8/8/1R6/R7/2N5/8/4K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+
+    let overloaded = &rec.sensor_report.tactical.overloaded;
+    assert_eq!(overloaded.len(), 1, "expected exactly one overloaded piece, got {overloaded:?}");
+    let ov = &overloaded[0];
+    assert_eq!(ov.piece.role, "Knight");
+    assert_eq!(ov.piece.square, "c3");
+    assert_eq!(ov.critical_for.len(), 2);
+    assert_eq!(ov.critical_value, 1000, "two rooks at 500cp each");
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let concept = concepts.iter().find(|c| c.name == "overloaded").expect("overloaded concept should be present");
+    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.severity, 1000);
+    assert_eq!(concept.elo_min, 1400);
+}
+
+// A defender that's sole-responsible for only one attacked piece (not two)
+// must not be flagged -- the >= 2 threshold is the whole definition of
+// "overloaded," not "merely defending something."
+#[test]
+fn single_responsibility_is_not_overloaded() {
+    // Same position, but a second white rook on b1 also defends b5 via the
+    // open b-file -- Nc3 is now sole defender of only Ra4 (one target).
+    let fen = "rr2k3/8/8/1R6/R7/2N5/8/1R2K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    assert!(rec.sensor_report.tactical.overloaded.is_empty(), "got {:?}", rec.sensor_report.tactical.overloaded);
+}
+
+// Flip-invariance: unflip_sensor_report must correct both the overloaded
+// piece's own PieceRef and every entry in critical_for, not just the first.
+#[test]
+fn overloaded_piece_survives_the_flip_with_real_terms() {
+    let real = analyze_fen("rr2k3/8/8/1R6/R7/2N5/8/4K3 w - - 0 1").expect("FEN should parse");
+    // Hand-built Black-to-move mirror of the exact same physical fact
+    // (vertical flip + color swap), independently of normalize_for_eval's
+    // own implementation.
+    let mirrored = analyze_fen("4k3/8/2n5/r7/1r6/8/8/RR2K3 b - - 0 1").expect("FEN should parse");
+
+    let r = &real.sensor_report.tactical.overloaded[0];
+    let m = &mirrored.sensor_report.tactical.overloaded[0];
+    assert_eq!(m.piece.color, Side::Black, "mirrored knight must be reported as Black (real terms), not White");
+    assert_eq!(m.piece.square, "c6", "mirrored knight square must be un-flipped back to real terms");
+    assert_eq!(m.critical_value, r.critical_value);
+    let m_squares: Vec<&str> = m.critical_for.iter().map(|t| t.square.as_str()).collect();
+    assert!(m_squares.contains(&"a5") && m_squares.contains(&"b4"), "critical_for squares should be real-terms too, got {m_squares:?}");
+    assert!(m.critical_for.iter().all(|t| t.color == Side::Black), "critical_for colors should be un-flipped too, got {:?}", m.critical_for);
+}
+
+// Regression for the "pathfind the graph" design pass, part 2: a piece can
+// pass find_hanging's zero-defender check (it has a defender) and still not
+// really be defended, if its only defender is pinned and unable to legally
+// recapture here. Real subtlety, checked before implementing: a pinned
+// piece CAN still move to any square strictly between the attacker and its
+// own king (or capture the attacker itself) without breaking the pin --
+// only moving elsewhere breaks it. Ba5 pins White's Nc3 to Ke1 along the
+// a5-e1 diagonal; Nc3 is Rb1's only defender (attacked by Rb8, open
+// b-file), but b1 is nowhere near that diagonal, so Nc3 moving there would
+// expose the king.
+#[test]
+fn false_defense_is_detected_when_the_only_defender_is_pinned_off_line() {
+    let fen = "1r2k3/8/8/b7/8/2N5/8/1R2K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+
+    assert_eq!(rec.sensor_report.tactical.pins.len(), 1, "Nc3 should be pinned by Ba5");
+    let fd = &rec.sensor_report.tactical.false_defense;
+    assert_eq!(fd.len(), 1, "expected exactly one false defense, got {fd:?}");
+    assert_eq!(fd[0].piece.role, "Rook");
+    assert_eq!(fd[0].piece.square, "b1");
+    assert_eq!(fd[0].value, 500);
+    assert_eq!(fd[0].pinned_defenders.len(), 1);
+    assert_eq!(fd[0].pinned_defenders[0].square, "c3");
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let concept = concepts.iter().find(|c| c.name == "false_defense").expect("false_defense concept should be present");
+    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.severity, 500);
+    assert_eq!(concept.elo_min, 1600);
+}
+
+// A defender that isn't pinned at all is a real defender -- must not be
+// flagged. Same position with the pinning bishop removed (not the
+// attacking rook, which stays so the target is still actually attacked).
+#[test]
+fn unpinned_defender_is_not_a_false_defense() {
+    let fen = "1r2k3/8/8/8/8/2N5/8/1R2K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    assert!(rec.sensor_report.tactical.pins.is_empty(), "Nc3 should not be pinned here");
+    assert!(rec.sensor_report.tactical.false_defense.is_empty(), "got {:?}", rec.sensor_report.tactical.false_defense);
+}
+
+// A piece with two defenders, only one of which is pinned, is genuinely
+// defended by the other -- must not be flagged. Nc3 stays pinned (Ba5
+// unchanged), but Rb1 gains a second defender, Ba2 (diagonal a2-b1), which
+// isn't pinned at all.
+#[test]
+fn one_real_defender_among_several_is_enough_to_not_be_false_defense() {
+    let fen = "1r2k3/8/8/b7/8/2N5/B7/1R2K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    assert_eq!(rec.sensor_report.tactical.pins.len(), 1, "Nc3 should still be pinned");
+    assert!(rec.sensor_report.tactical.false_defense.is_empty(), "Ba2 provides real defense, got {:?}", rec.sensor_report.tactical.false_defense);
+}
+
+// Flip-invariance, same discipline as the overloaded test: both the
+// falsely-defended piece and every entry in pinned_defenders must come back
+// in real terms after un-flipping, not just the first field touched.
+#[test]
+fn false_defense_survives_the_flip_with_real_terms() {
+    let mirrored = analyze_fen("1r2k3/8/2n5/8/B7/8/8/1R2K3 b - - 0 1").expect("FEN should parse");
+    let fd = &mirrored.sensor_report.tactical.false_defense;
+    assert_eq!(fd.len(), 1, "got {fd:?}");
+    assert_eq!(fd[0].piece.color, Side::Black, "mirrored rook must be reported as Black (real terms)");
+    assert_eq!(fd[0].piece.square, "b8", "mirrored rook square must be un-flipped to real terms");
+    assert_eq!(fd[0].pinned_defenders[0].color, Side::Black);
+    assert_eq!(fd[0].pinned_defenders[0].square, "c6");
+}
+
+// Regression: outnumbered is the most direct application of
+// ThreatGraph::control to piece safety, and the completeness gap noticed
+// only after overloaded/false_defense had already been built -- real
+// defenders exist (find_hanging doesn't touch these) but attackers still
+// outnumber them. White pawn d4 attacked by Rd8 (open d-file) and Ba7
+// (a7-b6-c5-d4 diagonal, clear) = 2 attackers, defended only by Rd1 (open
+// d-file) = 1 defender.
+#[test]
+fn outnumbered_piece_is_detected() {
+    let fen = "3r3k/b7/8/8/3P4/8/8/3R3K w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+
+    let outnumbered = &rec.sensor_report.tactical.outnumbered;
+    assert_eq!(outnumbered.len(), 1, "expected exactly one outnumbered piece, got {outnumbered:?}");
+    assert_eq!(outnumbered[0].piece.role, "Pawn");
+    assert_eq!(outnumbered[0].piece.square, "d4");
+    assert_eq!(outnumbered[0].attacker_count, 2);
+    assert_eq!(outnumbered[0].defender_count, 1);
+    assert_eq!(outnumbered[0].value, 100);
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let concept = concepts.iter().find(|c| c.name == "outnumbered").expect("outnumbered concept should be present");
+    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.severity, 100);
+    assert_eq!(concept.elo_min, 800);
+    assert!(concept.phrase.contains("isn't simply hanging"), "phrase should state the shallower check that passed, got: {}", concept.phrase);
+
+    // Rung 2: has a defender (rung 1 passed) but the raw count still fails.
+    let issues = rank_issues_for_position(&concepts, 2000);
+    let issue = issues.iter().find(|i| i.name == "outnumbered").expect("outnumbered issue should be present");
+    assert_eq!(issue.stage, 2);
+}
+
+// Equal attacker/defender counts (both the 2v2 and 1v1 case) must not be
+// flagged -- "outnumbered" means strictly more attackers than defenders,
+// not "is attacked at all."
+#[test]
+fn equal_attacker_defender_count_is_not_outnumbered() {
+    // 2 attackers (Rd8, Ba7), 2 defenders (Rd1, new bishop b2 on the
+    // b2-c3-d4 diagonal).
+    let two_v_two = analyze_fen("3r3k/b7/8/8/3P4/8/1B6/3R3K w - - 0 1").expect("FEN should parse");
+    assert!(two_v_two.sensor_report.tactical.outnumbered.is_empty(), "got {:?}", two_v_two.sensor_report.tactical.outnumbered);
+
+    // 1 attacker (Rd8), 1 defender (Rd1) -- the bishop attacker removed entirely.
+    let one_v_one = analyze_fen("3r3k/8/8/8/3P4/8/8/3R3K w - - 0 1").expect("FEN should parse");
+    assert!(one_v_one.sensor_report.tactical.outnumbered.is_empty(), "got {:?}", one_v_one.sensor_report.tactical.outnumbered);
+}
+
+// Flip-invariance, same discipline as overloaded/false_defense.
+#[test]
+fn outnumbered_piece_survives_the_flip_with_real_terms() {
+    let mirrored = analyze_fen("3r3k/8/8/3p4/8/8/B7/3R3K b - - 0 1").expect("FEN should parse");
+    let outnumbered = &mirrored.sensor_report.tactical.outnumbered;
+    assert_eq!(outnumbered.len(), 1, "got {outnumbered:?}");
+    assert_eq!(outnumbered[0].piece.color, Side::Black, "mirrored pawn must be reported as Black (real terms)");
+    assert_eq!(outnumbered[0].piece.square, "d5", "mirrored pawn square must be un-flipped to real terms");
+}
+
+// Regression for the rung above overloaded/false_defense: the raw count
+// alone says this piece is safe (2 attackers, 2 defenders -- outnumbered
+// doesn't touch it) but isn't, because one of the two defenders is pinned
+// off-line. Deliberately built as a *partial* compromise (1 of 2 defenders,
+// not all) so this doesn't overlap with false_defense, which only fires
+// when *every* defender is compromised -- this is testing the genuinely new
+// case false_defense's all-or-nothing check can't see.
+// Pd4 attacked by Rd8 (d-file) and Ba7 (a7-d4 diagonal) = 2 attackers.
+// Defended by Rd1 (d-file, genuinely free) and Nb3 (knight move to d4, but
+// pinned to Kb1 by Rb8 along the b-file -- d4 isn't on that line, so Nb3
+// can't actually recapture there) = 2 raw defenders, 1 effective.
+#[test]
+fn false_safety_is_detected_when_the_count_looks_safe_but_a_defender_is_compromised() {
+    let fen = "1r1r3k/b7/8/8/3P4/1N6/8/1K1R4 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+
+    assert!(rec.sensor_report.tactical.outnumbered.is_empty(), "raw count is 2v2, must not read as outnumbered");
+    assert!(rec.sensor_report.tactical.false_defense.is_empty(), "only one of two defenders is compromised, not all -- must not read as false_defense");
+
+    let fs = &rec.sensor_report.tactical.false_safety;
+    assert_eq!(fs.len(), 1, "expected exactly one false-safety piece, got {fs:?}");
+    assert_eq!(fs[0].piece.role, "Pawn");
+    assert_eq!(fs[0].piece.square, "d4");
+    assert_eq!(fs[0].attacker_count, 2);
+    assert_eq!(fs[0].raw_defender_count, 2);
+    assert_eq!(fs[0].effective_defender_count, 1);
+    assert_eq!(fs[0].compromised_defenders.len(), 1);
+    assert_eq!(fs[0].compromised_defenders[0].square, "b3");
+    assert_eq!(fs[0].value, 100);
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let concept = concepts.iter().find(|c| c.name == "false_safety").expect("false_safety concept should be present");
+    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.severity, 100);
+    assert_eq!(concept.elo_min, 1800);
+}
+
+// A third, genuinely free defender restores real safety even with one
+// defender still pinned off-line -- effective count (2) no longer falls
+// below attacker count (2), so this must not be flagged. Same position with
+// White bishop added on b2 (b2-c3-d4 diagonal, clear).
+#[test]
+fn enough_real_defenders_after_the_discount_is_not_false_safety() {
+    let fen = "1r1r3k/b7/8/8/3P4/1N6/1B6/1K1R4 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    assert!(rec.sensor_report.tactical.outnumbered.is_empty());
+    assert!(rec.sensor_report.tactical.false_safety.is_empty(), "got {:?}", rec.sensor_report.tactical.false_safety);
+}
+
+// Flip-invariance, same discipline as overloaded/false_defense: both the
+// falsely-safe piece and every entry in compromised_defenders must come
+// back in real terms after un-flipping.
+#[test]
+fn false_safety_survives_the_flip_with_real_terms() {
+    let mirrored = analyze_fen("1k1r4/8/1n6/3p4/8/8/B7/1R1R3K b - - 0 1").expect("FEN should parse");
+    let fs = &mirrored.sensor_report.tactical.false_safety;
+    assert_eq!(fs.len(), 1, "got {fs:?}");
+    assert_eq!(fs[0].piece.color, Side::Black, "mirrored pawn must be reported as Black (real terms)");
+    assert_eq!(fs[0].piece.square, "d5", "mirrored pawn square must be un-flipped to real terms");
+    assert_eq!(fs[0].compromised_defenders[0].color, Side::Black);
+    assert_eq!(fs[0].compromised_defenders[0].square, "b6");
 }

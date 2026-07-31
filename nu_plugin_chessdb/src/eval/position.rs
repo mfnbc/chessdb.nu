@@ -5,7 +5,7 @@ use shakmaty::{attacks, fen::Fen, Bitboard, Chess, Color, File, Position, Rank, 
 use crate::eval::concept_types::*;
 use crate::eval::sensor::{TacticalReport, PositionalReport, SensorReport, AggregatedScores, MaterialConceptReport};
 use crate::eval::concepts::{encode_state, extract_concepts, rank_issues_for_position};
-use crate::eval::threat_graph::{role_name, ThreatGraph};
+use crate::eval::threat_graph::{king_ring, role_name, ThreatGraph};
 use crate::canonical::{normalize_to_white_to_move, unflip_phrase, unflip_square_str};
 
 // Configurable constants (GUESS values) collected here for easier tuning.
@@ -307,13 +307,6 @@ fn blend(mg: i64, eg: i64, phase: u8) -> i64 {
 
 fn count_on_home(board: &shakmaty::Board, color: Color, role: Role, home: Bitboard) -> i64 {
     (board.by_color(color) & board.by_role(role) & home).count() as i64
-}
-
-fn king_ring(board: &shakmaty::Board, color: Color) -> Bitboard {
-    let Some(king_sq) = board.king_of(color) else {
-        return Bitboard::EMPTY;
-    };
-    attacks::king_attacks(king_sq) | Bitboard::from(king_sq)
 }
 
 fn pawn_attack_mask(board: &shakmaty::Board, color: Color) -> Bitboard {
@@ -2848,15 +2841,28 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
     // Tactical report — reuse raw examples cached in groups.tactical_raw by tactical_score;
     // no need to re-run the detectors.
     let raw = &groups.tactical_raw;
+    // Computed before the struct literal (not inline like the others) —
+    // find_false_defense below needs it as an input, it's not just another
+    // independent field.
+    let pins: Vec<Pin> = { let mut v = pins_to_typed(board, &raw.pin_ex_us); v.extend(pins_to_typed(board, &raw.pin_ex_them)); v };
+    // Computed before the struct literal too — find_false_safety below needs
+    // both pins and overloaded as input, the same "cross-reference of
+    // already-known facts" shape as false_defense's use of pins alone.
+    let overloaded: Vec<Overloaded> = { let mut v = graph.find_overloaded(us); v.extend(graph.find_overloaded(them)); v };
+    let false_safety: Vec<FalseSafety> = { let mut v = graph.find_false_safety(us, &pins, &overloaded); v.extend(graph.find_false_safety(them, &pins, &overloaded)); v };
     let tactical = TacticalReport {
         forks: evaluated_forks.iter().map(|ef| Fork {
             attacker: ef.attacker.clone(),
             targets: ef.targets.clone(),
         }).collect(),
-        pins:       { let mut v = pins_to_typed(board, &raw.pin_ex_us);   v.extend(pins_to_typed(board, &raw.pin_ex_them));   v },
         skewers:    { let mut v = skewers_to_typed(board, &raw.skew_ex_us); v.extend(skewers_to_typed(board, &raw.skew_ex_them)); v },
         discovered: { let mut v = discovered_to_typed(board, &raw.disc_ex_us); v.extend(discovered_to_typed(board, &raw.disc_ex_them)); v },
         hanging: graph.find_hanging(),
+        outnumbered: graph.find_outnumbered(),
+        overloaded,
+        false_defense: { let mut v = graph.find_false_defense(us, &pins); v.extend(graph.find_false_defense(them, &pins)); v },
+        false_safety,
+        pins,
     };
 
     let positional = PositionalReport {
@@ -3005,6 +3011,21 @@ fn unflip_sensor_report(sensor: &mut SensorReport) {
     }
     for h in &mut sensor.tactical.hanging {
         unflip_piece_ref(&mut h.piece);
+    }
+    for on in &mut sensor.tactical.outnumbered {
+        unflip_piece_ref(&mut on.piece);
+    }
+    for o in &mut sensor.tactical.overloaded {
+        unflip_piece_ref(&mut o.piece);
+        for t in &mut o.critical_for { unflip_piece_ref(t); }
+    }
+    for fd in &mut sensor.tactical.false_defense {
+        unflip_piece_ref(&mut fd.piece);
+        for d in &mut fd.pinned_defenders { unflip_piece_ref(d); }
+    }
+    for fs in &mut sensor.tactical.false_safety {
+        unflip_piece_ref(&mut fs.piece);
+        for d in &mut fs.compromised_defenders { unflip_piece_ref(d); }
     }
     for ef in &mut sensor.evaluated_forks {
         unflip_piece_ref(&mut ef.attacker);
