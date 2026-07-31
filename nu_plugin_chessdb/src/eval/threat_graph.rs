@@ -434,11 +434,21 @@ impl ThreatGraph {
     /// of `find_hanging`, since `find_hanging` calls `collapse_criticality`
     /// per candidate to fill that field in; going through the public
     /// `find_hanging` here would recurse forever.
+    ///
+    /// Kings excluded: a king attacked with no piece able to interpose or
+    /// capture the attacker isn't "hanging" (a piece a player could simply
+    /// take for free) — it's check, a different fact already reported
+    /// explicitly (`is_in_check`/`checkers`) and more clearly (kings can't
+    /// actually be captured; the game ends at checkmate first). Without
+    /// this, a checked king reads as a "hanging piece worth 20000
+    /// centipawns" — technically consistent with the raw attacker/defender
+    /// count, but a confusing duplicate of a fact stated better elsewhere.
     fn find_hanging_raw(&self) -> Vec<HangingPiece> {
         let mut out = Vec::new();
         for sq in Square::ALL {
             let idx = Self::idx(sq);
             let Some(piece) = self.pieces[idx] else { continue };
+            if piece.role == Role::King { continue; }
             let attacker_count = (self.attackers_to[idx]
                 & self.board.by_color(piece.color.other())).count();
             if attacker_count == 0 { continue; }
@@ -484,11 +494,17 @@ impl ThreatGraph {
     /// `control` to piece safety — deliberately checked before the fancier
     /// cross-references (`find_overloaded`, `find_false_defense`) even
     /// though it was built after them; see PLAN.md.
+    ///
+    /// Kings excluded, same reasoning as `find_hanging_raw`: a king in a
+    /// double check, with a friendly piece that geometrically covers its
+    /// square, would otherwise read as "outnumbered" — a confusing restated
+    /// version of check/double-check, not a real material-safety fact.
     pub fn find_outnumbered(&self) -> Vec<Outnumbered> {
         let mut out = Vec::new();
         for sq in Square::ALL {
             let idx = Self::idx(sq);
             let Some(piece) = self.pieces[idx] else { continue };
+            if piece.role == Role::King { continue; }
             let attacker_count = (self.attackers_to[idx]
                 & self.board.by_color(piece.color.other())).count();
             if attacker_count == 0 { continue; }
@@ -518,6 +534,12 @@ impl ThreatGraph {
     /// overload. Pure `attackers_to` lookup — no search, no cross-reference
     /// with any other detector needed (contrast the pin/false-defense case,
     /// which does need one — see PLAN.md).
+    ///
+    /// Targets exclude the king, same reasoning as `find_hanging_raw`: being
+    /// the sole piece "defending" a check isn't the same fact as being the
+    /// sole defender of a capturable piece, and mixing the king's 20000
+    /// piece-value into `critical_value` produces a number that isn't
+    /// really comparable to a genuine material stakes figure.
     pub fn find_overloaded(&self, color: Color) -> Vec<Overloaded> {
         let mut out = Vec::new();
         let enemy = color.other();
@@ -526,6 +548,7 @@ impl ThreatGraph {
             let mut critical_value = 0i64;
             for (t_sq, t_piece) in self.pieces_of(color) {
                 if t_sq == sq { continue; }
+                if t_piece.role == Role::King { continue; }
                 let t_idx = Self::idx(t_sq);
                 let attacker_count = (self.attackers_to[t_idx] & self.board.by_color(enemy)).count();
                 if attacker_count == 0 { continue; }
@@ -571,6 +594,7 @@ impl ThreatGraph {
             let idx = Self::idx(sq);
             let Some(piece) = self.pieces[idx] else { continue };
             if piece.color != color { continue; }
+            if piece.role == Role::King { continue; } // check, not a "falsely defended" material fact
             let attacker_count = (self.attackers_to[idx] & self.board.by_color(enemy)).count();
             if attacker_count == 0 { continue; }
             let defenders = self.attackers_to[idx] & self.board.by_color(color) & !Bitboard::from(sq);
@@ -674,18 +698,13 @@ impl ThreatGraph {
             // hypothetical itself instead of a bespoke "is this piece now
             // undefended" check — anything it reports that wasn't already
             // hanging in the real position is a fresh consequence of this
-            // specific candidate ending up on `sq`. Kings excluded: a king
-            // with an unanswerable attacker and 0 "defenders" is just
-            // check, already reported explicitly and more clearly via
-            // own_king_in_check/delivers_check above — find_hanging doesn't
-            // special-case the king's role, so without this filter a fresh
-            // check would double-count as a "newly hanging" entry too.
-            // find_hanging_raw, not find_hanging: only the piece list is
-            // used below, not safe_to_capture, so there's no reason to pay
-            // for (and recurse one level deeper into) the full
-            // collapse_criticality enrichment on this hypothetical too.
+            // specific candidate ending up on `sq`. find_hanging_raw, not
+            // find_hanging: only the piece list is used below, not
+            // safe_to_capture, so there's no reason to pay for (and recurse
+            // one level deeper into) the full collapse_criticality
+            // enrichment on this hypothetical too. No king filter needed
+            // here any more — find_hanging_raw itself excludes kings now.
             let newly_hanging: Vec<PieceRef> = graph.find_hanging_raw().into_iter()
-                .filter(|h| h.piece.role != "King")
                 .filter(|h| !baseline_hanging.iter().any(|b| b.piece.square == h.piece.square && b.piece.color == h.piece.color))
                 .map(|h| h.piece)
                 .collect();
@@ -727,6 +746,7 @@ impl ThreatGraph {
             let idx = Self::idx(sq);
             let Some(piece) = self.pieces[idx] else { continue };
             if piece.color != color { continue; }
+            if piece.role == Role::King { continue; } // check, not a material safety fact
             let attacker_count = (self.attackers_to[idx] & self.board.by_color(enemy)).count();
             if attacker_count == 0 { continue; }
             let defenders = self.attackers_to[idx] & self.board.by_color(color) & !Bitboard::from(sq);
@@ -1061,6 +1081,61 @@ mod tests {
         let graph = ThreatGraph::build(&chess);
         let a1 = Square::from_ascii(b"a1").unwrap();
         assert!(graph.collapse_criticality(a1).is_empty(), "empty, unattacked square has no cluster to collapse");
+    }
+
+    // Regression: a checked king must not read as a "hanging piece" (or as
+    // "outnumbered") -- that's check, a different and better-stated fact
+    // (is_in_check/checkers), not a material-safety one; kings can't
+    // actually be captured. Real position, verified independently via the
+    // live nu-plugin apply-uci pipeline (not hand-constructed): the Fried
+    // Liver main line through 7.Qf3+ -- Black's king on f7 is in check from
+    // White's queen on f3, with no black piece able to interpose or capture
+    // it, which is exactly the shape find_hanging's raw attacker/defender
+    // count would otherwise flag.
+    #[test]
+    fn checked_king_is_not_reported_as_hanging_or_outnumbered() {
+        let chess = pos("r1bq1b1r/ppp2kpp/2n5/3np3/2B5/5Q2/PPPP1PPP/RNB1K2R b KQ - 1 7");
+        let graph = ThreatGraph::build(&chess);
+
+        assert!(graph.is_in_check(Color::Black), "the king really is in check here");
+        assert_eq!(graph.checkers(Color::Black)[0].square, "f3", "Qf3 delivers the check");
+
+        assert!(graph.find_hanging().iter().all(|h| h.piece.square != "f7"),
+            "the checked king must not appear as a hanging piece, got {:?}", graph.find_hanging());
+        assert!(graph.find_outnumbered().iter().all(|o| o.piece.square != "f7"),
+            "the checked king must not appear as outnumbered either, got {:?}", graph.find_outnumbered());
+    }
+
+    // Regression for the same king-inclusion issue surfacing one rung
+    // deeper: real position from the Noah's Ark Trap (Steiner-Capablanca,
+    // Budapest 1929), position after 10.Qc6+ -- verified independently via
+    // the live nu-plugin apply-uci pipeline, not hand-constructed. Qc6
+    // checks the king on e8, which Qd8 and Bf8 both nominally "defend" by
+    // the raw count (2 defenders vs 1 attacker -- false_safety's own
+    // precondition for firing). Before this fix, find_false_safety and
+    // find_overloaded both treated the king like any other capturable
+    // target, producing a false_safety entry on e8 (severity = king's
+    // 20000 piece value) and an overloaded entry crediting a king-sized
+    // "critical_value" to whichever piece nominally guards it. Neither is a
+    // real material-safety fact -- it's check, already reported elsewhere.
+    #[test]
+    fn checked_king_is_excluded_from_overloaded_false_defense_and_false_safety_too() {
+        let chess = pos("r2qkbnr/5ppp/p1Qpb3/1pp5/4P3/1B6/PPP2PPP/RNB1K2R b KQkq - 3 10");
+        let graph = ThreatGraph::build(&chess);
+
+        assert!(graph.is_in_check(Color::Black), "the king really is in check here");
+
+        let pins: Vec<Pin> = Vec::new();
+        assert!(graph.find_false_defense(Color::Black, &pins).iter().all(|f| f.piece.square != "e8"),
+            "the checked king must not appear in false_defense either");
+
+        let overloaded = graph.find_overloaded(Color::Black);
+        assert!(overloaded.iter().all(|o| !o.critical_for.iter().any(|c| c.square == "e8")),
+            "no piece should be credited with 'defending' the king as a critical_for target, got {overloaded:?}");
+
+        let false_safety = graph.find_false_safety(Color::Black, &pins, &overloaded);
+        assert!(false_safety.iter().all(|f| f.piece.square != "e8"),
+            "the checked king must not appear as a false_safety piece either, got {false_safety:?}");
     }
 }
 

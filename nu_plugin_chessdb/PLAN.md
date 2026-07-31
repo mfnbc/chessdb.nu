@@ -3104,3 +3104,129 @@ post-fix; STS smoke test passes; `chessdb apply-uci` verified directly
 (`e2e4` from the start position returns the correct resulting FEN); both games re-run live
 through the corrected `chess-tactical-events` and spot-checked by hand against real chess
 theory, not just "it ran without erroring."
+
+## 2026-08-01, follow-up: excluded kings from find_hanging/find_outnumbered
+
+Fixed the pre-existing quirk flagged (but explicitly deferred) in the previous entry: a
+checked king with no piece able to interpose or capture the attacker read as a "hanging
+piece worth 20000 centipawns" — technically consistent with the raw attacker/defender
+count `find_hanging_raw` computes, but wrong: check is a different, better-stated fact
+(`is_in_check`/`checkers`), and kings can't actually be captured (the game ends at
+checkmate first). Added `if piece.role == Role::King { continue; }` to both
+`find_hanging_raw` and `find_outnumbered` (the same root cause applies to outnumbered too —
+a double-checked king with a friendly piece geometrically covering its square would
+otherwise read as "outnumbered", equally wrong for the same reason). This also made the
+king-role filter in `collapse_criticality`'s `newly_hanging` computation redundant
+(`find_hanging_raw` itself never produces king entries now) — removed it rather than leave
+dead defensive code checking for something that can no longer happen.
+
+Verified with a real position, not hand-constructed: reconstructed the exact FEN after the
+Fried Liver line's `7.Qf3+` via the live `chessdb apply-uci` pipeline (chained through all
+13 real moves), confirmed independently that Black's king on f7 really is in check from
+`Qf3` with `checkers()` correctly naming it, and confirmed neither `find_hanging` nor
+`find_outnumbered` report anything on `f7`. Re-ran the live Fried Liver
+`chess-tactical-events` test end to end after rebuilding — the bogus `ply 13, f7,
+hanging_piece, severity 20000` row is gone; every other real finding (the `e5`/`e4`/`c4`
+hangs, the `f7` double-attack, the `e4`/`d5` outnumbered findings) is unchanged.
+
+Verified: `cargo check`/`test`/`clippy --all-targets` clean (49 lib — one new; 28 motif
+tests unchanged); STS smoke test passes; live re-verification against the real imported
+Fried Liver game confirms the fix and no regression to the other findings.
+
+## 2026-08-01, follow-up: regression set of known games — `tests/known_games.rs`
+
+User: "lets build a regression set of games, the ones you already used plus all the
+beginner traps that we can find, all well trodden and named." Sourced five more real,
+well-documented traps via `WebSearch`/`WebFetch` (cross-checking at least two independent
+sources per game before trusting a line, same discipline as the ICBM/Alien Gambit work —
+one WebFetch extraction genuinely hallucinated an illegal move, `4.Nxe6` with nothing on
+e6, caught by disagreeing with a second source rather than assumed correct): Légal's Trap,
+the Blackburne Shilling Gambit, the Queen's Gambit Declined Elephant Trap, the Ruy Lopez
+Noah's Ark Trap (real historical game, Steiner–Capablanca, Budapest 1929), and the Drunken
+Bishops Gambit's mating line — this last one pulled as *raw PGN* directly from a real
+lichess study export (`lichess.org/study/.../....pgn`, not a video summary), the most
+reliable sourcing of the batch.
+
+**A second, deeper king-inclusion bug, found only by testing against real games.** Running
+Noah's Ark live surfaced `overloaded`/`false_safety` findings with king-sized severities
+(20000/20500) — the same root issue as the `hanging_piece`/`outnumbered` king fix from
+earlier the same day, just in the two detectors that fix didn't touch. `find_overloaded`
+was treating the king as a normal capturable "target" a piece could be the sole defender
+of; `find_false_defense`/`find_false_safety` were doing raw attacker/defender counting on
+king-occupied squares directly. Fixed all three the same way: skip `Role::King` — as a
+target in `find_overloaded`'s inner loop, as the occupant in `find_false_defense` and
+`find_false_safety`. Verified with a real position (Noah's Ark after `10.Qc6+`,
+reconstructed via `apply-uci`, not hand-built) confirming the king really is in check but
+no longer appears in any of the three detectors — new test
+`checked_king_is_excluded_from_overloaded_false_defense_and_false_safety_too`. This is
+exactly the value of testing against a *diverse* set of real games rather than only
+hand-built minimal positions: the original king-exclusion fix only exercised `hanging`/
+`outnumbered` directly, and it took a real game reaching a checked-king-with-nominal-
+defenders configuration to expose that `overloaded`/`false_safety` had the identical gap.
+
+**`tests/known_games.rs`**: one test per game (9 total — the 4 from the earlier ad hoc
+live sessions plus the 5 new ones), replaying real SAN move sequences via a `replay_san`
+helper that uses shakmaty directly (never touching `positions.fen`/`pgn_to_fens`, both
+canonical — the exact bug fixed earlier the same day) and asserting the specific,
+already-hand-verified findings at each game's key tactical moment, encoded permanently so
+they run under `cargo test` instead of needing a live plugin round-trip and a scratch
+database each time. Every assertion had already been derived by hand against the real
+position *and* confirmed live through the actual `chess-tactical-events` pipeline before
+being written down here — this file is the permanent record of that verification, not a
+new round of guessing. Notable finds preserved as regression coverage:
+- Fried Liver: `e4` reads `outnumbered` (2 attackers, 1 defender), not `hanging` — the
+  defender is `Ng5`, defending via a second knight-move line while also attacking `f7`.
+  First hand-derivation expected 0 defenders and was wrong; re-checking found this.
+- ICBM: the queen only becomes hanging the instant `Bg6+` vacates `d3` — the check is a
+  free tempo attached to the move that clears an already-aimed file, not what wins the
+  queen itself.
+- Légal's Trap: `5.Nxe5` vacating `f3` opens `Qd1`'s diagonal onto `Bg4` — a real
+  discovered-attack-shaped consequence of the capture, not just "the knight took a pawn."
+- Drunken Bishops Gambit: the deepest and most interesting one — `11.Be2` (forced,
+  interposing against `10...Re8+`) leaves the bishop pinned along the e-file; two moves
+  later it nominally "defends" `f3` (1 attacker, 1 defender, `false_safety`'s own
+  precondition for firing) but can't actually recapture there without breaking the pin —
+  exactly why `13...Nxf3` is checkmate, not just a won piece. Both `false_defense` and
+  `false_safety` correctly fire on the same square for the same reason.
+- Noah's Ark: deliberately included a case the current tactical ladder *isn't* designed to
+  catch — the bishop's eventual permanent entrapment on `b3` is a positional fact (no legal
+  escape square, ever), not an immediate material-safety one. Only asserted the earlier,
+  genuinely tactical moment (`Bb5` hanging to `...a6`) instead — an honest example of where
+  this ladder's boundary sits, matching the user's own explicitly separate "later, more
+  positional sensors" direction rather than a gap to paper over.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (50 lib — two new; 9 new
+`known_games` integration tests, all passing on first run against hand-derived
+expectations; 28 motif tests unchanged); `cargo clippy --all-targets` zero warnings; STS
+smoke test passes.
+
+## 2026-08-01, follow-up: Alekhine's Gun — an honest boundary case, not a gap papered over
+
+User: "oh, Alekhine's Gun ... that would be interesting too." Sourced the actual historical
+game (Alekhine vs. Nimzowitsch, San Remo 1930) as raw PGN directly from a lichess study
+export (`lichess.org/study/cpuqVg6h/u0Ppk2Ul.pgn`), cross-checked against a chess.com blog
+that independently quoted the same first 26 moves verbatim — the most confidence this suite
+has had in a source, on its longest game by far (34 moves / 67 plies, vs. the previous
+longest at 15 plies).
+
+**The honest finding**: the "gun" formation itself — `Rc2`+`Rc3`+`Qc1` stacked on the
+c-file, completed at move 26 — triggers nothing in the current ladder. No
+`outnumbered`/`overloaded` shows up on Black's c-file stack despite the obvious positional
+pressure a human immediately recognizes. This isn't a bug to chase — Alekhine's gun is a
+slow positional squeeze accumulated over many moves, exactly the category of thing that
+needs the *future* positional sensors (file/zone control tracked over time) this session
+has repeatedly scoped as separate, later work, not the current material-only ladder. Ran
+the game live through `chess-tactical-events` specifically to confirm this absence rather
+than assume it, before deciding what (if anything) to assert.
+
+What the ladder *does* find correctly, one move past the formation: right after `27...b5`,
+White's bishop on `a4` and Black's pawn on `b5` mutually hang each other — neither
+defended — which is exactly why `28.Bxb5` follows in the real game. Added as
+`alekhines_gun_mutual_hang_after_the_queenside_pawn_break` in `tests/known_games.rs`, with
+the "gun itself isn't caught, and here's precisely why that's expected" reasoning written
+directly into the test's own comment rather than left implicit — the same discipline as
+Noah's Ark's entrapment-vs-tactic distinction, now with a second, more prominent example.
+
+Verified: `cargo check`/`test`/`clippy --all-targets` clean (50 lib unchanged; 10
+`known_games` tests — one new, passing on first run against hand-derived expectations; 28
+motif tests unchanged); STS smoke test passes.
