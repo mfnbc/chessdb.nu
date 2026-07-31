@@ -24,6 +24,20 @@ pub struct SensorReport {
     /// Side to move is in check
     #[serde(default)]
     pub in_check: bool,
+    /// King tropism score for the side to move (pieces massed toward the
+    /// enemy king) — a whole-position scalar, not a per-piece concept, so it
+    /// has no natural home in `TacticalReport`/`PositionalReport`.
+    #[serde(default)]
+    pub king_tropism_us: i64,
+    /// Count of files with 2+ rooks stacked, for the side to move.
+    #[serde(default)]
+    pub doubled_rooks_us: i64,
+    /// Development/space differential (us minus them), whole-position scalar.
+    #[serde(default)]
+    pub development_score_diff: i64,
+    /// Initiative score for the side to move, whole-position scalar.
+    #[serde(default)]
+    pub initiative_us: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

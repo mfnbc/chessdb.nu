@@ -2535,7 +2535,7 @@ fn draw_weight(board: &shakmaty::Board, color: Color) -> i64 {
 /// callers uphold this two ways: `analyze_fen_with_engine_score` calls
 /// `normalize_for_eval` first; `coach_derive_cmd.rs`'s direct calls read
 /// `positions.fen`, which is already canonical by construction (see
-/// PLAN.md's "Canonical position identity" section). A future caller that
+/// FINDINGS.md's "Canonical position identity" section). A future caller that
 /// evaluates a real, un-normalized position directly would get silently
 /// wrong material/pawn/king-safety/development scores — nothing here
 /// enforces the precondition, it just has to be upheld by the caller.
@@ -2548,7 +2548,7 @@ pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> Eval
     // are built from, see ThreatGraph::is_in_check) instead of a second,
     // separate shakmaty call. build_sensor_report constructs its own,
     // separate graph later — these two functions don't yet share one across
-    // a single evaluation (see PLAN.md).
+    // a single evaluation (see FINDINGS.md).
     let graph = ThreatGraph::build(chess);
     let in_check = graph.is_in_check(us);
 
@@ -2906,6 +2906,15 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
 
     let in_check = graph.is_in_check(us);
 
+    // Four whole-position scalars with no per-concept typed home elsewhere —
+    // read once, here, at position.rs's own conversion boundary, so no
+    // downstream consumer (render_explanations included) needs to reach back
+    // into groups.*.terms itself.
+    let king_tropism_us = groups.king_safety.terms.get("tropism_us").and_then(|v| v.as_i64()).unwrap_or(0);
+    let doubled_rooks_us = groups.piece_activity.terms.get("doubled_rooks").and_then(|v| v.as_i64()).unwrap_or(0);
+    let development_score_diff = groups.development.terms.get("development_diff").and_then(|v| v.as_i64()).unwrap_or(0);
+    let initiative_us = groups.strategic.terms.get("initiative").and_then(|v| v.as_i64()).unwrap_or(0);
+
     // Partial SensorReport — everything typed downstream consumers (encode_state,
     // extract_concepts) need is already built above. Reused for both rather than
     // re-deriving each from EvalGroups.terms independently.
@@ -2943,6 +2952,10 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         evaluated_forks,
         gated_issues,
         mate_in_1_exists,
+        king_tropism_us,
+        doubled_rooks_us,
+        development_score_diff,
+        initiative_us,
     }
 }
 
@@ -3270,11 +3283,7 @@ pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json
     out
 }
 
-/// Two remaining fields have no typed `SensorReport` home (`tropism_us`,
-/// `doubled_rooks`) alongside two whole-position scores that aren't
-/// per-concept at all (`development_diff`, `initiative`) — these four are a
-/// deliberate, narrow exception to "read only `sensor_report`" below, not a
-/// gap in the migration. Everything else here reads typed data.
+/// Reads only `record.sensor_report` — no `groups.*.terms` access here.
 pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let us_color = record.side_to_move;
@@ -3314,13 +3323,9 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
         out.push(format!("{} has {} fork(s) (by opponent) (e.g. {} -> {}) — consider defensive resources.", opp, forks_them.len(), f.attacker.notation(), t_str));
     }
 
-    // King safety / tropism — no typed field yet, narrow exception (see doc comment above)
-    if let Some(val) = record.groups.king_safety.terms.get("tropism_us") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} pieces show tropism toward the opponent king (score = {}) — attacking chances exist.", side, n));
-            }
-        }
+    // King safety / tropism
+    if sensor.king_tropism_us > 0 {
+        out.push(format!("{} pieces show tropism toward the opponent king (score = {}) — attacking chances exist.", side, sensor.king_tropism_us));
     }
 
     // Rook activity
@@ -3331,13 +3336,9 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     for r in sensor.positional.rook_on_seventh.iter().filter(|r| r.color == us_color) {
         out.push(format!("{} has {} rook(s) on the 7th rank — strong pressure on enemy pawns and king.", side, r.count));
     }
-    // Doubled rooks — no typed field yet, narrow exception (see doc comment above)
-    if let Some(val) = record.groups.piece_activity.terms.get("doubled_rooks") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} has {} doubled-rook file(s) — potential for heavy-file pressure.", side, n));
-            }
-        }
+    // Doubled rooks
+    if sensor.doubled_rooks_us > 0 {
+        out.push(format!("{} has {} doubled-rook file(s) — potential for heavy-file pressure.", side, sensor.doubled_rooks_us));
     }
 
     // Pawn structure notes
@@ -3357,21 +3358,12 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
         out.push(format!("{} has {} outpost(s) (e.g. {} supported by {}) — strong squares often requiring specific plans to challenge.", side, outposts_us.len(), o.piece.notation(), o.supported_by.notation()));
     }
 
-    // Development/space/initiative — whole-position scores, no per-concept typed
-    // home; narrow exception (see doc comment above).
-    if let Some(val) = record.groups.development.terms.get("development_diff") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} is ahead in development/space (diff = {}).", side, n));
-            }
-        }
+    // Development/space/initiative — whole-position scores
+    if sensor.development_score_diff > 0 {
+        out.push(format!("{} is ahead in development/space (diff = {}).", side, sensor.development_score_diff));
     }
-    if let Some(val) = record.groups.strategic.terms.get("initiative") {
-        if let Some(n) = val.as_i64() {
-            if n > 0 {
-                out.push(format!("{} appears to have initiative ({}).", side, n));
-            }
-        }
+    if sensor.initiative_us > 0 {
+        out.push(format!("{} appears to have initiative ({}).", side, sensor.initiative_us));
     }
 
     if out.is_empty() {
