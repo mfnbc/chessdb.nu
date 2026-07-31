@@ -13,18 +13,18 @@
 //!   (`king_safety_score`, `development_space_score`, `piece_activity_score`,
 //!   `detect_outposts`) read directly, instead of each independently
 //!   re-deriving the same attack facts via its own `board.attacks_to`/
-//!   `attacks_from` call. See PLAN.md's "continuity map" thread for the full
+//!   `attacks_from` call. See FINDINGS.md's "continuity map" thread for the full
 //!   migration history — and which call sites still don't use it
 //!   (`detect_skewers`, the legacy `detect_forks`). `find_hanging` and
 //!   `find_outnumbered` are the two most direct piece-safety applications of
 //!   `control` itself — zero defenders vs. attackers simply outnumbering
 //!   real defenders, respectively; `find_outnumbered` was the completeness
 //!   gap noticed only after the fancier cross-references below were already
-//!   built (PLAN.md).
+//!   built (FINDINGS.md).
 //! - **Pricing — `see`/`see_chain`, consumed by `find_forks`.** A genuinely
 //!   different question: not "who's here" but "what would this be worth."
 //!   Runs an actual capture/recapture simulation. Has a known, unfixed
-//!   correctness bug in its multi-step chain math (PLAN.md) — deliberately
+//!   correctness bug in its multi-step chain math (FINDINGS.md) — deliberately
 //!   not depended on by anything in the geometry layer above, so that bug
 //!   doesn't reach `hanging_piece`/`detect_outposts`/`king_safety_score`/etc.
 //!   `find_hanging`'s recorded piece `value` happens to equal what `see`
@@ -38,10 +38,10 @@
 //! occupancy-aware sliding-attack primitives directly — `detect_pins` calls
 //! `attacks::rook_attacks`/`bishop_attacks` itself; `detect_skewers` instead
 //! hand-rolls a ray walk that doesn't yet reuse them (a known, deferred gap,
-//! PLAN.md). Forks *are* graph-derived (`find_forks` below), but through a
+//! FINDINGS.md). Forks *are* graph-derived (`find_forks` below), but through a
 //! second, independent `detect_forks` also exists in `position.rs` purely
 //! for the legacy scoring engine, with a threshold that can disagree with
-//! this one (PLAN.md).
+//! this one (FINDINGS.md).
 //!
 //! - **Cross-reference — `find_overloaded`, `find_false_defense`,
 //!   `find_false_safety`.** A third family, deliberately distinct from
@@ -55,7 +55,7 @@
 //!   pinned piece can still legally move along its own pin line, so this
 //!   checks `attacks::between(attacker, king)`, not just pin-list
 //!   membership). All three are concrete instances of the "pathfind the
-//!   graph, don't calculate the exchange" principle in PLAN.md — a
+//!   graph, don't calculate the exchange" principle in FINDINGS.md — a
 //!   deliberate design stance, not a shortcut taken because the pricing
 //!   layer above is currently buggy.
 //!
@@ -244,7 +244,7 @@ impl ThreatGraph {
     /// Whether `color`'s king is currently attacked — mathematically the same
     /// fact shakmaty's own `Position::checkers().any()` computes
     /// (`king_attackers` there is just `board().attacks_to(...)`, the same
-    /// primitive `attackers_to` is built from — see PLAN.md), read here from
+    /// primitive `attackers_to` is built from — see FINDINGS.md), read here from
     /// the graph already built for this position instead of a second,
     /// separate shakmaty call. Defined in terms of `checkers` — one
     /// computation, not two that happen to agree.
@@ -259,7 +259,7 @@ impl ThreatGraph {
     /// only the king's own square (its own `board.attacks_to` call, not this
     /// graph), and piece_activity_score's `king_ring` usage is a per-piece
     /// existence check ("does this piece's attack reach the ring"), not a
-    /// control sum — see PLAN.md for why neither was migrated onto this in
+    /// control sum — see FINDINGS.md for why neither was migrated onto this in
     /// the same pass it was added.
     pub fn zone_control(&self, zone: Bitboard, color: Color) -> i32 {
         zone.into_iter().map(|sq| self.control(sq, color)).sum()
@@ -493,7 +493,7 @@ impl ThreatGraph {
     /// but attackers still outnumber them. The most direct application of
     /// `control` to piece safety — deliberately checked before the fancier
     /// cross-references (`find_overloaded`, `find_false_defense`) even
-    /// though it was built after them; see PLAN.md.
+    /// though it was built after them; see FINDINGS.md.
     ///
     /// Kings excluded, same reasoning as `find_hanging_raw`: a king in a
     /// double check, with a friendly piece that geometrically covers its
@@ -533,7 +533,7 @@ impl ThreatGraph {
     /// defender of 2+ of its own side's currently-attacked pieces is an
     /// overload. Pure `attackers_to` lookup — no search, no cross-reference
     /// with any other detector needed (contrast the pin/false-defense case,
-    /// which does need one — see PLAN.md).
+    /// which does need one — see FINDINGS.md).
     ///
     /// Targets exclude the king, same reasoning as `find_hanging_raw`: being
     /// the sole piece "defending" a check isn't the same fact as being the

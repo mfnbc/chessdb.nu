@@ -2,7 +2,7 @@
 // traps" / "how to beat your dad at chess" style games), run through the
 // full analysis pipeline (analyze_fen -> sensor_report.tactical) at their
 // key tactical moments. Every game's moves were cross-checked against at
-// least one independent source before being used here — see PLAN.md's
+// least one independent source before being used here — see FINDINGS.md's
 // "regression set of known games" entry for exactly which sources and what
 // each one's confidence level was. Every specific finding asserted below
 // was hand-derived against the real chess position *before* being written
@@ -49,7 +49,7 @@ use shakmaty::{Chess, EnPassantMode, Position};
 /// Deliberately never canonicalized — these tests assert on actual
 /// square/color labels a player watching the real game would see, and
 /// `positions.fen`-style canonicalization would silently mirror them for
-/// any ply where Black is to move (see PLAN.md's "tactical_events fed
+/// any ply where Black is to move (see FINDINGS.md's "tactical_events fed
 /// canonical FEN" entry — the exact mistake this helper avoids by
 /// construction, replaying with shakmaty directly instead of touching
 /// anything canonical).

@@ -120,6 +120,7 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chess-explore <zobrist>` | Move frequencies from a position |
 | `chess-seed-openings` | Re-download and re-apply ECO opening data |
 | `chess-validate <username> <game-id>` | List and consume unreviewed anomalies for a game |
+| `chess-tactical-events <game-id>` | Replay a game's real moves and persist per-ply tactical events (hanging/outnumbered/overloaded/false-defense/false-safety) |
 | `chess-profile <username>` | Comprehensive coaching profile |
 | `chess-profile-tactical <username>` | Tactical drill-down (fork/pin/hanging by phase) |
 | `chess-profile-precision <username>` | Precision drill-down (eval swings, blunder distribution) |
@@ -130,7 +131,11 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 
 - **`nu_plugin_chessdb`** — Rust plugin for all chess semantics
   - HUGM evaluation: 33-row phase table, 11 coefficient arrays (ported from Critter 1.6a)
-  - ThreatGraph: shakmaty-powered attack graph → SEE chains → forks/pins/hanging with material consequence
+  - ThreatGraph: a single shared control/continuity graph per position (`control(sq, color)`) →
+    forks/pins/hanging/outnumbered/overloaded/false-defense/false-safety, plus
+    `collapse_criticality` for pathfinding whether an exchange on a square was
+    calculated correctly. See `nu_plugin_chessdb/PLAN.md` for the full architecture
+    and `nu_plugin_chessdb/FINDINGS.md` for the dated history behind each finding.
   - StateVector encoding: 13-bit `state_id` per position (phase, material, fork, pin, hanging, king)
   - ELO-gated concept ranking: `gated_issues` output with severity × elo_relevance × confidence
 
@@ -152,11 +157,13 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chessdb pgn-to-fens` | Single-game PGN → table of per-move FEN/zobrist/SAN/UCI rows |
 | `chessdb zobrist` | Compute Zobrist hash from FEN |
 | `chessdb canonicalize-fen` | Normalize a FEN to the canonical White-always-to-move frame |
-| `chessdb nnue-eval` | Evaluate FEN(s) via Stockfish NNUE (UCI subprocess) |
+| `chessdb apply-uci` | Apply a UCI move to a FEN, returning the resulting FEN in the same (real, non-canonical) frame |
+| `chessdb collapse-criticality` | Clear a square's local cluster and place each candidate piece back individually to read its true control/check/mate consequences, independent of the other candidates |
+| `chessdb stockfish-eval` | Evaluate FEN(s) via Stockfish (external oracle, UCI subprocess) — not this project's own eval |
 
 ## Database
 
-SQLite with tables: `games`, `positions`, `moves`, `move_states`, `player_baselines`, `move_anomalies`, `transition_events`.
+SQLite with tables: `games`, `positions`, `moves`, `move_states`, `player_baselines`, `move_anomalies`, `transition_events`, `tactical_events`.
 
 Query directly in Nushell:
 

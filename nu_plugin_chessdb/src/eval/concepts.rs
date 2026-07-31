@@ -362,7 +362,7 @@ pub fn rank_issues_for_player(
 /// Encodes phase, material balance, tactical flags, and positional features into 19 bits.
 /// Widened from u16 to u32 when the failure-lattice rungs (`outnumbered`,
 /// `overloaded`, `false_defense`, `false_safety`) were added — u16 had
-/// exactly one free bit left, not four (PLAN.md).
+/// exactly one free bit left, not four (FINDINGS.md).
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct StateVector {
     pub state_id: u32,
@@ -402,7 +402,7 @@ const BIT_OPEN_FILE: u32 = 11;
 const BIT_PASSED_PAWN: u32 = 12;
 const BIT_SKEWER: u32 = 13;
 const BIT_DISCOVERED: u32 = 14;
-// The failure-lattice rungs (PLAN.md, threat_graph.rs module doc): raw-count
+// The failure-lattice rungs (FINDINGS.md, threat_graph.rs module doc): raw-count
 // (outnumbered), commitment-elsewhere (overloaded, false_defense), and the
 // composite rung above both (false_safety) — added together so a position's
 // full ladder depth is visible from state_id alone, not just its topmost

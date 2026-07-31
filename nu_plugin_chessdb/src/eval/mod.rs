@@ -57,7 +57,7 @@
 //! reads directly instead of re-deriving; and a separate, currently-buggy
 //! exchange-*pricing* layer (`see`/`see_chain`) that the geometry layer
 //! never depends on. See `threat_graph.rs`'s own module doc for the full
-//! split and PLAN.md's "continuity map" thread for how it got there.
+//! split and FINDINGS.md's "continuity map" thread for how it got there.
 
 pub mod concept_types;
 pub mod concepts;

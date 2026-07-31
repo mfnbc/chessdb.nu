@@ -12,7 +12,7 @@ use crate::PLUGIN_CATEGORY;
 /// to read its per-candidate, fully-identifiable facts (named checkers,
 /// king-zone deltas, newly-hanging pieces). One record per cluster
 /// candidate, no aggregation, no narrative — the structured facts only; see
-/// PLAN.md's "what can be described vs. what can be quantified" entry for
+/// FINDINGS.md's "what can be described vs. what can be quantified" entry for
 /// why this command deliberately doesn't try to also produce a phrase.
 pub struct CollapseCriticalityCmd;
 

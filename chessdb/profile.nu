@@ -52,7 +52,7 @@ def "profile-phase-stats" [username: string --db: string = "./chess.db"] {
             -- p.hugm_score is relative to whoever is to move AT p (the
             -- opponent of m.color, since m.color just moved to reach p), so
             -- the mover's own perspective is always -p.hugm_score — never
-            -- m.color-conditional. See PLAN.md's hugm_score sign bug entry.
+            -- m.color-conditional. See FINDINGS.md's hugm_score sign bug entry.
             ROUND(AVG(-p.hugm_score), 0) as avg_score_cp,
             ROUND(AVG(ABS(p.hugm_score)), 0) as avg_abs_material
         FROM moves m
@@ -349,7 +349,7 @@ def "position-eval-components" [username: string --db: string = "./chess.db"] {
             -- Each hugm_eval_arr component is relative to whoever is to move
             -- AT p (the opponent of m.color), so the mover's own perspective
             -- is always the negation — never m.color-conditional. See
-            -- PLAN.md's hugm_score/hugm_eval_arr sign bug entry.
+            -- FINDINGS.md's hugm_score/hugm_eval_arr sign bug entry.
             ROUND(AVG(-CAST(json_extract(p.hugm_eval_arr, '\$[1]') AS REAL)), 1) as avg_pawns_cp,
             ROUND(AVG(-CAST(json_extract(p.hugm_eval_arr, '\$[2]') AS REAL)), 1) as avg_activity_cp,
             ROUND(AVG(-CAST(json_extract(p.hugm_eval_arr, '\$[3]') AS REAL)), 1) as avg_king_safety_cp

@@ -258,7 +258,7 @@ fn compute_baselines(rows: &[MoveRecord], states: &[StateVector]) -> HashMap<(St
                 ("discovered_attack", s.has_discovered),
                 ("king_exposed",      s.king_exposed),
                 // Failure-lattice rungs (threat_graph.rs module doc,
-                // PLAN.md): raw-count outnumbered, commitment-elsewhere
+                // FINDINGS.md): raw-count outnumbered, commitment-elsewhere
                 // (overloaded/false_defense), and the composite rung above
                 // both (false_safety) — baselined the same way as every
                 // other binary state-vector concept above, so a player's

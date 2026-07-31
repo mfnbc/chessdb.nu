@@ -13,7 +13,7 @@ use crate::PLUGIN_CATEGORY;
 /// canonical (White-always-to-move) and is *not* a substitute for this: for
 /// any ply where the true side to move is Black, it's a color-swapped,
 /// rank-mirrored version of the real position, not the real position
-/// itself. See PLAN.md's "tactical_events fed canonical FENs" entry.
+/// itself. See FINDINGS.md's "tactical_events fed canonical FENs" entry.
 pub struct ApplyUci;
 
 impl PluginCommand for ApplyUci {

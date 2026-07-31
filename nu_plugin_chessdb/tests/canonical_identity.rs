@@ -5,7 +5,7 @@
 // (as actually played, for human-facing single-game review) while
 // `canonical_san` carries the same move translated into that canonical
 // frame (for cross-game aggregation by position identity); `uci` is left in
-// real terms. See PLAN.md's "Canonical position identity (tablebase-style
+// real terms. See FINDINGS.md's "Canonical position identity (tablebase-style
 // dedup)" section.
 
 use nu_plugin_chessdb::canonical::{flip_colors, normalize_to_white_to_move};

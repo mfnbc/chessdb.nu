@@ -116,7 +116,7 @@ fn discovered_negative_starting_position() {
     // ordinary blocked-slider geometry mirrored on both sides, not a tactical discovered
     // attack — the revealed target (a7/d7/h7 pawn) is adequately defended and worth no more
     // than the attacking rook/queen. Found via the terms-bag -> typed SensorReport migration
-    // (see PLAN.md), which was the first time this concept actually reached gated_issues output.
+    // (see FINDINGS.md), which was the first time this concept actually reached gated_issues output.
     let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     let rec = analyze_fen(fen).expect("FEN should parse");
     let disc_us = rec.groups.tactical.terms.get("discovered_us").and_then(|v| v.as_i64()).unwrap_or(0);

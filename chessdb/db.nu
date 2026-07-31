@@ -136,7 +136,7 @@ export def init-db [db: string] {
         "
     } catch { }
 
-    # The failure-lattice rungs (threat_graph.rs module doc, PLAN.md): raw
+    # The failure-lattice rungs (threat_graph.rs module doc, FINDINGS.md): raw
     # miscount (outnumbered), a defender already committed elsewhere
     # (overloaded, false_defense), and the composite rung above both
     # (false_safety) that fires when the raw count alone said "safe" but
@@ -252,7 +252,7 @@ export def init-db [db: string] {
     # description column: synthesizing "why this matters" from these facts
     # is interpretation, not quantification, and belongs at read time, not
     # frozen into a row that could only ever serve one framing — see
-    # PLAN.md's "what can be described vs. what can be detected" entry.
+    # FINDINGS.md's "what can be described vs. what can be detected" entry.
     open $db | query db "
         CREATE TABLE IF NOT EXISTS tactical_events (
             event_id     INTEGER PRIMARY KEY AUTOINCREMENT,

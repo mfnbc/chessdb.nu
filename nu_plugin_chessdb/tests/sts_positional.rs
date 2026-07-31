@@ -10,12 +10,12 @@
 // position already embodies it. So "does our concept fire on the raw
 // pre-move FEN more often than on an unrelated theme" tests the wrong
 // hypothesis and was retracted from here after producing a false-looking
-// signal (see PLAN.md's "STS calibration" section for that retraction).
+// signal (see FINDINGS.md's "STS calibration" section for that retraction).
 //
 // STS's own "best move" ranking isn't used for validation here either —
 // that's an engine/human judgment call entangled with search and opponent
 // response, a different and much harder problem than "does this position
-// have property X." See PLAN.md's "definitive ground truth" section for the
+// have property X." See FINDINGS.md's "definitive ground truth" section for the
 // actual methodology: only trust positions that are unambiguous by
 // construction (hand-labeled, or derived by pushing our own side's move(s)
 // forward with no opponent-response search — a 2-ply lookahead is a hint to

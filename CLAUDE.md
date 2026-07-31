@@ -102,16 +102,16 @@ produces it, and nothing stops a second representation of the same data growing 
 to the first.
 
 Concretely: `nu_plugin_chessdb/src/eval/position.rs`'s `EvalGroups` holds 9 named groups,
-but each group's real data lives in a `terms: serde_json::Map<String, Value>` grab-bag —
-while `nu_plugin_chessdb/src/eval/sensor.rs`'s `SensorReport` models the same evaluation as
-typed structs (`TacticalReport { forks: Vec<Fork>, pins: Vec<Pin>, ... }`) organized by what
-computed them. Both get built from the same board in the same call
-(`build_sensor_report`, `position.rs:2723`), but `concepts::extract_concepts` — which drives
-the entire ELO-gated coaching output — reads from the untyped `terms` side even though the
-typed data is sitting right next to it unused. That's not a naming nitpick; it's two sources
-of truth that only agree by coincidence of both being computed in the same function. See
-`nu_plugin_chessdb/PLAN.md`'s "Terms-bag → typed SensorReport migration" section for the
-scoped fix.
+and each group's raw scoring terms live in a `terms: serde_json::Map<String, Value>`
+grab-bag — deliberately private to `position.rs`'s own scoring bookkeeping. Nothing outside
+that file's one conversion boundary, `build_sensor_report` (`position.rs:2812`), reads it:
+`concepts::extract_concepts`, `render_explanations`, and `render_structured_explanations`
+all read only `nu_plugin_chessdb/src/eval/sensor.rs`'s typed `SensorReport` now. This is the
+finished state of a migration, not a hypothetical — it's recorded here as the pattern to
+keep applying, not a pattern currently being violated. See
+`nu_plugin_chessdb/FINDINGS.md`'s "Terms-bag → typed SensorReport migration" section for the
+full history (`nu_plugin_chessdb/PLAN.md`'s "How primitives become features" has the current
+architecture summary).
 
 The same principle applies on the Nu side: prefer a record with named fields over a
 generic key-value table when the shape is known ahead of time.
@@ -142,7 +142,7 @@ canonical FEN/zobrist itself — it always looks like White is to move,
 regardless of what really happened.
 
 Two real bugs shipped from getting this backwards (full history in
-`nu_plugin_chessdb/PLAN.md`'s "Canonical position identity" section):
+`nu_plugin_chessdb/FINDINGS.md`'s "Canonical position identity" section):
 - `moves.san` was overwritten with the canonical-frame move instead of the
   real one, so `chess-review` showed players a color-mirrored version of
   their own moves. Fixed by splitting into `san` (real) and `canonical_san`

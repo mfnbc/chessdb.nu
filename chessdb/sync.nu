@@ -74,7 +74,7 @@ def review-game [game_id: int, db: string] {
     # before this move, already relative to this row's own mover) are
     # relative to opposite sides, the per-component swing from the mover's
     # own perspective is -(arr + prev_arr), not arr - prev_arr. See
-    # PLAN.md's "hugm_score/hugm_eval_arr sign bug" entry.
+    # FINDINGS.md's "hugm_score/hugm_eval_arr sign bug" entry.
     let zero_arr = [0 0 0 0 0 0 0 0 0 0 0]
     $raw | enumerate | each { |item|
         let row      = $item.item
@@ -110,19 +110,19 @@ def review-game [game_id: int, db: string] {
 # checkers, king-zone deltas -- via `chessdb collapse-criticality`; for the
 # other four concepts, the instance itself) so a human or the LLM can read
 # exactly why, without recomputation. No player-elo needed -- this is the
-# raw lattice, not the elo-gated coaching shortlist (see PLAN.md). Safe to
+# raw lattice, not the elo-gated coaching shortlist (see FINDINGS.md). Safe to
 # re-run: idempotent via tactical_events' own unique index, same pattern as
 # move_anomalies.
 #
 # stage mirrors concepts.rs's ladder_stage() -- a second place with this
 # same small mapping, since that function is private and operates on
 # aggregated Concepts, not per-instance structs; same kind of known,
-# deferred duplication as the confidence-tier match arms (PLAN.md).
+# deferred duplication as the confidence-tier match arms (FINDINGS.md).
 #
 # Deliberately does NOT read positions.fen -- that column is canonical
 # (White-always-to-move); real per-ply FENs are reconstructed by replaying
 # moves.uci (real terms) from the real starting position instead. See the
-# real-fen-reconstruction comment below and PLAN.md's entry for the bug
+# real-fen-reconstruction comment below and FINDINGS.md's entry for the bug
 # this fixes.
 export def "chess-tactical-events" [
     game_id: int
@@ -143,7 +143,7 @@ export def "chess-tactical-events" [
     # positions.fen is stored in canonical (White-always-to-move) frame --
     # for any ply where the true side to move is Black, it's a rank-mirrored,
     # color-swapped view of the real position, not the real position (see
-    # CLAUDE.md's canonical-identity section, and PLAN.md's entry for the
+    # CLAUDE.md's canonical-identity section, and FINDINGS.md's entry for the
     # real bug this was: an early version of this function fed
     # positions.fen straight into hugm-eval and got square/color labels that
     # didn't match the real game past the very first ply). moves.uci is
@@ -261,7 +261,7 @@ export def "chess-review" [
 
 # Move frequencies and average ELO for a position (identified by its
 # canonical, White-always-to-move Zobrist hash — see nu_plugin_chessdb's
-# PLAN.md "Canonical position identity" section). With --username, also
+# FINDINGS.md "Canonical position identity" section). With --username, also
 # reports how often that specific player faced this position: since the
 # position collapses real color-mirror occurrences from either side of any
 # game onto one row, "hit this position" only means something relative to
