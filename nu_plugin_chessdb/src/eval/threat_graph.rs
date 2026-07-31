@@ -1,11 +1,42 @@
-//! Threat graph: unified attack-relationship graph derived from shakmaty bitboards.
+//! Threat graph: a complete attack-adjacency map (`ThreatGraph::build`, one
+//! pass over the board, every square, not just occupied ones) that feeds two
+//! genuinely different kinds of consumer.
 //!
-//! Builds a complete attack adjacency in one pass over the board, then derives
-//! all tactical concepts (forks, skewers, pins, hanging pieces) as graph queries.
-//! Runs Static Exchange Evaluation (SEE) on each threat to compute the actual
-//! material consequence before categorising the pattern.
+//! - **Geometry — `control`, `attackers`, `attacks_from`, `zone_control`,
+//!   `is_in_check`.** Pure overlap/count, no piece values enter into it at
+//!   all: "who attacks this square, how many more of mine than theirs."
+//!   Cheap, reusable, and provably symmetric — `control(sq, White) ==
+//!   -control(sq, Black)` on every square, on every position (see this
+//!   file's own tests) — because both are just two counts read off the same
+//!   shared `attackers_to[sq]`, not two independently-meaningful maps. This
+//!   is the shared substrate `position.rs`'s scoring functions
+//!   (`king_safety_score`, `development_space_score`, `piece_activity_score`,
+//!   `detect_outposts`) and `find_hanging` read directly, instead of each
+//!   independently re-deriving the same attack facts via its own
+//!   `board.attacks_to`/`attacks_from` call. See PLAN.md's "continuity map"
+//!   thread for the full migration history — and which call sites still
+//!   don't use it (`detect_skewers`, the legacy `detect_forks`).
+//! - **Pricing — `see`/`see_chain`, consumed by `find_forks`.** A genuinely
+//!   different question: not "who's here" but "what would this be worth."
+//!   Runs an actual capture/recapture simulation. Has a known, unfixed
+//!   correctness bug in its multi-step chain math (PLAN.md) — deliberately
+//!   not depended on by anything in the geometry layer above, so that bug
+//!   doesn't reach `hanging_piece`/`detect_outposts`/`king_safety_score`/etc.
+//!   `find_hanging`'s recorded piece `value` happens to equal what `see`
+//!   would compute for that specific case (zero defenders means no
+//!   recapture to walk), but it's read directly from `piece_value`, not
+//!   routed through the buggy chain logic.
 //!
-//! This replaces the separate detector functions with a single graph builder.
+//! **Not built from this graph at all**: pins, skewers, and discovered
+//! attacks are detected independently in `position.rs` (`detect_pins`,
+//! `detect_skewers`, `detect_discovered`) using shakmaty's own
+//! occupancy-aware sliding-attack primitives directly — `detect_pins` calls
+//! `attacks::rook_attacks`/`bishop_attacks` itself; `detect_skewers` instead
+//! hand-rolls a ray walk that doesn't yet reuse them (a known, deferred gap,
+//! PLAN.md). Forks *are* graph-derived (`find_forks` below), but through a
+//! second, independent `detect_forks` also exists in `position.rs` purely
+//! for the legacy scoring engine, with a threshold that can disagree with
+//! this one (PLAN.md).
 
 use shakmaty::{Bitboard, Board, Chess, Color, Piece, Position, Role, Square};
 use crate::eval::concept_types::*;
@@ -69,6 +100,57 @@ impl ThreatGraph {
 
     /// Square index helper.
     fn idx(sq: Square) -> usize { u32::from(sq) as usize }
+
+    /// Net control of `sq`: how many more of `color`'s pieces attack it than
+    /// the opponent's — built entirely from `attackers_to`, already computed
+    /// once for the whole board. Positive means `color` controls this square
+    /// more than the opponent does; negative means the reverse. This is the
+    /// shared "whose continuity is this square in" primitive — a piece is
+    /// hanging exactly when it sits on a square where its own color's control
+    /// is negative (occupied by a piece that can't be defended in kind).
+    pub fn control(&self, sq: Square, color: Color) -> i32 {
+        let idx = Self::idx(sq);
+        let ours = (self.attackers_to[idx] & self.board.by_color(color)).count() as i32;
+        let theirs = (self.attackers_to[idx] & self.board.by_color(color.other())).count() as i32;
+        ours - theirs
+    }
+
+    /// `attackers_to[sq]`, masked to one color — the piece-level view of the
+    /// same continuity primitive `control` summarizes as a differential.
+    pub fn attackers(&self, sq: Square, color: Color) -> Bitboard {
+        self.attackers_to[Self::idx(sq)] & self.board.by_color(color)
+    }
+
+    /// `attacks_from[sq]` — a named accessor so external callers don't need
+    /// `idx` (private). Only meaningful for an occupied square; empty
+    /// otherwise, matching `board.attacks_from`.
+    pub fn attacks_from(&self, sq: Square) -> Bitboard {
+        self.attacks_from[Self::idx(sq)]
+    }
+
+    /// Whether `color`'s king is currently attacked — mathematically the same
+    /// fact shakmaty's own `Position::checkers().any()` computes
+    /// (`king_attackers` there is just `board().attacks_to(...)`, the same
+    /// primitive `attackers_to` is built from — see PLAN.md), read here from
+    /// the graph already built for this position instead of a second,
+    /// separate shakmaty call.
+    pub fn is_in_check(&self, color: Color) -> bool {
+        let king_sq = if color.is_white() { self.kings.0 } else { self.kings.1 };
+        king_sq.map(|sq| self.attackers(sq, color.other()).any()).unwrap_or(false)
+    }
+
+    /// `control`, summed over every square in `zone` — the zone-level
+    /// generalization of the same continuity primitive, for questions like
+    /// "who controls the king ring" rather than "who controls this one
+    /// square." Not yet used anywhere: king_safety_score currently checks
+    /// only the king's own square (its own `board.attacks_to` call, not this
+    /// graph), and piece_activity_score's `king_ring` usage is a per-piece
+    /// existence check ("does this piece's attack reach the ring"), not a
+    /// control sum — see PLAN.md for why neither was migrated onto this in
+    /// the same pass it was added.
+    pub fn zone_control(&self, zone: Bitboard, color: Color) -> i32 {
+        zone.into_iter().map(|sq| self.control(sq, color)).sum()
+    }
 
     /// Value of a piece for SEE ordering.
     fn piece_value(role: Role) -> i64 {
@@ -254,6 +336,7 @@ impl ThreatGraph {
                         square: sq.to_string(),
                     },
                     attacker_count: attacker_count as u8,
+                    value: Self::piece_value(piece.role),
                 });
             }
         }
@@ -352,5 +435,88 @@ pub struct ExchangeChain {
 pub fn role_name(r: Role) -> String {
     match r { Role::Pawn => "Pawn", Role::Knight => "Knight", Role::Bishop => "Bishop",
               Role::Rook => "Rook", Role::Queen => "Queen", Role::King => "King" }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shakmaty::{attacks, fen::Fen, CastlingMode};
+
+    fn pos(fen: &str) -> Chess {
+        Fen::from_ascii(fen.as_bytes()).unwrap().into_position(CastlingMode::Standard).unwrap()
+    }
+
+    #[test]
+    fn control_and_attackers_agree_with_a_direct_recount() {
+        // White queen d4, kings only otherwise. Queen attacks the whole
+        // d-file and 4th rank plus its diagonals; black king defends its own
+        // 8 neighbors. Verify control()/attackers() against an independent
+        // recount via board.attacks_to directly, not by reusing the graph's
+        // own logic.
+        let chess = pos("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        let graph = ThreatGraph::build(&chess);
+        let board = chess.board();
+        let occ = board.occupied();
+
+        for sq in Square::ALL {
+            let expect_white = (board.attacks_to(sq, Color::White, occ) & board.by_color(Color::White)).count() as i32;
+            let expect_black = (board.attacks_to(sq, Color::Black, occ) & board.by_color(Color::Black)).count() as i32;
+            assert_eq!(graph.attackers(sq, Color::White).count() as i32, expect_white, "attackers(White) mismatch at {sq}");
+            assert_eq!(graph.attackers(sq, Color::Black).count() as i32, expect_black, "attackers(Black) mismatch at {sq}");
+            assert_eq!(graph.control(sq, Color::White), expect_white - expect_black, "control(White) mismatch at {sq}");
+        }
+    }
+
+    #[test]
+    fn control_is_one_shared_map_not_two_independent_ones() {
+        // control(sq, White) == -control(sq, Black) for every square, on
+        // every position, by construction (see control's own body: swapping
+        // `color` swaps which count is `ours` vs `theirs`). There's one real
+        // per-square quantity (white_attackers - black_attackers); querying
+        // either color's control is just that one number read with a sign
+        // flip, not two separately-computed maps that happen to agree.
+        for fen in [
+            "4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1",
+            "r1bq1rk1/ppp2ppp/2n2n2/2bpp3/4P3/2PP1N2/PP1N1PPP/R1BQKB1R w KQ - 0 7",
+            "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1",
+        ] {
+            let chess = pos(fen);
+            let graph = ThreatGraph::build(&chess);
+            for sq in Square::ALL {
+                assert_eq!(
+                    graph.control(sq, Color::White), -graph.control(sq, Color::Black),
+                    "control(White)/control(Black) should be exact negatives at {sq} for {fen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zone_control_sums_control_over_every_square_in_the_zone() {
+        let chess = pos("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
+        let graph = ThreatGraph::build(&chess);
+        let king_sq = graph.kings.1.unwrap(); // black king, e8
+        let zone = attacks::king_attacks(king_sq) | Bitboard::from(king_sq);
+
+        let independent_sum: i32 = zone.into_iter().map(|sq| graph.control(sq, Color::Black)).sum();
+        assert_eq!(graph.zone_control(zone, Color::Black), independent_sum);
+        // Ring is {d7,d8,e7,e8,f7,f8}. The queen reaches d7/d8 (same file),
+        // exactly canceled there by the king's own defense of its neighbors
+        // (control 0 on each); e7/f7/f8 are king-defended and queen-unreached
+        // (control +1 each); e8 itself is unattacked by anyone (control 0).
+        // Net: 0 + 0 + 1 + 0 + 1 + 1 = 3.
+        assert_eq!(graph.zone_control(zone, Color::Black), 3);
+    }
+
+    #[test]
+    fn is_in_check_matches_shakmatys_own_is_check() {
+        let in_check = pos("rnb1kbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1qPP/RNBQKB1R w KQkq - 0 1");
+        assert!(in_check.is_check());
+        assert!(ThreatGraph::build(&in_check).is_in_check(Color::White));
+
+        let not_in_check = pos("6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1");
+        assert!(!not_in_check.is_check());
+        assert!(!ThreatGraph::build(&not_in_check).is_in_check(Color::White));
+    }
 }
 

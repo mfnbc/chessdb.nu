@@ -4,7 +4,7 @@
 // - Wikipedia: Positional play / pawn structures (examples adapted)
 // - Lichess public puzzles / study examples (representative)
 
-use nu_plugin_chessdb::eval::{analyze_fen, analyze_fen_with_engine_score, extract_concepts, Side};
+use nu_plugin_chessdb::eval::{analyze_fen, analyze_fen_with_engine_score, extract_concepts, rank_issues_for_position, Side};
 
 #[test]
 fn wikipedia_pawn_break_detected() {
@@ -222,4 +222,112 @@ fn board_normalization_reports_real_squares_and_colors_for_black_to_move() {
     let mat2 = rec2.sensor_report.gated_issues.iter().find(|g| g.name == "material_imbalance").expect("material_imbalance issue");
     assert_eq!(mat2.side, Side::White);
     assert!(mat2.phrase.starts_with("White"), "phrase should say White, got: {}", mat2.phrase);
+}
+
+// Regression (found 2026-07-30 in a "what's detected but never surfaced"
+// audit): sensor_report.mate_in_1_exists was a real, fully-computed legal-move
+// scan that never became a Concept, so a live mate-in-1 opportunity produced
+// no coaching signal at all — the same bug class as the hanging_piece gap
+// fixed earlier this session. Also locks in that its severity (1000) is high
+// enough to outrank material_imbalance in the ranked gated_issues output —
+// finding a forced mate should never lose to a material-swing comment.
+#[test]
+fn mate_in_1_is_detected_and_ranks_above_material_imbalance() {
+    // Back-rank mate: Ra1-a8# for White (Black king on g8 boxed in by its own
+    // f7/g7/h7 pawns). Also a large material lead (R vs 3P), which is exactly
+    // the scenario that would previously have outranked mate_in_1 entirely.
+    let fen = "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    assert!(rec.sensor_report.mate_in_1_exists, "sensor should detect the mate-in-1");
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let mate = concepts.iter().find(|c| c.name == "mate_in_1").expect("mate_in_1 concept should be present");
+    assert_eq!(mate.side, Side::White);
+
+    let issues = rank_issues_for_position(&concepts, 400);
+    assert_eq!(issues.first().map(|i| i.name.as_str()), Some("mate_in_1"), "mate_in_1 should rank first, got {issues:?}");
+
+    // The actual bug: `sensor_report.gated_issues` (the field a real
+    // `chessdb hugm-eval --player-elo N` call returns) is computed *inside*
+    // `build_sensor_report`, from a `partial` SensorReport built before this
+    // function returns. The first version of this fix only wired mate_in_1
+    // into `extract_concepts`, leaving `mate_in_1_exists` computed by the
+    // *caller* (`analyze_fen_with_engine_score`) and patched onto the result
+    // afterward — too late for build_sensor_report's own internal
+    // extract_concepts call to see it. So `concepts`/`rank_issues_for_position`
+    // above (called directly, bypassing that ordering bug) could pass while
+    // the real API still silently produced no mate_in_1 issue at all. Now
+    // fixed by computing mate_in_1_exists inside build_sensor_report itself.
+    let rec_elo = analyze_fen_with_engine_score(fen, None, Some(400)).expect("FEN should parse");
+    assert_eq!(
+        rec_elo.sensor_report.gated_issues.first().map(|g| g.name.as_str()),
+        Some("mate_in_1"),
+        "sensor_report.gated_issues (the real API surface) should rank mate_in_1 first, got {:?}",
+        rec_elo.sensor_report.gated_issues
+    );
+
+    // Flip-invariance: the same physical mate-in-1 fact, reached via a
+    // Black-to-move mirror (rank-flipped, case-swapped, side-to-move
+    // flipped) that goes through normalize_for_eval's flip path internally —
+    // must produce the identical result, proving mate_in_1_exists doesn't
+    // depend on which frame build_sensor_report happens to be given.
+    let mirrored_fen = "r3k3/8/8/8/8/8/5PPP/6K1 b - - 0 1";
+    let rec_mirrored = analyze_fen_with_engine_score(mirrored_fen, None, Some(400)).expect("FEN should parse");
+    assert!(rec_mirrored.sensor_report.mate_in_1_exists, "mirrored position should also detect the mate-in-1");
+    assert_eq!(
+        rec_mirrored.sensor_report.gated_issues.first().map(|g| g.name.as_str()),
+        Some("mate_in_1"),
+        "mirrored position's gated_issues should also rank mate_in_1 first"
+    );
+}
+
+// Regression (found in the same audit): sensor_report.positional.pawn_islands
+// was computed by extract_pawn_islands (only populated once a side has 2+
+// islands — fragmented pawn groups) but never turned into a Concept.
+#[test]
+fn pawn_islands_is_detected() {
+    // White pawns on a2/h2 (2 islands, opposite edges of the board); Black
+    // pawns on e7/f7 (adjacent files, 1 island — correctly not recorded).
+    let fen = "4k3/4pp2/8/8/8/8/P6P/4K3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    assert_eq!(rec.sensor_report.positional.pawn_islands.len(), 1, "only White should have a recorded pawn-islands entry");
+    assert_eq!(rec.sensor_report.positional.pawn_islands[0].color, Side::White);
+    assert_eq!(rec.sensor_report.positional.pawn_islands[0].count, 2);
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let islands = concepts.iter().find(|c| c.name == "pawn_islands").expect("pawn_islands concept should be present");
+    assert_eq!(islands.side, Side::White);
+    assert_eq!(islands.elo_min, 1600);
+}
+
+// Regression (2026-07-30, same audit): hanging_piece severity used to be a
+// flat count * weight (e.g. two hanging pawns scored identically to two
+// hanging queens). Now anchored on the single biggest piece at risk (the
+// real immediate danger — only one capture happens per move), with a
+// smaller weight for additional simultaneously-hanging pieces, since a
+// position with several pieces hanging at once is genuinely worse than one
+// with a single hanging piece of the same size. HangingPiece.value is exact
+// for this detection (zero defenders means no recapture, so it equals the
+// full SEE result, not an approximation of it).
+#[test]
+fn hanging_piece_severity_is_anchored_on_the_biggest_at_risk() {
+    // Black queen d8 (attacked by White Ra1d1's Rd1, open d-file) and knight
+    // a4 (attacked by White Ra1, open a-file, blocked at a4) -- verified
+    // independently that neither black piece defends the other and the
+    // black king isn't adjacent to either.
+    let fen = "k2q4/8/8/8/n7/8/8/R2RK3 w - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+
+    let hanging = &rec.sensor_report.tactical.hanging;
+    assert_eq!(hanging.len(), 2, "expected both the queen and knight to be detected hanging, got {hanging:?}");
+    let queen = hanging.iter().find(|h| h.piece.role == "Queen").expect("queen should be hanging");
+    assert_eq!(queen.value, 900, "HangingPiece.value should be the real piece value, not a flat placeholder");
+    let knight = hanging.iter().find(|h| h.piece.role == "Knight").expect("knight should be hanging");
+    assert_eq!(knight.value, 320);
+
+    let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
+    let concept = concepts.iter().find(|c| c.name == "hanging_piece").expect("hanging_piece concept should be present");
+    assert_eq!(concept.side, Side::Black);
+    // max (900) + 0.3 * rest (320) = 996, not a flat 60*2=120 or a naive sum of 1220.
+    assert_eq!(concept.severity, 996, "severity should be max-anchored with a smaller weight for the second piece, got {}", concept.severity);
 }

@@ -48,6 +48,20 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
     let mut concepts = Vec::new();
     let (us_color, them_color) = (side_to_move, side_to_move.other());
 
+    // Mate in 1 (ELO 400+): the single most decisive tactical fact a
+    // position can have, checked first for that reason. sensor.mate_in_1_exists
+    // is a real legal-move scan (position.rs's build_sensor_report) that was
+    // already fully computed but never turned into a Concept — it only ever
+    // reached DB-aggregate mate-conversion stats (chess-profile-mate-analysis)
+    // after the fact, never live coaching output for the position itself.
+    if sensor.mate_in_1_exists {
+        // severity is fixed at 1000, well above any realistic material_imbalance
+        // (a full queen is ~900) — finding a forced mate should always outrank
+        // material commentary in the ranked gated_issues output, not just
+        // happen to win on a case-by-case basis.
+        concepts.push(Concept { name: "mate_in_1".into(), severity: 1000, side: us_color, phrase: format!("{} has a mate in 1!", us_color), elo_min: 400 });
+    }
+
     // --- Material (ELO 600+) ---
     let material_imbalance = groups.material_total.value;
     if material_imbalance.abs() > 50 {
@@ -74,9 +88,31 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
         "skewer", 45, 1200, |side, n| format!("{} has {} skewer(s)", side, n));
     count_and_push_by_color(&mut concepts, &sensor.tactical.discovered, |d| d.attacker.color, us_color, them_color,
         "discovered_attack", 60, 1400, |side, n| format!("{} has {} discovered attack(s)", side, n));
-    // Hanging pieces — typed data existed but this concept was never emitted before this session.
-    count_and_push_by_color(&mut concepts, &sensor.tactical.hanging, |h| h.piece.color, us_color, them_color,
-        "hanging_piece", 60, 600, |side, n| format!("{} has {} hanging piece(s)", side, n));
+    // Hanging pieces (ELO 600+): typed data existed but this concept was never
+    // emitted before this session. Doesn't fit count_and_push_by_color — severity
+    // is anchored on the single biggest piece at risk (only one capture happens
+    // per move, so that's the real immediate danger), with a smaller weight for
+    // any additional hanging pieces: a position with several pieces hanging at
+    // once is a genuinely worse, harder-to-navigate mess than one with a single
+    // hanging piece of the same size, even though the rest aren't lost on the
+    // very next move — they tend to linger and accumulate if not addressed.
+    for side in [us_color, them_color] {
+        let mut values: Vec<i64> = sensor.tactical.hanging.iter()
+            .filter(|h| h.piece.color == side)
+            .map(|h| h.value)
+            .collect();
+        if values.is_empty() { continue; }
+        values.sort_unstable_by(|a, b| b.cmp(a));
+        let max = values[0];
+        let rest: i64 = values[1..].iter().sum();
+        let severity = max + (rest as f64 * 0.3) as i64;
+        let phrase = if values.len() == 1 {
+            format!("{} has a hanging piece worth {} centipawns", side, max)
+        } else {
+            format!("{} has {} hanging pieces (biggest worth {} centipawns)", side, values.len(), max)
+        };
+        concepts.push(Concept { name: "hanging_piece".into(), severity, side, phrase, elo_min: 600 });
+    }
 
     // Pawn structure (ELO 1600+): isolated pawns, keyed by the pawn's real color (not us/them)
     count_and_push_by_color(&mut concepts, &sensor.positional.isolated_pawns, |p| p.color, Side::White, Side::Black,
@@ -88,6 +124,14 @@ pub fn extract_concepts(sensor: &SensorReport, groups: &EvalGroups, side_to_move
     if doubled_white > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_white * 30, side: Side::White, phrase: format!("white has {} doubled pawn(s)", doubled_white), elo_min: 1600 }); }
     let doubled_black: i64 = sensor.positional.doubled_pawns.iter().filter(|p| p.color == Side::Black).map(|p| p.count as i64).sum();
     if doubled_black > 0 { concepts.push(Concept { name: "doubled_pawn".into(), severity: doubled_black * 30, side: Side::Black, phrase: format!("black has {} doubled pawn(s)", doubled_black), elo_min: 1600 }); }
+
+    // Pawn islands (ELO 1600+): extract_pawn_islands only records an entry
+    // once a side has 2+ islands (fragmented pawn groups are structurally
+    // weaker — harder to defend, easier to pick off one at a time). Computed
+    // but never turned into a Concept before now.
+    for isl in &sensor.positional.pawn_islands {
+        concepts.push(Concept { name: "pawn_islands".into(), severity: isl.count as i64 * 20, side: isl.color, phrase: format!("{} has {} pawn islands", isl.color, isl.count), elo_min: 1600 });
+    }
 
     // Pawn majority (1800+) and breaks (1800+)
     for m in &sensor.positional.pawn_majority {
@@ -167,10 +211,10 @@ pub fn rank_issues_for_position(concepts: &[Concept], player_elo: i32) -> Vec<Ga
         let elo_relevance = if c.elo_min <= player_elo { 1.0 }
             else { 0.5f64.powf((c.elo_min - player_elo) as f64 / 200.0) };
         let confidence = match c.name.as_str() {
-            "fork"|"pin"|"skewer"|"discovered_attack"|"king_in_check" => 1.0,
+            "mate_in_1"|"fork"|"pin"|"skewer"|"discovered_attack"|"king_in_check" => 1.0,
             "hanging_piece"|"passed_pawn"|"material_imbalance" => 0.9,
             "rook_open_file"|"rook_seventh"|"outpost"|"development" => 0.8,
-            "king_exposed"|"isolated_pawn"|"doubled_pawn" => 0.7,
+            "king_exposed"|"isolated_pawn"|"doubled_pawn"|"pawn_islands" => 0.7,
             _ => 0.6,
         };
         let score = c.severity as f64 * elo_relevance * confidence;
@@ -199,10 +243,10 @@ pub fn rank_issues_for_player(
         let elo_relevance = if c.elo_min <= player_elo { 1.0 }
             else { 0.5f64.powf((c.elo_min - player_elo) as f64 / 200.0) };
         let confidence = match c.name.as_str() {
-            "fork"|"pin"|"skewer"|"discovered_attack"|"king_in_check" => 1.0,
+            "mate_in_1"|"fork"|"pin"|"skewer"|"discovered_attack"|"king_in_check" => 1.0,
             "hanging_piece"|"passed_pawn"|"material_imbalance" => 0.9,
             "rook_open_file"|"rook_seventh"|"outpost"|"development" => 0.8,
-            "king_exposed"|"isolated_pawn"|"doubled_pawn" => 0.7,
+            "king_exposed"|"isolated_pawn"|"doubled_pawn"|"pawn_islands" => 0.7,
             _ => 0.6,
         };
         let score = magnitude * c.severity as f64 * elo_relevance * confidence;

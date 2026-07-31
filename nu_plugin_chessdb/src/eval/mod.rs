@@ -44,6 +44,20 @@
 //!
 //! This is a real structural difference (cached-then-converted vs.
 //! direct-scan-and-build), not inconsistent naming — read it that way.
+//!
+//! ## ThreatGraph: the shared attack-geometry substrate
+//!
+//! `compute_groups` and `build_sensor_report` each build their own
+//! `ThreatGraph` (`threat_graph.rs`) — a deliberate, documented tradeoff (one
+//! extra whole-board pass per evaluation) rather than threading a single
+//! graph across both; they don't yet share one. `ThreatGraph` itself splits
+//! into two layers with very different reliability: cheap, tested,
+//! provably-symmetric attack-overlap primitives (`control`, `attackers`,
+//! `zone_control`, `is_in_check`) that most of `position.rs`'s scoring now
+//! reads directly instead of re-deriving; and a separate, currently-buggy
+//! exchange-*pricing* layer (`see`/`see_chain`) that the geometry layer
+//! never depends on. See `threat_graph.rs`'s own module doc for the full
+//! split and PLAN.md's "continuity map" thread for how it got there.
 
 pub mod concept_types;
 pub mod concepts;

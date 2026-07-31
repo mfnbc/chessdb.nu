@@ -99,6 +99,11 @@ pub struct DiscoveredAttack {
 pub struct HangingPiece {
     pub piece: PieceRef,
     pub attacker_count: u8,
+    /// Material at stake if the attacker simply takes it — exact, not an
+    /// estimate: with zero defenders (this struct's whole definition) there's
+    /// no recapture, so this equals the full SEE result for the single
+    /// capture on this square, not just a face-value approximation of it.
+    pub value: i64,
 }
 
 // ── Positional concepts ──

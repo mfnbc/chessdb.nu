@@ -1800,3 +1800,531 @@ green — none of this round's fixes touched Rust test-covered code); `cargo cli
 --all-targets` still zero warnings; STS smoke test passes; both edited `.nu` files pass
 `nu-check`; `chess-validate`'s fix additionally verified against a real seeded SQLite
 database (not just static checks), described above.
+
+Re-audit 2026-07-30 (5): mate_in_1 and pawn_islands were detected but never
+surfaced as coaching concepts
+
+User asked "what are all the [concepts] detected in a FEN" — walking `SensorReport`'s
+full field list (`sensor.rs`) against `extract_concepts` (`concepts.rs`) to answer that
+question directly found two gaps: `sensor.mate_in_1_exists` and
+`sensor.positional.pawn_islands` are both fully computed (the former a real legal-move
+scan for a mate-delivering move, the latter `extract_pawn_islands`'s file-adjacency scan)
+but neither was ever turned into a `Concept`, so neither ever reached `gated_issues` for a
+live position — the exact bug class `concepts.rs:77`'s own comment already documents once
+for `hanging_piece` ("typed data existed but this concept was never emitted before this
+session"). `mate_in_1_exists` in particular only ever reached players after the fact, via
+`positions.mate_in_1` → `chess-profile-mate-analysis`'s aggregate "did you find your
+mates" stat — never as an in-the-moment issue for the position actually being analyzed.
+
+**Fixed**, both in `extract_concepts`:
+- `mate_in_1` (ELO 400+, the lowest gate in the system — deliberately below
+  `material_imbalance`/`hanging_piece`'s 600, since spotting a forced mate is more
+  fundamental than either): severity fixed at **1000**, not scaled from anything, and
+  verified via a real back-rank-mate FEN (`R3K3` vs `k` boxed in by its own pawns, which
+  also happens to carry a large material lead) that it actually outranks
+  `material_imbalance` in `rank_issues_for_position`'s output — the first version of this
+  fix used severity 200 and *lost* that ranking to a 632-severity material imbalance in
+  testing, which would have been a materially misleading regression (a coach that mentions
+  material before "you can mate right now" is actively bad coaching) had it not been
+  caught before committing.
+- `pawn_islands` (ELO 1600+, same tier as `isolated_pawn`/`doubled_pawn`): severity
+  `count * 20`.
+- Both added to the `confidence` match arm in **both** `rank_issues_for_position` and
+  `rank_issues_for_player` (`mate_in_1` at the top 1.0 tier alongside fork/pin/skewer/
+  discovered_attack/king_in_check; `pawn_islands` at the 0.7 tier alongside
+  king_exposed/isolated_pawn/doubled_pawn) — these two match arms are themselves
+  identical copy-pasted lists, a minor pre-existing duplication noted but not fixed here
+  since it wasn't part of what was asked.
+
+Verified beyond `cargo test`: hand-ran both new FENs through `extract_concepts` and
+`rank_issues_for_position` directly (a throwaway `src/bin/_scratch_verify*.rs`, deleted
+after use — not committed) before writing permanent tests, specifically to catch the
+severity-ranking problem above, which unit-testing "concept exists in the list" alone
+would have missed entirely. Permanent regression tests added to `tests/motif_canonical.rs`:
+`mate_in_1_is_detected_and_ranks_above_material_imbalance`,
+`pawn_islands_is_detected`. Full suite green (39 lib + 13 motif, up from 11), clippy
+zero warnings, STS smoke test passes.
+
+Correction (same session, minutes later): the fix above was necessary but not
+sufficient — `mate_in_1_exists` was still architecturally bolted on, and that turned out
+to be a live bug, not just a smell. User pushed back: "it needs the de[dup]lification,
+because if the fen is ever evaluated you should be able to retrieve the mate in 1 value
+as well" — i.e. fold the detection into the one shared evaluation path instead of one
+caller patching it on after the fact.
+
+Tracing it further: `build_sensor_report` computed its own `gated_issues` internally
+(`position.rs`, via `extract_concepts(&partial, ...)`, where `partial` is a `SensorReport`
+built *inside* the function) — and returned `mate_in_1_exists: false` unconditionally at
+its very end. `analyze_fen_with_engine_score` then computed the real
+`mate_in_1_exists` value itself (from the un-normalized position, deliberately, per a
+comment already there) and patched it onto the *already-returned* `SensorReport`
+afterward — too late to affect the `gated_issues` that had already been computed inside
+`build_sensor_report`. Confirmed with a throwaway scratch binary: `analyze_fen_with_engine_score(fen, None, Some(400)).sensor_report.gated_issues` for the
+same back-rank-mate FEN used in the test above did **not** contain `mate_in_1` even
+after the "fix" above — only the lower-level `extract_concepts`/`rank_issues_for_position`
+calls (bypassing that ordering bug) had been exercised by the first test. Also confirmed
+`coach_derive_cmd.rs`'s two direct `build_sensor_report` callers (the `encode_move_states`
+slow path, and its own test) got nothing at all, ever — they don't go through
+`analyze_fen_with_engine_score`.
+
+**Fixed properly**: moved the mate-in-1 detection (`chess.legal_moves().iter().any(|m|
+{...c.is_checkmate()})`) into `build_sensor_report` itself, computed early and included in
+`partial` (so `extract_concepts`'s internal call sees it) and in the final returned
+`SensorReport` — not patched on by any caller. `analyze_fen_with_engine_score` no longer
+computes or patches it at all; every caller of `build_sensor_report` gets it for free now,
+matching every other sensor in the file. Verified the "computed from whichever position
+frame you're given, real or eval-normalized, doesn't matter" claim in the original
+(now-deleted) comment is actually true, not just asserted: fed a hand-verified Black-to-move
+mirror of the same physical mate-in-1 fact (rank-flipped/case-swapped/side-flipped, which
+goes through `normalize_for_eval`'s internal flip) and confirmed identical
+`mate_in_1_exists`/`gated_issues` output — both via a throwaway scratch check and as a
+permanent assertion added to `mate_in_1_is_detected_and_ranks_above_material_imbalance`.
+
+Verified: full suite still green (39 lib + 13 motif — no test count change, existing
+assertions in the same test strengthened rather than new tests added), clippy zero
+warnings, STS smoke test passes.
+
+Follow-on (same session): material_score's white/black closures made explicit us/them
+
+Walking the ELO-sorted sensors for a "how is this detected" session, the user caught
+`material_score`'s internal `white`/`black` closures — literal `Color::White`/
+`Color::Black`, unlike every sibling function in `compute_groups`
+(`pawn_structure_score`, `king_safety_score`, `development_score`), which all take an
+explicit `us: Color` parameter. Traced why this was safe: `material_score` is only ever
+called with an already-canonical (White-to-move) board, so literal White ≡ `us` by
+construction — but that's an invariant upheld entirely by caller discipline across two
+files, nowhere stated at `material_score`'s own signature.
+
+Checked all three call sites of `compute_groups` (the only caller of `material_score`)
+to confirm the invariant currently holds everywhere: `analyze_fen_with_engine_score`
+explicitly calls `normalize_for_eval` (itself just `canonical::normalize_to_white_to_move`)
+first; `coach_derive_cmd.rs`'s two direct calls parse `chess` from `r.fen`, which traces to
+`positions.fen` — already canonical by construction (confirmed: `MoveRecord.fen` ←
+`rec.get("fen")` ← SQL's bare `p.fen` in `chess-derive`'s query, and `positions.fen` is
+never written except via `pgn_to_fens`'s canonical output or `core::initial_position()`).
+Also checked whether `MaterialBalance`'s white/black fields (built from `material_score`'s
+own `terms` map) are mislabeled when the position was flipped — they aren't:
+`unflip_sensor_report` (`position.rs:2953-2957`) already explicitly swaps
+`bal.white`/`bal.black` and the bishop-pair flags in that case, so the real-terms output
+was never actually wrong, just the internal scoring's own expression.
+
+**Fixed**: `material_score` now takes `us: Color` explicitly and uses `ours`/`theirs`
+closures (`piece_count(board, us, ...)`/`piece_count(board, them, ...)`) throughout the
+`mg`/`eg` blend and all six adjustment terms (bishop pair, rook/pawn penalty, knight/pawn
+bonus, minor-vs-major comparison, redundant rook, redundant queen+rook) — matching every
+sibling function's convention. Its output (`blended`, feeding `material_total.value`,
+the `material_imbalance` concept's source) is now correct-by-construction relative to
+whichever `us` it's given, not correct-only-because-every-caller-happens-to-pass-White.
+The `terms` map (the JSON `"white_queens"`/`"black_queens"` etc. keys feeding
+`MaterialBalance`) deliberately stays literal-color, untouched — that's the real-terms
+output path already correctly handled by `unflip_sensor_report`'s explicit swap, a
+genuinely different job from the internal us-relative scoring. Added a doc comment to
+`compute_groups` stating the canonicalization precondition explicitly, since nothing
+enforces it — a future caller that evaluates a real, un-normalized position directly
+would still silently get every score in this file wrong, not just material.
+
+Verified as a pure refactor, not a behavior change: full suite green (39 lib + 13 motif,
+unchanged), clippy zero warnings, STS smoke test passes, and directly re-checked
+`material_total.value` for three FENs (632, 0, 0) against the exact values observed
+before this change — byte-identical.
+
+Follow-on: hanging_piece value/severity, and ThreatGraph::control (phase 1 of a
+larger "shared continuity map" direction)
+
+Continuing the ELO-ladder walkthrough to `hanging_piece` (ELO 600, tied with
+`material_imbalance`) surfaced a real design gap: severity was a flat `count * 60`
+(`concepts.rs`) — two hanging pawns scored identically to two hanging queens. Traced the
+right fix through `ThreatGraph::see`/`see_chain` (already used by `find_forks` for exact
+material-consequence-of-a-capture-sequence, i.e. Static Exchange Evaluation): for a piece
+with **zero defenders** (which is `find_hanging`'s entire definition), SEE has no recapture
+to walk — it reduces to exactly `piece_value(role)`. So weighting by piece value isn't an
+approximation of SEE for this case, it *is* SEE, just without paying for a chain walk that
+would immediately terminate. (A broader "defended but still SEE-losing" detector was scoped
+as a distinct, higher-ELO sibling concept — not built yet, needs its own pass once the
+ladder reaches a tier where calculating a trade, not just spotting an undefended piece, is
+the actual skill being taught.)
+
+**Real-game observation that shaped the severity formula**: hanging pieces don't
+necessarily get captured immediately — multiple pieces can sit hanging simultaneously and
+persist over several moves if neither side notices. So severity shouldn't be pure `max`
+(loses the "this is a messier, more dangerous position" signal from multiple simultaneous
+threats) or pure `sum` (overstates it — only one capture happens per move; summing treats
+every hanging piece as equally certain to be lost). Settled on max-anchored with a damped
+weight for the rest: `severity = max_value + 0.3 * sum(remaining values)`. The single
+biggest piece dominates (the honest "what's actually at risk right now" signal), but a
+second or third hanging piece still meaningfully raises severity above a single-piece case
+of the same size, and the phrase text carries the count/max explicitly either way (e.g.
+`"black has 2 hanging pieces (biggest worth 900 centipawns)"`) so the ranking math
+collapsing to one number doesn't lose the fact from the coaching text.
+
+**Fixed**:
+- `HangingPiece` (`concept_types.rs`) gained a `value: i64` field, populated in
+  `find_hanging` via the same `Self::piece_value(role)` table `see_chain` already uses —
+  one source of truth, no second piece-value table introduced.
+- `extract_concepts`'s `hanging_piece` handling replaced the `count_and_push_by_color`
+  call with the max-anchored formula above (doesn't fit that helper's flat-weight shape,
+  same reason `doubled_pawn` already has its own manual loop).
+- Verified with a hand-built position (queen worth 900 + knight worth 320 hanging
+  simultaneously, cross-checked to confirm neither piece defends the other and the king
+  isn't adjacent to either): severity came out to exactly `900 + 0.3*320 = 996`, matching
+  the formula precisely. Locked in as a permanent test,
+  `hanging_piece_severity_is_anchored_on_the_biggest_at_risk`.
+
+**Also added (phase 1 of a larger, explicitly-scoped-but-not-yet-executed direction)**:
+`ThreatGraph::control(sq, color) -> i32` — net attacker-count differential at a square,
+built entirely from `attackers_to` (already computed once per position). Motivated by
+recognizing that `hanging_piece` and `detect_outposts` are both really asking the same
+underlying question — "whose continuity does this square belong to" — but currently
+answer it two different ways: `find_hanging` reads the shared `ThreatGraph.attackers_to`
+`hanging_piece` already sits on; `detect_outposts` (`position.rs:2102`) computes its own
+separate, narrower `pawn_attack_mask` (pawns only, not the full attack picture) from
+scratch, even though `ThreatGraph` has *already been built* by the point
+`build_sensor_report` calls `detect_outposts` — it's just never threaded through.
+`king_ring` (king safety) has the same shape: a third, independently-computed attack
+zone. Confirmed with shakmaty's own source (`position.rs:442-567` in the shakmaty crate)
+that this isn't "moving outside shakmaty" — `king_attackers` (which shakmaty's own
+`checkers()`/`is_check()` are built from) is *itself* just `board.attacks_to(...)`, the
+same primitive `ThreatGraph` already calls; the generalization is reusing one whole-board
+computation of a shakmaty primitive instead of each detector calling a narrower one
+separately.
+
+**Scoped, not yet done**: migrating `detect_outposts` onto `graph.attackers_to`/`control`
+(needs `graph: &ThreatGraph` threaded into its signature, and a direct before/after
+numeric check on real outpost positions, same discipline as the `material_score`
+refactor); `king_ring`/king safety migration scoped as lower-priority and needing its own
+look, since king safety scoring does more than pure attacker-counting. `in_check` also
+still calls `chess.is_check()` independently rather than reading `graph.attackers_to` at
+the king square (a live, previously-identified duplicate-computation instance of the same
+pattern) — not yet fixed either.
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (39 lib, unchanged — the
+`control` method has no callers yet so nothing exercises it directly; 14 motif tests, up
+from 13, new test above); `cargo clippy --all-targets` zero warnings; STS smoke test
+passes.
+
+Phase 3: detect_outposts migrated onto the shared ThreatGraph substrate
+
+Added `ThreatGraph::attackers(sq, color) -> Bitboard` (`attackers_to[sq]` masked to one
+color — the piece-level counterpart to `control`'s differential). `detect_outposts`
+(`position.rs:2102`) now reads `graph.attackers(...)` for both its "not attackable by
+enemy pawns" check and its "supported by own pawn / fallback: any other piece" checks,
+instead of its own separate `pawn_attack_mask`/`board.attacks_to` calls — same primitive
+family `find_hanging` already reads, per the "continuity map" direction scoped in the
+entry above.
+
+**Real complication found while doing this, handled deliberately**: `detect_outposts` is
+called from *two* places — `build_sensor_report` (which already has a `ThreatGraph`) and
+`compute_groups` (the legacy scoring engine, which had never built one). Rather than give
+`detect_outposts` two code paths (graph vs. no-graph) or leave it inconsistent between
+call sites, `compute_groups` now builds its own `ThreatGraph` too — a real, deliberate
+tradeoff (one extra O(64) graph build per evaluation) in exchange for one detector
+implementation instead of two. Documented in a comment at the build site that
+`compute_groups` and `build_sensor_report` don't yet share a single graph across one
+evaluation — a further consolidation, scoped but explicitly not attempted here.
+
+**Found in passing, confirmed pre-existing (not introduced by this change)**: the
+"fallback: supported by any other piece" branch has never actually recorded *which*
+piece defends the outpost — it pushes a literal `Square::E1` placeholder regardless of
+where the real defender is (confirmed via `git diff`: this line was already there,
+unchanged by this migration). A test position with a real piece incidentally placed on
+e1 will show a misleading `supported_by` in the typed output. Not fixed — separate,
+minor, pre-existing bug, noted for whenever positional-detector accuracy gets its own pass.
+
+Verified as a pure refactor via the same discipline as the `material_score` change:
+`git stash`'d this change, ran `analyze_fen_with_engine_score` on 5 real positions
+(including one with a genuine detected outpost, `final_score=148, outposts_us=1`) against
+the pre-migration code, `git stash pop`'d, reran the identical positions — byte-identical
+`final_score` and `outposts_us`/`outposts_them` on every one. Also hand-verified all four
+outpost branches individually (pawn-supported, non-pawn-supported/fallback,
+attacked-by-enemy-pawn/correctly rejected, undefended/correctly rejected) against known
+chess facts. Full suite green (39 lib + 14 motif, unchanged counts — this phase added no
+new tests since it's a pure internal refactor, verified by the A/B numeric comparison
+instead), clippy zero warnings, STS smoke test passes.
+
+Phase 4: in_check migrated onto the shared substrate too
+
+`ThreatGraph::is_in_check(color) -> bool` added — finds `color`'s king square from
+`self.kings` and checks `attackers(king_sq, color.other()).any()`. This is exactly
+shakmaty's own `checkers().any()` (proven from the shakmaty source in the entry above:
+`king_attackers` there is literally `board().attacks_to(...)`, the same primitive
+`attackers_to` is built from), just read from the graph already built for this position
+instead of a second, separate shakmaty call. `compute_groups` and `build_sensor_report`
+both used to call `chess.is_check()` independently — both now call `graph.is_in_check(us)`
+using the graph each already builds (`compute_groups`'s graph build was reordered earlier
+in the function so it's available before `in_check` is computed).
+
+Left `analyze_fen_with_engine_score`'s `LegalInfo.is_check: chess.is_check()`
+(`position.rs:3110`) alone, deliberately — it's grouped with `is_checkmate`/
+`is_stalemate`/`is_insufficient_material`, all of which genuinely need shakmaty's full
+legality engine, on the *real* (un-normalized) `chess`, for which no `ThreatGraph` exists
+at that point in the function. Pulling just `is_check` out of that cluster for a marginal,
+non-redundant gain (there's nothing already-built to reuse there) would fragment a
+correctly-scoped block for no real benefit.
+
+Verified with the same A/B discipline as the two changes above, this time specifically
+targeting the highest-risk case (positions where the side to move genuinely is in check,
+since a wrong `in_check` would corrupt `king_safety_score` and the `king_in_check`
+concept): `git stash`'d, ran 4 positions (two in-check — one via a queen giving check
+directly, one via discovered-style open-file check — two not) against the pre-migration
+code, `git stash pop`'d, reran — `in_check`, `king_safety.blended`, and `final_score`
+byte-identical on all 4, including both in-check cases. Full suite green (39 lib + 14
+motif, unchanged), clippy zero warnings, STS smoke test passes.
+
+Remaining known instance of this pattern, not yet touched: `king_ring`/king safety
+scoring — scoped as its own look (not a drop-in migration) since king safety does more
+than pure attacker-counting.
+
+Phase 5: ThreatGraph::zone_control — the zone-level generalization king_ring actually needs
+
+User's observation: `king_ring` isn't a single-square continuity question like the three
+migrated above — it's a *zone* (the king's square plus its 8 neighbors), and the natural
+generalization of `control()` is "sum it over every square in the zone," not a single
+lookup. Checked how `king_ring` is actually consumed before building anything:
+- `king_safety_score` (`position.rs:895`) doesn't use `king_ring` at all — it separately
+  calls `board.attacks_to(king_sq, ...)` on just the king's own square (weighted by
+  piece type), the same primitive/redundancy pattern as the now-fixed `in_check`, plus an
+  unrelated pawn-shelter/storm computation.
+- `piece_activity_score` (`position.rs:1045`) is the only actual consumer of `king_ring`,
+  and only as a per-piece *existence* check (`atk & king_ring_bb != EMPTY`, "does this
+  piece's attack pattern touch the ring around its own king" — a defensive-coverage
+  bonus), never a control sum.
+
+Neither is "zone control" yet — both are narrower, different questions. Added
+`ThreatGraph::zone_control(zone: Bitboard, color: Color) -> i32` (`control` mapped over
+every square in `zone`, summed) as a pure, additive primitive — **not** wired into
+`king_safety_score` or `piece_activity_score` in this pass, since both are tuned,
+weighted scoring formulas where a change needs its own dedicated validation (like
+`material_score`'s A/B check, but for a formula that doesn't yet exist), not a
+drop-in swap the way `hanging_piece`/`detect_outposts`/`in_check` were.
+
+Added direct unit tests in a new `threat_graph.rs` test module (none existed before):
+`control_and_attackers_agree_with_a_direct_recount` (validates `control`/`attackers`
+against an independently-recomputed `board.attacks_to` count, not the graph's own logic,
+across all 64 squares of a real position), `zone_control_sums_control_over_every_square_in_the_zone`
+(validates the sum against an independent per-square loop, plus an exact hand-verified
+value — first attempt at the hand-derivation was wrong, caught immediately by the test
+failing, corrected to the right value: 3, not a guessed "should be negative"),
+`is_in_check_matches_shakmatys_own_is_check` (cross-checks `ThreatGraph::is_in_check`
+against `chess.is_check()` directly, for both an in-check and a not-in-check position).
+
+Verified: `cargo check --all-targets` clean; `cargo test` green (42 lib tests, up from 39
+— all three new; 14 motif, STS, integration tests unchanged since this phase touched no
+scoring formula); `cargo clippy --all-targets` zero warnings; STS smoke test passes.
+
+Confirmed: `control` is one shared per-square map, not two independent ones
+
+User's observation, checked and proven rather than just agreed with: `control(sq,
+White)` and `control(sq, Black)` aren't two separately-meaningful quantities that happen
+to correlate — they're exact negatives of each other on every square, on every position,
+by construction (swapping `color` in `control`'s own body swaps which count is `ours` vs
+`theirs`). So the one real per-square fact is a single signed number
+(`white_attackers[sq] - black_attackers[sq]`); `control(sq, color)` is that number read
+with a sign flip depending on whose question is being asked — `attackers_to[sq]` was
+never "White's map" and "Black's map," it's one shared bitboard both queries split
+differently. This is the same convention every other score in this file already follows
+(`material_total.value`, `king_safety.blended`, `development.blended` — single signed,
+us-relative numbers, not two separate positive-for-each-side numbers), the same
+convention the `material_score` phase enforced explicitly. `control` already followed it;
+this makes explicit *why* it has to, and (since `zone_control` is just `control` summed)
+the same antisymmetry propagates to zone_control for free.
+
+Added `control_is_one_shared_map_not_two_independent_ones`: asserts
+`control(sq, White) == -control(sq, Black)` for every square across 3 different real
+positions (not just the one simple test position used elsewhere), including a real
+middlegame position. Full suite green (43 lib tests, up from 42), clippy zero warnings,
+STS smoke test passes.
+
+Found, verified, deferred: `ThreatGraph::see_chain` gives wrong answers for 2+ step
+exchanges (real bug, not yet fixed)
+
+Chasing a clean example of "control is a cheap count, not a value, so it can disagree
+with the real exchange result" (user's question, answered above) led to hand-verifying
+`see()`'s actual output against ground truth, which didn't match.
+
+**Position**: `k7/8/3p4/4n3/8/8/4Q3/4K3 w - - 0 1` — White queen e2, black knight e5
+(defended once, by a black pawn on d6). `graph.see(Square::E5, Color::White)` returns
+**+220**. Ground truth by hand: White captures the knight (+320), black recaptures with
+the pawn, capturing White's *queen* (−900) — net **−580**, a clearly bad trade for
+White. The two numbers aren't close; this isn't a rounding/edge-case disagreement.
+
+**Root cause, located precisely**: in the recapture loop (`threat_graph.rs`, inside
+`see_chain`), each step computes `let val = Self::piece_value(best_role);` where
+`best_role` is the role of the piece *making* that recapture (e.g. the pawn, 100) — but
+the value that should enter the running total at that step is the value of whatever's
+*being captured* (which is always the previous side's piece that just moved there — here,
+White's queen, 900). The code prices each step by who's swinging, not by what's on the
+board being taken. Correct only for the first step (initial victim), where the two
+coincide by construction; wrong from the second step on whenever the capturing piece's
+own value differs from what it's capturing — which is most real positions.
+
+**Also separately incomplete even once that's fixed**: the standard SEE "swap-off"
+algorithm requires a backward minimax pass after the chain is walked (a rational side
+stops recapturing once it's no longer favorable, rather than being forced to complete
+every physical capture that exists) — `see_chain` has no such pass, so even with the
+`val` computation corrected it would still describe "what happens if both sides greedily
+capture to the end," not real best play. Confirmed this is a second, separate gap by
+noting `delivers_check`'s "any check cancels the chain" logic has the same flavor of
+issue in the position tested first (`.../4n3/8/8/4Q3/4K3` with the black king left on
+e8): capturing the queen with the pawn *also* resolves the discovered check the queen's
+own capture created, but the code can't distinguish "check I must answer some other way"
+from "check I'm about to answer by continuing the very capture in progress," and bails
+out of the chain either way.
+
+**Why not fixed now**: this is `ThreatGraph::find_forks`'s `evaluated_forks` material
+consequence — real, coaching-relevant production code, and a correct fix needs the actual
+swap-off algorithm (backward pass included), not a one-line patch. Deferred as its own
+scoped piece of work, not folded into the "continuity map" primitives thread this pass
+was about — confirmed with the user that this is architecturally a separate layer (SEE
+prices an exchange; `control`/`attackers`/`zone_control` never touch piece values at all,
+so nothing built in phases 1-5 is affected by this bug). `find_forks` is the only place
+`see`/`see_chain` currently feeds live output (`sensor.evaluated_forks`) — not yet
+consumed by `hanging_piece`'s severity (uses `piece_value` directly, exact for the
+zero-defender case per the earlier finding, no chain-walking involved) or anything from
+this pass.
+
+Found, verified, deferred: two more findings surfaced walking the ladder to fork/pin/skewer
+
+**Fork threshold divergence between the legacy and typed detectors.** `detect_forks`
+(`position.rs:1415`, inside `tactical_score`/`compute_groups`, feeds only the legacy
+`tactical_total.blended` score and verbose-text examples) and `ThreatGraph::find_forks`
+(`threat_graph.rs:202`, feeds the typed `sensor.tactical.forks`/`evaluated_forks` and the
+`fork` coaching concept) are two independent scans of the same board answering the same
+question, deliberately (confirmed `TacticalRaw` has no `fork_ex_us`/`fork_ex_them`
+fields — unlike pins/skewers/discovered, which *are* cached and shared — so this isn't
+leftover dead code, it's two intentionally separate consumers). But their thresholds
+disagree: `detect_forks` accepts `sum >= val_rook OR attacked_pieces.count() >= 3`;
+`find_forks` requires `targets.len() >= 2 AND total_val >= piece_value(Rook)` with no
+count-based escape hatch. A piece forking three pawns (300cp total, below the 500cp rook
+threshold) counts as a fork in the engine's own numeric score but not in the typed
+sensor or the `fork` coaching concept — the number and the player-facing text can
+silently disagree about whether a fork exists. Not fixed: touches the legacy scoring
+engine's tuned weights, same caution `material_score` needed.
+
+**`detect_skewers` hand-rolls ray-walking instead of reusing shakmaty's own primitive.**
+`detect_pins` (two lines earlier in the same file) computes an enemy slider's attack
+pattern via shakmaty's own occupancy-aware `attacks::rook_attacks`/`attacks::bishop_attacks`.
+`detect_skewers` (`position.rs:1452`) solves an adjacent problem (two enemy pieces on one
+ray) by manually stepping `cur_file.offset(df)`/`cur_rank.offset(dr)` one square at a
+time in each of 8 hand-coded directions, checking occupancy itself — never calling
+`attacks::rook_attacks`/`bishop_attacks` at all, the same primitive sitting right there
+in the same function's sibling. Same "reimplements what shakmaty already computes"
+pattern as the `pawn_attack_mask`/`in_check` findings fixed earlier in this thread, just
+not yet migrated. Not fixed: a real behavior-preserving rewrite here needs the same A/B
+verification discipline as the earlier migrations, not a quick pass.
+
+Phase 6: king_safety_score's own attackers_to call migrated too
+
+Deliberately steered away from the `detect_skewers` rewrite (a genuine algorithm change,
+not a primitive swap — different risk profile from everything else in this thread) and
+the `see_chain` fix (explicitly deferred, will likely be redesigned before it's picked
+back up) in favor of staying in the safe, already-proven pattern: `king_safety_score`
+(`position.rs:895`) still had its own `board.attacks_to(king_sq, color.other(),
+board.occupied())` call — the exact same redundancy shape as `in_check`, just not yet
+migrated when that phase happened. Added a `graph: &ThreatGraph` parameter and replaced
+it with `graph.attackers(king_sq, color.other())`.
+
+Verified with the same A/B discipline as every migration in this thread, this time
+specifically including positions with real attackers on the king (the exact code path
+changed — a position with zero king attackers wouldn't exercise this line at all):
+`git stash`'d, ran 4 positions (two with real queen/rook pressure on a king, two without)
+against the pre-migration code, `git stash pop`'d, reran — `king_safety.blended` and
+`final_score` byte-identical on all 4. Full suite green (43 lib tests, unchanged — pure
+refactor, no new test needed beyond the A/B check), clippy zero warnings, STS smoke test
+passes.
+
+Remaining known instances of the "reimplements a primitive instead of reusing
+attackers_to/ThreatGraph" pattern, still not migrated: `piece_activity_score`'s
+`king_ring` existence checks (a different question — zone overlap, not single-square
+control — `zone_control` exists for this now but hasn't been wired in), and
+`detect_skewers` (a genuine algorithm rewrite, not a drop-in swap, deliberately not
+attempted in this pass).
+
+Phase 7: systematic sweep for the same pattern found two more duplicated pawn-attack
+computations (no ThreatGraph needed for these — just an existing function un-reused)
+
+Went looking systematically (grepped every `board.attacks_to`/`board.attacks_from` call
+site in `position.rs`, ~14 total) rather than continuing to stumble onto instances one at
+a time, and classified each by whether it uses the *current*, unmodified board occupancy
+(a safe swap) versus a modified one like `detect_pins`'s `occ_minus` (a genuinely
+different computation, not swappable).
+
+Found: `king_safety_score`'s own pawn-shelter loop and a separate `mobility_mask`
+function (`position.rs:1037`, feeding `piece_activity_score`'s mobility scoring) each
+hand-rolled their own "union of this color's pawn attacks" via a
+`for sq in pawns { mask |= board.attacks_from(sq) }` loop — the exact same computation
+`pawn_attack_mask` (`position.rs:319`, already used elsewhere in the file) already
+provides as a named function. Verified precisely before touching anything, not assumed:
+read shakmaty's own `Board::attacks_from` → `attacks::attacks` dispatch
+(`attacks.rs:141-150`) and confirmed `Role::Pawn` routes to `pawn_attacks(color, sq)`
+*unconditionally*, ignoring the `occupied` parameter entirely (pawn attacks aren't
+blockable) — so `board.attacks_from(pawn_sq)` is provably, not just plausibly, identical
+to `attacks::pawn_attacks(color, sq)`, which is exactly what `pawn_attack_mask` computes.
+Both loops replaced with direct calls to the existing function — not a new primitive,
+just stopping two more places from re-deriving what already has a name.
+
+Verified with the same A/B discipline: `git stash`'d, ran 5 positions (covering real king
+pressure, real piece mobility, the starting position, a real middlegame) against the
+pre-migration code, `git stash pop`'d, reran — `king_safety.blended`,
+`piece_activity.blended`, and `final_score` byte-identical on all 5. Full suite green (43
+lib tests, unchanged), clippy zero warnings, STS smoke test passes.
+
+Remaining classified-but-not-yet-migrated candidates from the same sweep, for whenever
+this thread resumes: `development_space_score` (`position.rs:977`, two
+`board.attacks_to(king_of(...), ...)` calls with unmodified occupancy — same shape as the
+`king_safety_score`/`in_check` fixes, needs `graph` threaded through it and its one
+caller `extract_development_info`), `piece_activity_score`'s per-piece mobility
+`board.attacks_from(sq)` calls (lines ~1274-1283, occupied squares, unmodified occupancy
+— same shape, needs `graph` threaded through `piece_activity_score` itself), and
+`detect_forks` (`position.rs:1424`, the already-flagged legacy fork detector — its own
+`board.attacks_from(sq)` could read `graph.attacks_from` too, but this function is
+already queued behind the fork-threshold-divergence finding, not worth touching twice
+separately). Several other call sites in the original 14 (`position.rs:1593`, `2170`,
+etc.) use modified occupancy or serve genuinely different purposes — not swap candidates,
+excluded from this queue.
+
+Phase 8: development_space_score migrated
+
+`development_space_score` (`position.rs:976`) had two `board.attacks_to(king_of(...),
+..., board.occupied())` calls — same shape as `king_safety_score`/`in_check`, unmodified
+occupancy, safe swap. Took a `graph: &ThreatGraph` parameter and read
+`graph.attackers(...)` instead. This one had two callers needing the graph threaded
+through, not one: `compute_groups` (already had its own graph in scope) and
+`extract_development_info` (`position.rs:1887`, called only from `build_sensor_report`,
+which already had its own graph too) — `extract_development_info` itself gained a
+`graph` parameter to pass through.
+
+Verified with the same A/B discipline: `git stash`'d, ran 4 positions (starting position,
+a real middlegame with real development imbalance — `development=202`, not a trivial
+zero case — an early-development position, an endgame with none of this feature active)
+against the pre-migration code, `git stash pop`'d, reran — `development.blended` and
+`final_score` byte-identical on all 4. Full suite green (43 lib tests, unchanged), clippy
+zero warnings, STS smoke test passes.
+
+Phase 9: piece_activity_score's per-piece mobility counters migrated — queue cleared
+
+Added `ThreatGraph::attacks_from(sq) -> Bitboard` (a named accessor for the
+`attacks_from` array field, mirroring `attackers()`, so external callers don't need the
+private `idx` helper). Confirmed a field and a method can share a name in Rust without
+ambiguity (indexing syntax `self.attacks_from[i]` unambiguously means the field) —
+verified by compiling, not assumed.
+
+`piece_activity_score`'s four mobility-counter loops (knight/bishop/rook/queen,
+`position.rs:1271-1281`) each called `board.attacks_from(sq)` once per piece — same
+shape as everything else in this thread, occupied squares, unmodified occupancy, safe
+swap to `graph.attacks_from(sq)`. Took a `graph: &ThreatGraph` parameter (single
+function, two call sites, both already inside `compute_groups` with a graph in scope —
+simpler than the two-caller cases earlier in this thread).
+
+Verified with the same A/B discipline: `git stash`'d, ran 4 positions (starting position,
+two real middlegames with genuinely active pieces — `piece_activity=-37` and `108`, not
+trivial — an endgame) against the pre-migration code, `git stash pop`'d, reran —
+`piece_activity.blended` and `final_score` byte-identical on all 4. Full suite green (43
+lib tests, unchanged), clippy zero warnings, STS smoke test passes.
+
+That clears every candidate queued from phase 7's systematic sweep except `detect_forks`
+(deliberately left bundled with the fork-threshold-divergence finding rather than touched
+twice) and `detect_skewers` (a genuine algorithm rewrite, not a primitive swap — its own,
+separately-scoped piece of work). Production functions now reading from the shared
+`ThreatGraph` continuity map: `hanging_piece`, `detect_outposts`, `in_check`,
+`king_safety_score`, `development_space_score`, `piece_activity_score` — six, up from
+zero at the start of this thread.

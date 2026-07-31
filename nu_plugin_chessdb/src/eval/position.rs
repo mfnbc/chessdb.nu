@@ -337,7 +337,8 @@ pub fn compute_phase(board: &shakmaty::Board) -> u8 {
     (white_minor + black_minor + white_major + black_major).min(32) as u8
 }
 
-fn material_score(board: &shakmaty::Board, phase: u8) -> GroupValue {
+fn material_score(board: &shakmaty::Board, us: Color, phase: u8) -> GroupValue {
+    let them = us.other();
     // Phase-dependent material adjustment coefficients, indexed by game phase (0..=32).
     // Each row: [unused0, unused1, unused2, unused3, unused4, bishop_pair, np_bonus, rp_penalty,
     //            bn_vs_rp, redundant_r, redundant_qr]
@@ -380,66 +381,74 @@ fn material_score(board: &shakmaty::Board, phase: u8) -> GroupValue {
         [2090, 1018, 708, 653, 190, 75, 0, 13, 51, 41, 20],
     ][phase as usize];
 
-    let white = |role: Role, value: i64| piece_count(board, Color::White, role) * value;
-    let black = |role: Role, value: i64| piece_count(board, Color::Black, role) * value;
+    // `ours`/`theirs` — not `white`/`black` — because material_score's contract
+    // is "return the us-relative score," and every sibling function in
+    // compute_groups (pawn_structure_score, king_safety_score,
+    // development_score) already takes `us: Color` for exactly this reason.
+    // Only correct because `board` is always canonical (White-to-move) at
+    // every current call site — see compute_groups's own doc comment — but
+    // expressing it as us/them means that invariant no longer has to hold
+    // for this function's *output* to still mean the right thing.
+    let ours   = |role: Role, value: i64| piece_count(board, us, role) * value;
+    let theirs = |role: Role, value: i64| piece_count(board, them, role) * value;
 
     // mg = opening (phase 32) — positional play dominates, pieces worth less
-    let mg = (white(Role::Queen, 2090)
-        + white(Role::Rook, 1018)
-        + white(Role::Bishop, 708)
-        + white(Role::Knight, 653)
-        + white(Role::Pawn, 190))
-        - (black(Role::Queen, 2090)
-            + black(Role::Rook, 1018)
-            + black(Role::Bishop, 708)
-            + black(Role::Knight, 653)
-            + black(Role::Pawn, 190));
+    let mg = (ours(Role::Queen, 2090)
+        + ours(Role::Rook, 1018)
+        + ours(Role::Bishop, 708)
+        + ours(Role::Knight, 653)
+        + ours(Role::Pawn, 190))
+        - (theirs(Role::Queen, 2090)
+            + theirs(Role::Rook, 1018)
+            + theirs(Role::Bishop, 708)
+            + theirs(Role::Knight, 653)
+            + theirs(Role::Pawn, 190));
 
     // eg = endgame (phase 0) — material is decisive, pieces worth more
-    let eg = (white(Role::Queen, 3004)
-        + white(Role::Rook, 1533)
-        + white(Role::Bishop, 910)
-        + white(Role::Knight, 875)
-        + white(Role::Pawn, 298))
-        - (black(Role::Queen, 3004)
-            + black(Role::Rook, 1533)
-            + black(Role::Bishop, 910)
-            + black(Role::Knight, 875)
-            + black(Role::Pawn, 298));
+    let eg = (ours(Role::Queen, 3004)
+        + ours(Role::Rook, 1533)
+        + ours(Role::Bishop, 910)
+        + ours(Role::Knight, 875)
+        + ours(Role::Pawn, 298))
+        - (theirs(Role::Queen, 3004)
+            + theirs(Role::Rook, 1533)
+            + theirs(Role::Bishop, 910)
+            + theirs(Role::Knight, 875)
+            + theirs(Role::Pawn, 298));
 
-    let bishop_pair = if piece_count(board, Color::White, Role::Bishop) >= 2 {
+    let bishop_pair = if piece_count(board, us, Role::Bishop) >= 2 {
         coeff[5]
     } else {
         0
-    } - if piece_count(board, Color::Black, Role::Bishop) >= 2 {
+    } - if piece_count(board, them, Role::Bishop) >= 2 {
         coeff[5]
     } else {
         0
     };
 
-    let rp_penalty = -((piece_count(board, Color::White, Role::Pawn) - 5)
-        * piece_count(board, Color::White, Role::Rook)
+    let rp_penalty = -((piece_count(board, us, Role::Pawn) - 5)
+        * piece_count(board, us, Role::Rook)
         * coeff[7])
-        + ((piece_count(board, Color::Black, Role::Pawn) - 5)
-            * piece_count(board, Color::Black, Role::Rook)
+        + ((piece_count(board, them, Role::Pawn) - 5)
+            * piece_count(board, them, Role::Rook)
             * coeff[7]);
 
-    let np_bonus = ((piece_count(board, Color::White, Role::Pawn) - 5)
-        * piece_count(board, Color::White, Role::Knight)
+    let np_bonus = ((piece_count(board, us, Role::Pawn) - 5)
+        * piece_count(board, us, Role::Knight)
         * coeff[6])
-        - ((piece_count(board, Color::Black, Role::Pawn) - 5)
-            * piece_count(board, Color::Black, Role::Knight)
+        - ((piece_count(board, them, Role::Pawn) - 5)
+            * piece_count(board, them, Role::Knight)
             * coeff[6]);
 
-    let bn_vs_rp = if (piece_count(board, Color::White, Role::Knight)
-        + piece_count(board, Color::White, Role::Bishop))
-        != (piece_count(board, Color::Black, Role::Knight)
-            + piece_count(board, Color::Black, Role::Bishop))
+    let bn_vs_rp = if (piece_count(board, us, Role::Knight)
+        + piece_count(board, us, Role::Bishop))
+        != (piece_count(board, them, Role::Knight)
+            + piece_count(board, them, Role::Bishop))
     {
-        if (piece_count(board, Color::White, Role::Knight)
-            + piece_count(board, Color::White, Role::Bishop))
-            > (piece_count(board, Color::Black, Role::Knight)
-                + piece_count(board, Color::Black, Role::Bishop))
+        if (piece_count(board, us, Role::Knight)
+            + piece_count(board, us, Role::Bishop))
+            > (piece_count(board, them, Role::Knight)
+                + piece_count(board, them, Role::Bishop))
         {
             coeff[8]
         } else {
@@ -449,25 +458,25 @@ fn material_score(board: &shakmaty::Board, phase: u8) -> GroupValue {
         0
     };
 
-    let redundant_r = -if piece_count(board, Color::White, Role::Rook) >= 2 {
+    let redundant_r = -if piece_count(board, us, Role::Rook) >= 2 {
         coeff[9]
     } else {
         0
-    } + if piece_count(board, Color::Black, Role::Rook) >= 2 {
+    } + if piece_count(board, them, Role::Rook) >= 2 {
         coeff[9]
     } else {
         0
     };
 
-    let redundant_qr = -if piece_count(board, Color::White, Role::Queen)
-        + piece_count(board, Color::White, Role::Rook)
+    let redundant_qr = -if piece_count(board, us, Role::Queen)
+        + piece_count(board, us, Role::Rook)
         >= 2
     {
         coeff[10]
     } else {
         0
-    } + if piece_count(board, Color::Black, Role::Queen)
-        + piece_count(board, Color::Black, Role::Rook)
+    } + if piece_count(board, them, Role::Queen)
+        + piece_count(board, them, Role::Rook)
         >= 2
     {
         coeff[10]
@@ -883,7 +892,7 @@ fn passed_pawn_score(
 
 // _phase is kept for potential future phase-dependent king safety tuning but is
 // not currently used inside this function.
-fn king_safety_score(board: &shakmaty::Board, color: Color, in_check: bool, _phase: u8) -> i64 {
+fn king_safety_score(board: &shakmaty::Board, graph: &ThreatGraph, color: Color, in_check: bool, _phase: u8) -> i64 {
     let king_sq = match board.king_of(color) {
         Some(sq) => sq,
         None => return 0,
@@ -895,17 +904,19 @@ fn king_safety_score(board: &shakmaty::Board, color: Color, in_check: bool, _pha
     }
 
     // Critter-style pawn_safe: squares NOT attacked by enemy pawns.
-    // King is safer when standing in pawn shelter.
-    let enemy_pawns = board.by_color(color.other()) & board.by_role(Role::Pawn);
-    let mut pawn_safe = !Bitboard::EMPTY; // all squares safe initially
-    for sq in enemy_pawns {
-        pawn_safe &= !board.attacks_from(sq);
-    }
+    // King is safer when standing in pawn shelter. board.attacks_from(pawn_sq)
+    // is exactly attacks::pawn_attacks(color, sq) (shakmaty dispatches pawns
+    // there unconditionally, ignoring occupancy — pawn attacks aren't
+    // blockable), so this is exactly pawn_attack_mask, not a fresh derivation.
+    let pawn_safe = !pawn_attack_mask(board, color.other());
     if (Bitboard::from(king_sq) & pawn_safe).any() {
         score += 15; // king stands on pawn-protected square
     }
 
-    let attackers = board.attacks_to(king_sq, color.other(), board.occupied());
+    // Same primitive attackers_to is built from, read from the graph already
+    // built for this position instead of a second, separate shakmaty call
+    // (same pattern as is_in_check).
+    let attackers = graph.attackers(king_sq, color.other());
     // Critter-style weighted king attacks: queen=300, rook=200, minor=100
     let queen_att  = (attackers & board.by_role(Role::Queen)).count() as i64 * 3;
     let rook_att  = (attackers & board.by_role(Role::Rook)).count() as i64 * 2;
@@ -962,26 +973,26 @@ fn development_score(board: &shakmaty::Board, color: Color) -> i64 {
     -NOT_DEVELOPED[undeveloped]
 }
 
-fn development_space_score(board: &shakmaty::Board, color: Color, phase: u8) -> i64 {
+fn development_space_score(board: &shakmaty::Board, graph: &ThreatGraph, color: Color, phase: u8) -> i64 {
     let own_pawns = board.by_color(color) & board.by_role(Role::Pawn);
     let enemy_pawn_attacks = pawn_attack_mask(board, color.other());
-    let enemy_attacks = board.attacks_to(
+    // Same primitive attackers_to is built from, read from the graph already
+    // built for this position instead of two more separate shakmaty calls.
+    let enemy_attacks = graph.attackers(
         board.king_of(color).unwrap_or(if color.is_white() {
             Square::E1
         } else {
             Square::E8
         }),
         color.other(),
-        board.occupied(),
     );
-    let own_attacks = board.attacks_to(
+    let own_attacks = graph.attackers(
         board.king_of(color.other()).unwrap_or(if color.is_white() {
             Square::E8
         } else {
             Square::E1
         }),
         color,
-        board.occupied(),
     );
 
     let base_mask = Bitboard::from(Square::C4)
@@ -1025,16 +1036,15 @@ fn in_front(color: Color, sq: Square) -> Bitboard {
 /// Excludes friendly occupied squares and squares attacked by enemy pawns.
 fn mobility_mask(board: &shakmaty::Board, color: Color) -> Bitboard {
     let friendly = board.by_color(color);
-    let enemy_pawns = board.by_color(color.other()) & board.by_role(Role::Pawn);
-    let mut enemy_pawn_attacks = Bitboard::EMPTY;
-    for sq in enemy_pawns {
-        enemy_pawn_attacks |= board.attacks_from(sq);
-    }
-    !(friendly | enemy_pawn_attacks)
+    // Same derivation as king_safety_score's pawn_safe: board.attacks_from on
+    // a pawn square is exactly attacks::pawn_attacks (occupancy-independent),
+    // i.e. exactly pawn_attack_mask — not re-derived by hand here either.
+    !(friendly | pawn_attack_mask(board, color.other()))
 }
 
 fn piece_activity_score(
     board: &shakmaty::Board,
+    graph: &ThreatGraph,
     color: Color,
     phase: u8,
     pawn_safe: Bitboard,
@@ -1258,17 +1268,20 @@ fn piece_activity_score(
     let mut queen_mob = 0_i64;
     let mut pawn_mob = 0_i64;
 
+    // graph.attacks_from(sq) here is exactly board.attacks_from(sq) for these
+    // occupied squares — read from the graph already built instead of asking
+    // shakmaty to redo it.
     for sq in board.by_color(color) & board.by_role(Role::Knight) {
-        knight_mob += (board.attacks_from(sq) & !board.by_color(color)).count() as i64;
+        knight_mob += (graph.attacks_from(sq) & !board.by_color(color)).count() as i64;
     }
     for sq in board.by_color(color) & board.by_role(Role::Bishop) {
-        bishop_mob += (board.attacks_from(sq) & !board.by_color(color)).count() as i64;
+        bishop_mob += (graph.attacks_from(sq) & !board.by_color(color)).count() as i64;
     }
     for sq in board.by_color(color) & board.by_role(Role::Rook) {
-        rook_mob += (board.attacks_from(sq) & !board.by_color(color)).count() as i64;
+        rook_mob += (graph.attacks_from(sq) & !board.by_color(color)).count() as i64;
     }
     for sq in board.by_color(color) & board.by_role(Role::Queen) {
-        queen_mob += (board.attacks_from(sq) & !board.by_color(color)).count() as i64;
+        queen_mob += (graph.attacks_from(sq) & !board.by_color(color)).count() as i64;
     }
     for sq in board.by_color(color) & board.by_role(Role::Pawn) {
         // pawn mobility: forward push if empty + captures
@@ -1875,11 +1888,11 @@ fn extract_center_control(board: &shakmaty::Board) -> Option<CenterControl> {
     }
 }
 
-fn extract_development_info(board: &shakmaty::Board) -> Vec<DevelopmentInfo> {
+fn extract_development_info(board: &shakmaty::Board, graph: &ThreatGraph) -> Vec<DevelopmentInfo> {
     let mut results = Vec::new();
     for color in [Color::White, Color::Black] {
         let undeveloped = count_undeveloped(board, color);
-        let space = development_space_score(board, color, compute_phase(board));
+        let space = development_space_score(board, graph, color, compute_phase(board));
         if undeveloped > 0 || space < 0 {
             let pieces: Vec<PieceRef> = {
                 let knight_home = color.fold_wb(
@@ -2090,12 +2103,16 @@ fn tactical_score(board: &shakmaty::Board, us: Color, phase: u8) -> (GroupValue,
     (GroupValue { mg, eg, blended, terms }, raw)
 }
 
-fn detect_outposts(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, Role, Square)>) {
+fn detect_outposts(board: &shakmaty::Board, graph: &ThreatGraph, color: Color) -> (i64, Vec<(Square, Role, Square)>) {
     // Detect outposts: own Knight/Bishop on an advanced square that is not attackable by opponent pawns
     // and is supported by an own pawn (preferred). Returns (count, vec![(sq, role, support_sq), ...]).
+    // Reads `graph.attackers` (built once from ThreatGraph::attackers_to) instead of a
+    // separate pawn_attack_mask/attacks_to call per square — the same "whose continuity
+    // is this square in" question hanging-piece detection already answers from this
+    // shared substrate.
     let mut count = 0_i64;
     let mut examples: Vec<(Square, Role, Square)> = Vec::new();
-    let enemy_pawn_attacks = pawn_attack_mask(board, color.other());
+    let them = color.other();
 
     let pieces = board.by_color(color) & (board.by_role(Role::Knight) | board.by_role(Role::Bishop));
 
@@ -2113,32 +2130,24 @@ fn detect_outposts(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, 
         }
 
         // must not be attackable by enemy pawns
-        if (enemy_pawn_attacks & Bitboard::from(sq)) != Bitboard::EMPTY {
+        let enemy_pawn_attackers = graph.attackers(sq, them) & board.by_role(Role::Pawn);
+        if enemy_pawn_attackers.any() {
             continue;
         }
 
         // check if supported by own pawn (preferred)
-        let mut supported_by_pawn: Option<Square> = None;
-        for p in board.by_color(color) & board.by_role(Role::Pawn) {
-            if (attacks::pawn_attacks(color, p) & Bitboard::from(sq)).any() {
-                supported_by_pawn = Some(p);
-                break;
-            }
-        }
+        let supported_by_pawn = (graph.attackers(sq, color) & board.by_role(Role::Pawn)).into_iter().next();
 
         if let Some(p_support) = supported_by_pawn {
             count += 1;
             if let Some(piece) = board.piece_at(sq) {
                 examples.push((sq, piece.role, p_support));
             }
-        } else {
+        } else if graph.attackers(sq, color).any() {
             // as a fallback, allow squares defended by other pieces
-            let occ = board.occupied();
-            if board.attacks_to(sq, color, occ).any() {
-                count += 1;
-                if let Some(piece) = board.piece_at(sq) {
-                    examples.push((sq, piece.role, Square::E1));
-                }
+            count += 1;
+            if let Some(piece) = board.piece_at(sq) {
+                examples.push((sq, piece.role, Square::E1));
                 // support square unknown; placeholder E1 (we will prefer pawn support in examples)
             }
         }
@@ -2527,21 +2536,38 @@ fn draw_weight(board: &shakmaty::Board, color: Color) -> i64 {
     open_file_mult[open as usize] * pawn_count_mult[all as usize]
 }
 
+/// Expects `chess` already canonical (White-to-move) — every score this
+/// produces is computed relative to `chess.turn()` as "us," which is only
+/// meaningful if that's actually the side to move in the real game. Current
+/// callers uphold this two ways: `analyze_fen_with_engine_score` calls
+/// `normalize_for_eval` first; `coach_derive_cmd.rs`'s direct calls read
+/// `positions.fen`, which is already canonical by construction (see
+/// PLAN.md's "Canonical position identity" section). A future caller that
+/// evaluates a real, un-normalized position directly would get silently
+/// wrong material/pawn/king-safety/development scores — nothing here
+/// enforces the precondition, it just has to be upheld by the caller.
 pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> EvalGroups {
     let board = chess.board();
     let us = chess.turn();
     let them = us.other();
-    let in_check = chess.is_check();
+    // Built once, reused for detect_outposts's shared-substrate query below
+    // and in_check (the same primitive shakmaty's own is_check()/checkers()
+    // are built from, see ThreatGraph::is_in_check) instead of a second,
+    // separate shakmaty call. build_sensor_report constructs its own,
+    // separate graph later — these two functions don't yet share one across
+    // a single evaluation (see PLAN.md).
+    let graph = ThreatGraph::build(chess);
+    let in_check = graph.is_in_check(us);
 
     let w = weights();
-    let material = material_score(board, phase);
+    let material = material_score(board, us, phase);
     let (pawn_us, pawn_us_terms) = pawn_structure_score(board, us, phase);
     let (pawn_them, pawn_them_terms) = pawn_structure_score(board, them, phase);
     let (passed_us, passed_us_terms) = passed_pawn_score(board, us);
     let (passed_them, passed_them_terms) = passed_pawn_score(board, them);
     let dev_diff = development_score(board, us) - development_score(board, them);
-    let king_safety = king_safety_score(board, us, in_check, phase)
-        - king_safety_score(board, them, false, phase);
+    let king_safety = king_safety_score(board, &graph, us, in_check, phase)
+        - king_safety_score(board, &graph, them, false, phase);
 
     let mut pawn_structure = GroupValue::default();
     let pawn_total = pawn_us - pawn_them;
@@ -2584,6 +2610,7 @@ pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> Eval
     let mut piece_activity = GroupValue::default();
     let (piece_us, piece_us_terms) = piece_activity_score(
         board,
+        &graph,
         us,
         phase,
         !pawn_attack_mask(board, them),
@@ -2591,6 +2618,7 @@ pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> Eval
     );
     let (piece_them, piece_them_terms) = piece_activity_score(
         board,
+        &graph,
         them,
         phase,
         !pawn_attack_mask(board, us),
@@ -2615,8 +2643,8 @@ pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> Eval
     );
 
     // Outpost detection: add as a piece activity term, with example context
-    let (outposts_us, out_ex_us) = detect_outposts(board, us);
-    let (outposts_them, out_ex_them) = detect_outposts(board, them);
+    let (outposts_us, out_ex_us) = detect_outposts(board, &graph, us);
+    let (outposts_them, out_ex_them) = detect_outposts(board, &graph, them);
     let outpost_delta = outposts_us * w.outpost_weight - outposts_them * w.outpost_weight;
     piece_activity.blended += outpost_delta;
     piece_activity.terms.insert("outposts_us".into(), serde_json::Value::from(outposts_us));
@@ -2697,8 +2725,8 @@ pub fn compute_groups(chess: &Chess, phase: u8, legal_move_count: usize) -> Eval
     );
 
     let mut development = GroupValue::default();
-    let dev_space_us = development_space_score(board, us, phase);
-    let dev_space_them = development_space_score(board, them, phase);
+    let dev_space_us = development_space_score(board, &graph, us, phase);
+    let dev_space_them = development_space_score(board, &graph, them, phase);
     let dev_total = dev_diff + (dev_space_us - dev_space_them);
     let (dev_mg, dev_eg) = phase_split(dev_total, biased_phase(phase, w.phase_bias_development));
     development.mg = dev_mg;
@@ -2792,6 +2820,23 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
     let us = chess.turn();
     let them = us.other();
 
+    // Brute-force one-ply search, not a geometric pattern detector like
+    // everything else here: does any legal move deliver checkmate. Computed
+    // early and folded into `partial` below (not patched onto the return
+    // value afterward) so it's part of the same data `extract_concepts`
+    // sees when this function computes `gated_issues` itself, and so every
+    // caller of this function gets it for free — previously this only ran
+    // in `analyze_fen_with_engine_score`, so the two direct callers in
+    // coach_derive_cmd.rs silently never saw it, and even
+    // `analyze_fen_with_engine_score`'s own `gated_issues` never included it
+    // either, since gated_issues was already computed before this got
+    // patched on.
+    let mate_in_1_exists = chess.legal_moves().iter().any(|m| {
+        let mut c = chess.clone();
+        c.play_unchecked(m);
+        c.is_checkmate()
+    });
+
     // Build the unified threat graph — one pass over the board
     let graph = ThreatGraph::build(chess);
 
@@ -2816,8 +2861,8 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
 
     let positional = PositionalReport {
         outposts: {
-            let (_, out_ex_us) = detect_outposts(board, us);
-            let (_, out_ex_them) = detect_outposts(board, them);
+            let (_, out_ex_us) = detect_outposts(board, &graph, us);
+            let (_, out_ex_them) = detect_outposts(board, &graph, them);
             let mut v = outposts_to_typed(board, &out_ex_us);
             v.extend(outposts_to_typed(board, &out_ex_them));
             v
@@ -2841,7 +2886,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
             }
         },
         development: {
-            let dev_infos = extract_development_info(board);
+            let dev_infos = extract_development_info(board, &graph);
             let target_color = Side::from(us);
             let dev_first = dev_infos.iter().find(|d| d.color == target_color);
             dev_first.cloned().or_else(|| dev_infos.first().cloned())
@@ -2853,7 +2898,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         MaterialConceptReport { balance }
     };
 
-    let in_check = chess.is_check();
+    let in_check = graph.is_in_check(us);
 
     // Partial SensorReport — everything typed downstream consumers (encode_state,
     // extract_concepts) need is already built above. Reused for both rather than
@@ -2864,6 +2909,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         aggregated: AggregatedScores::default(),
         evaluated_forks: evaluated_forks.clone(),
         in_check,
+        mate_in_1_exists,
         ..Default::default()
     };
     let state_id = encode_state(&partial, groups, phase).state_id;
@@ -2890,7 +2936,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         in_check,
         evaluated_forks,
         gated_issues,
-        mate_in_1_exists: false,
+        mate_in_1_exists,
     }
 }
 
@@ -3039,17 +3085,7 @@ pub fn analyze_fen_with_engine_score(
 
     let normalized_fen =
         Fen::from_position(chess.clone(), shakmaty::EnPassantMode::Legal).to_string();
-    // LegalInfo/mate_in_1_exists are boolean/scalar and color-symmetric —
-    // computed from the real, unflipped position on purpose, not because
-    // they'd differ, but to keep them independent of the eval-only
-    // normalization below.
-    let legal_moves = chess.legal_moves();
-    let legal_move_count = legal_moves.len();
-    let mate_in_1_exists = legal_moves.iter().any(|m| {
-        let mut c = chess.clone();
-        c.play_unchecked(m);
-        c.is_checkmate()
-    });
+    let legal_move_count = chess.legal_moves().len();
 
     // Scoring/SensorReport work entirely in a normalized frame where White
     // is always the side to move — see normalize_for_eval's doc comment.
@@ -3059,8 +3095,10 @@ pub fn analyze_fen_with_engine_score(
     let (eval_chess, was_flipped) = normalize_for_eval(&chess)?;
     let phase = compute_phase(eval_chess.board());
     let groups = compute_groups(&eval_chess, phase, legal_move_count);
+    // mate_in_1_exists is computed inside build_sensor_report itself now
+    // (from whichever frame it's given — the boolean is color-symmetric, so
+    // it doesn't matter which), not patched on here afterward.
     let mut sensor_report = build_sensor_report(eval_chess.board(), fen, &groups, &eval_chess, phase, player_elo);
-    sensor_report.mate_in_1_exists = mate_in_1_exists;
     if was_flipped {
         unflip_sensor_report(&mut sensor_report);
     }
