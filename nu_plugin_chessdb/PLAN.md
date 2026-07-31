@@ -120,7 +120,11 @@ before it needs to:
 4. `build_sensor_report` (`position.rs`) folds every detector's output for one position into
    `SensorReport` — the single typed representation of "what did this ply's board actually
    show," replacing the older, string-keyed `EvalGroups.terms` grab-bag as the one thing
-   downstream code reads.
+   downstream code reads. `SensorReport` isn't tactical-only: it also carries
+   `PositionalReport` (outposts, pawn structure, king exposure, development, …),
+   `MaterialConceptReport`, and a handful of whole-position scalars (`king_tropism_us`,
+   `initiative_us`, …) — everything above is the tactical slice of a report that's actually
+   comprehensive.
 5. `extract_concepts` (`concepts.rs`) turns a `SensorReport` into `Vec<Concept>` — the same
    shape regardless of whether a `Concept` originated from a tactical detector, a positional
    extractor, or a material scalar, so everything downstream treats them uniformly.
