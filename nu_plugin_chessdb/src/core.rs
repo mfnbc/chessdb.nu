@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use nu_protocol::{LabeledError, Span};
-use pgn_reader::{BufferedReader, RawHeader, SanPlus, Skip, Visitor};
+use pgn_reader::{RawTag, Reader, SanPlus, Skip, Visitor};
 use shakmaty::{
     fen::Fen,
     san::San,
-    uci::Uci,
-    zobrist::{Zobrist64, ZobristHash},
+    uci::UciMove,
+    zobrist::Zobrist64,
     Bitboard, Chess, Color, EnPassantMode, Piece, Position, Role,
 };
 
@@ -124,9 +125,20 @@ impl GameVisitor {
 }
 
 impl Visitor for GameVisitor {
-    type Result = Vec<MoveRow>;
+    type Tags = ();
+    type Movetext = ();
+    type Output = Vec<MoveRow>;
 
-    fn header(&mut self, key: &[u8], value: RawHeader<'_>) {
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(())
+    }
+
+    fn tag(
+        &mut self,
+        _tags: &mut Self::Tags,
+        key: &[u8],
+        value: RawTag<'_>,
+    ) -> ControlFlow<Self::Output> {
         if let (Ok(key), Ok(value)) = (
             std::str::from_utf8(key),
             std::str::from_utf8(value.as_bytes()),
@@ -134,14 +146,16 @@ impl Visitor for GameVisitor {
             self.headers
                 .push((key.to_string(), value.trim_matches('"').to_string()));
         }
-    }
-    fn end_headers(&mut self) -> Skip {
-        Skip(false)
+        ControlFlow::Continue(())
     }
 
-    fn san(&mut self, san_plus: SanPlus) {
+    fn begin_movetext(&mut self, _tags: Self::Tags) -> ControlFlow<Self::Output, Self::Movetext> {
+        ControlFlow::Continue(())
+    }
+
+    fn san(&mut self, _movetext: &mut Self::Movetext, san_plus: SanPlus) -> ControlFlow<Self::Output> {
         if self.error.is_some() {
-            return;
+            return ControlFlow::Continue(());
         }
 
         let san_str = san_plus.to_string();
@@ -151,7 +165,7 @@ impl Visitor for GameVisitor {
             Ok(s) => s,
             Err(e) => {
                 self.error = Some(format!("SAN parse error '{bare}': {e}"));
-                return;
+                return ControlFlow::Continue(());
             }
         };
 
@@ -159,17 +173,17 @@ impl Visitor for GameVisitor {
             Ok(m) => m,
             Err(e) => {
                 self.error = Some(format!("Illegal move '{bare}': {e}"));
-                return;
+                return ControlFlow::Continue(());
             }
         };
 
-        let uci = Uci::from_move(&mv, shakmaty::CastlingMode::Standard).to_string();
+        let uci = UciMove::from_move(mv, shakmaty::CastlingMode::Standard).to_string();
 
-        let new_pos = match self.pos.clone().play(&mv) {
+        let new_pos = match self.pos.clone().play(mv) {
             Ok(p) => p,
             Err(e) => {
                 self.error = Some(format!("Play error: {e}"));
-                return;
+                return ControlFlow::Continue(());
             }
         };
 
@@ -181,10 +195,10 @@ impl Visitor for GameVisitor {
             Ok(p) => p,
             Err(e) => {
                 self.error = Some(format!("Canonicalization error: {e}"));
-                return;
+                return ControlFlow::Continue(());
             }
         };
-        let fen = Fen::from_position(canonical_pos.clone(), EnPassantMode::Legal).to_string();
+        let fen = Fen::from_position(&canonical_pos, EnPassantMode::Legal).to_string();
         let zobrist = get_canonical_hash(&canonical_pos);
 
         // `san` stays real (as actually played) — human-facing single-game
@@ -198,11 +212,11 @@ impl Visitor for GameVisitor {
                 Ok(p) => p,
                 Err(e) => {
                     self.error = Some(format!("Canonicalization error: {e}"));
-                    return;
+                    return ControlFlow::Continue(());
                 }
             };
             let flipped_mv = flip_move(&mv);
-            shakmaty::san::SanPlus::from_move(canonical_pre_pos, &flipped_mv).to_string()
+            shakmaty::san::SanPlus::from_move(canonical_pre_pos, flipped_mv).to_string()
         } else {
             san_str.clone()
         };
@@ -224,14 +238,15 @@ impl Visitor for GameVisitor {
         });
 
         self.pos = new_pos;
-        
+
+        ControlFlow::Continue(())
     }
 
-    fn begin_variation(&mut self) -> Skip {
-        Skip(true)
+    fn begin_variation(&mut self, _movetext: &mut Self::Movetext) -> ControlFlow<Self::Output, Skip> {
+        ControlFlow::Continue(Skip(true))
     }
 
-    fn end_game(&mut self) -> Self::Result {
+    fn end_game(&mut self, _movetext: Self::Movetext) -> Self::Output {
         std::mem::take(&mut self.rows)
     }
 }
@@ -261,9 +276,9 @@ pub struct CheckerSummary {
 
 fn play_and_serialize(pos: Chess, mv: &shakmaty::Move) -> Result<String, LabeledError> {
     let new_pos = pos
-        .play(mv)
+        .play(*mv)
         .map_err(|e| LabeledError::new(format!("Cannot play move: {e}")))?;
-    Ok(Fen::from_position(new_pos, EnPassantMode::Legal).to_string())
+    Ok(Fen::from_position(&new_pos, EnPassantMode::Legal).to_string())
 }
 
 fn side_to_move_string(pos: &Chess) -> String {
@@ -331,12 +346,12 @@ pub fn normalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledError> 
                 .with_label("position is illegal", span)
         })?;
 
-    Ok(Fen::from_position(pos, EnPassantMode::Legal).to_string())
+    Ok(Fen::from_position(&pos, EnPassantMode::Legal).to_string())
 }
 
 pub fn apply_uci(fen_str: &str, uci_str: &str, span: Span) -> Result<String, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
-    let uci: Uci = uci_str.parse().map_err(|e| {
+    let uci: UciMove = uci_str.parse().map_err(|e| {
         LabeledError::new(format!("Invalid UCI move: {e}"))
             .with_label("failed to parse UCI move", span)
     })?;
@@ -351,7 +366,7 @@ pub fn apply_uci(fen_str: &str, uci_str: &str, span: Span) -> Result<String, Lab
 
 pub fn uci_to_san(fen_str: &str, uci_str: &str, span: Span) -> Result<String, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
-    let uci: Uci = uci_str.parse().map_err(|e| {
+    let uci: UciMove = uci_str.parse().map_err(|e| {
         LabeledError::new(format!("Invalid UCI: {e}")).with_label("failed to parse UCI", span)
     })?;
 
@@ -360,7 +375,7 @@ pub fn uci_to_san(fen_str: &str, uci_str: &str, span: Span) -> Result<String, La
             .with_label("move is not legal in this position", span)
     })?;
 
-    Ok(San::from_move(&pos, &mv).to_string())
+    Ok(San::from_move(&pos, mv).to_string())
 }
 
 pub fn san_to_uci(fen_str: &str, san_str: &str, span: Span) -> Result<String, LabeledError> {
@@ -374,7 +389,7 @@ pub fn san_to_uci(fen_str: &str, san_str: &str, span: Span) -> Result<String, La
             .with_label("move is not legal in this position", span)
     })?;
 
-    Ok(Uci::from_move(&mv, shakmaty::CastlingMode::Standard).to_string())
+    Ok(UciMove::from_move(mv, shakmaty::CastlingMode::Standard).to_string())
 }
 
 pub fn is_legal(fen_str: &str, move_str: &str, span: Span) -> Result<bool, LabeledError> {
@@ -382,7 +397,7 @@ pub fn is_legal(fen_str: &str, move_str: &str, span: Span) -> Result<bool, Label
 
     Ok(if let Ok(san) = move_str.parse::<San>() {
         san.to_move(&pos).is_ok()
-    } else if let Ok(uci) = move_str.parse::<Uci>() {
+    } else if let Ok(uci) = move_str.parse::<UciMove>() {
         uci.to_move(&pos).is_ok()
     } else {
         false
@@ -455,7 +470,7 @@ pub fn mobility_summary(fen_str: &str, span: Span) -> Result<MobilitySummary, La
     let mobility_san = pos
         .legal_moves()
         .iter()
-        .map(|mv| San::from_move(&pos, mv).to_string())
+        .map(|mv| San::from_move(&pos, *mv).to_string())
         .collect::<Vec<_>>();
 
     Ok(MobilitySummary {
@@ -484,7 +499,7 @@ pub fn checker_summary(fen_str: &str, span: Span) -> Result<CheckerSummary, Labe
 }
 
 pub fn pgn_to_fens(pgn_str: &str, span: Span) -> Result<Vec<MoveRow>, LabeledError> {
-    let mut reader = BufferedReader::new(pgn_str.as_bytes());
+    let mut reader = Reader::new(pgn_str.as_bytes());
     let mut visitor = GameVisitor::new(0);
 
     let rows = reader
@@ -505,7 +520,7 @@ pub fn pgn_to_fens(pgn_str: &str, span: Span) -> Result<Vec<MoveRow>, LabeledErr
 pub fn pgn_to_batch_record(pgn_str: &str, span: Span) -> Result<BatchSummary, LabeledError> {
     let (initial_fen, initial_hash) = initial_position();
 
-    let mut reader = BufferedReader::new(pgn_str.as_bytes());
+    let mut reader = Reader::new(pgn_str.as_bytes());
     let mut games = Vec::new();
     let mut positions = Vec::new();
     let mut unique_map: BTreeMap<String, String> = BTreeMap::new();
@@ -594,5 +609,5 @@ pub fn canonicalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledErro
     let pos = fen_to_chess(fen_str, span)?;
     let (canonical_pos, _) = normalize_to_white_to_move(&pos)
         .map_err(|e| LabeledError::new(format!("Canonicalization error: {e}")))?;
-    Ok(Fen::from_position(canonical_pos, EnPassantMode::Legal).to_string())
+    Ok(Fen::from_position(&canonical_pos, EnPassantMode::Legal).to_string())
 }

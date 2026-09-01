@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nu-plugin = "0.114"
-nu-protocol = "0.114"
+nu-plugin = "0.115"
+nu-protocol = "0.115"
 
-shakmaty = "0.26"
-pgn-reader = "0.24"
+shakmaty = "0.30"
+pgn-reader = "0.29"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

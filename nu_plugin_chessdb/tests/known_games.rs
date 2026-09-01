@@ -60,8 +60,8 @@ fn replay_san(moves: &[&str]) -> Vec<String> {
         let bare = mv_str.trim_end_matches(['+', '#']);
         let san: San = bare.parse().unwrap_or_else(|e| panic!("bad SAN '{bare}': {e}"));
         let mv = san.to_move(&pos).unwrap_or_else(|e| panic!("illegal move '{bare}' after {fens:?}: {e}"));
-        pos = pos.play(&mv).unwrap_or_else(|e| panic!("play failed for '{bare}': {e}"));
-        fens.push(Fen::from_position(pos.clone(), EnPassantMode::Legal).to_string());
+        pos = pos.play(mv).unwrap_or_else(|e| panic!("play failed for '{bare}': {e}"));
+        fens.push(Fen::from_position(&pos, EnPassantMode::Legal).to_string());
     }
     fens
 }

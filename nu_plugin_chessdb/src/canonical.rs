@@ -36,14 +36,15 @@ use shakmaty::{Board, Chess, Color, FromSetup, Move, Position, Setup, Square};
 /// mirrored, and vice versa). Applying it twice returns the original
 /// position — it's its own inverse.
 pub fn flip_colors(chess: &Chess) -> Result<Chess> {
-    let setup = chess.clone().into_setup(shakmaty::EnPassantMode::Legal);
+    let setup = chess.clone().to_setup(shakmaty::EnPassantMode::Legal);
 
     let by_role = shakmaty::ByRole::new_with(|role| setup.board.by_role(role).flip_vertical());
     let by_color = shakmaty::ByColor {
         white: setup.board.by_color(Color::Black).flip_vertical(),
         black: setup.board.by_color(Color::White).flip_vertical(),
     };
-    let normalized_board = Board::from_bitboards(by_role, by_color);
+    let normalized_board = Board::try_from_bitboards(by_role, by_color)
+        .expect("role/color bitboards built from a flip of a valid board are always consistent");
 
     let normalized_setup = Setup {
         board: normalized_board,

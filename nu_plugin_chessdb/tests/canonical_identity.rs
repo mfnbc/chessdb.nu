@@ -12,7 +12,7 @@ use nu_plugin_chessdb::canonical::{flip_colors, normalize_to_white_to_move};
 use nu_plugin_chessdb::chess::fen_to_chess;
 use nu_plugin_chessdb::core::{canonicalize_fen, pgn_to_fens};
 use nu_protocol::Span;
-use shakmaty::zobrist::{Zobrist64, ZobristHash};
+use shakmaty::zobrist::Zobrist64;
 use shakmaty::{fen::Fen, EnPassantMode, Color, Position};
 
 fn hash_of(fen: &str) -> String {
@@ -153,8 +153,8 @@ fn flip_colors_is_an_involution_and_de_canonicalizes() {
     let (via_normalize, was_flipped) = normalize_to_white_to_move(&real_black_to_move).unwrap();
     assert!(was_flipped);
     assert_eq!(
-        Fen::from_position(canonical.clone(), EnPassantMode::Legal).to_string(),
-        Fen::from_position(via_normalize, EnPassantMode::Legal).to_string()
+        Fen::from_position(&canonical, EnPassantMode::Legal).to_string(),
+        Fen::from_position(&via_normalize, EnPassantMode::Legal).to_string()
     );
 
     // De-canonicalize: flipping the canonical result again must recover the
@@ -163,7 +163,7 @@ fn flip_colors_is_an_involution_and_de_canonicalizes() {
     let de_canonicalized = flip_colors(&canonical).expect("reverse flip should succeed");
     assert_eq!(de_canonicalized.turn(), Color::Black);
     assert_eq!(
-        Fen::from_position(de_canonicalized, EnPassantMode::Legal).to_string(),
-        Fen::from_position(real_black_to_move, EnPassantMode::Legal).to_string()
+        Fen::from_position(&de_canonicalized, EnPassantMode::Legal).to_string(),
+        Fen::from_position(&real_black_to_move, EnPassantMode::Legal).to_string()
     );
 }

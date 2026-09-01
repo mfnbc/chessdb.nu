@@ -2826,7 +2826,7 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
     // patched on.
     let mate_in_1_exists = chess.legal_moves().iter().any(|m| {
         let mut c = chess.clone();
-        c.play_unchecked(m);
+        c.play_unchecked(*m);
         c.is_checkmate()
     });
 
@@ -3118,7 +3118,7 @@ pub fn analyze_fen_with_engine_score(
         .context("could not convert FEN to chess position")?;
 
     let normalized_fen =
-        Fen::from_position(chess.clone(), shakmaty::EnPassantMode::Legal).to_string();
+        Fen::from_position(&chess, shakmaty::EnPassantMode::Legal).to_string();
     let legal_move_count = chess.legal_moves().len();
 
     // Scoring/SensorReport work entirely in a normalized frame where White
