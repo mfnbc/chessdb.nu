@@ -12,25 +12,32 @@
 # computation of its own, on purpose: that's the class of code that caused
 # the blunder in the first place.
 #
-# Cell legend:
-#   .    empty, uncontrolled
-#   x    empty, controlled
-#   P/p  occupied, uncontrolled by this piece (shown as-is from the FEN)
-#  (P)  occupied by this piece's own side, controlled (defended)
-#  [p]  occupied by the opponent, controlled (attacked)
-#  *N*  the piece being inspected, on its own square
-const FILES = [a b c d e f g h]
+# Renders through board_overlay.nu's shared convention (2026-09-02) instead
+# of a bespoke legend: the one "controls" set is split into 3 layers by what
+# occupies each square — own pieces (defended), enemy pieces (attacked),
+# empty (controlled space) — so the fixed (),[],{} bracket grammar applies
+# unchanged. These three are mutually exclusive by construction (a square
+# is exactly one of own/enemy/empty), so the overlap marker <> never fires
+# here — that's expected, not a bug; see control_overlap.nu for a case
+# where two layers genuinely can overlap on the same square.
+use ./board_overlay.nu *
 
 def main [fen: string, square: string] {
-    let board_part = ($fen | split row " " | get 0)
-    let ranks = ($board_part | split row "/")
-    if ($ranks | length) != 8 {
-        print $"malformed FEN board section: ($board_part)"
+    let info = ($fen | chessdb square-control --square $square)
+    if $info.piece == null {
+        print $"($square) is empty — nothing to compute control from."
         return
     }
+    let is_white_piece = ($info.piece.color == "white")
 
-    # rows top-to-bottom are rank 8..1; expand digit run-lengths into '.'
-    mut grid = {}
+    # Split controls by what's actually on each square, read straight from
+    # the FEN's own board text (uppercase = white) rather than a second
+    # plugin round trip — cheap and this is display-only classification,
+    # not geometry.
+    let board_part = ($fen | split row " " | get 0)
+    let files = [a b c d e f g h]
+    mut occupant_of = {}
+    let ranks = ($board_part | split row "/")
     for rank_idx in 0..7 {
         let rank_num = 8 - $rank_idx
         let row = ($ranks | get $rank_idx)
@@ -39,53 +46,31 @@ def main [fen: string, square: string] {
             if ($ch =~ '^[0-9]$') {
                 let n = ($ch | into int)
                 for _ in 0..<$n {
-                    let sq = $"($FILES | get $file_idx)($rank_num)"
-                    $grid = ($grid | insert $sq ".")
+                    $occupant_of = ($occupant_of | insert $"($files | get $file_idx)($rank_num)" ".")
                     $file_idx = $file_idx + 1
                 }
             } else {
-                let sq = $"($FILES | get $file_idx)($rank_num)"
-                $grid = ($grid | insert $sq $ch)
+                $occupant_of = ($occupant_of | insert $"($files | get $file_idx)($rank_num)" $ch)
                 $file_idx = $file_idx + 1
             }
         }
     }
 
-    let info = ($fen | chessdb square-control --square $square)
-    if $info.piece == null {
-        print $"($square) is empty — nothing to compute control from."
-        return
-    }
-    let is_white_piece = ($info.piece.color == "white")
-    let controlled_set = $info.controls
+    let own_controlled = ($info.controls | where { |sq|
+        let occ = ($occupant_of | get $sq)
+        $occ != "." and (($occ =~ '^[A-Z]$') == $is_white_piece)
+    })
+    let enemy_controlled = ($info.controls | where { |sq|
+        let occ = ($occupant_of | get $sq)
+        $occ != "." and (($occ =~ '^[A-Z]$') != $is_white_piece)
+    })
+    let empty_controlled = ($info.controls | where { |sq| ($occupant_of | get $sq) == "." })
 
-    print $"($info.piece.color) ($info.piece.role) on ($square) controls ($controlled_set | length) squares:"
+    print $"($info.piece.color) ($info.piece.role) on ($square) controls ($info.controls | length) squares:"
     print ""
-
-    for rank_idx in 0..7 {
-        let rank_num = 8 - $rank_idx
-        mut row_str = $"($rank_num) "
-        for file_idx in 0..7 {
-            let sq = $"($FILES | get $file_idx)($rank_num)"
-            let occupant = ($grid | get $sq)
-            let is_controlled = ($sq in $controlled_set)
-            let cell = if $sq == $square {
-                $"*($occupant)*"
-            } else if $occupant == "." {
-                if $is_controlled { " x " } else { " . " }
-            } else if $is_controlled {
-                let occupant_is_white = ($occupant =~ '^[A-Z]$')
-                if $occupant_is_white == $is_white_piece {
-                    $"\(($occupant)\)"
-                } else {
-                    $"[($occupant)]"
-                }
-            } else {
-                $" ($occupant) "
-            }
-            $row_str = $row_str + $cell + " "
-        }
-        print $row_str
-    }
-    print "    a   b   c   d   e   f   g   h"
+    render-board-grid $fen [
+        {name: "own piece defended", squares: $own_controlled}
+        {name: "enemy piece attacked", squares: $enemy_controlled}
+        {name: "empty square controlled", squares: $empty_controlled}
+    ] --highlight $square
 }

@@ -219,19 +219,34 @@ through the internal `us_color`/`them_color` variables would have silently corru
 sent straight into the `chess-coach` LLM prompt (`ai/mod.nu`).
 
 A handful of `core.rs` functions that predate this whole pipeline — `fen_info`,
-`mobility_summary`, `attack_summary`, `checker_summary`, `is_legal`, `square_control` — are
-now also exposed directly as plugin commands (`chessdb fen-info`, `chessdb legal-moves`,
-`chessdb attack-summary`, `chessdb checker-summary`, `chessdb is-legal`, `chessdb
-square-control`), not just called internally. They sit outside the numbered pipeline above
-(no `SensorReport`, no concepts, no ranking) — cheap, single-purpose answers to "what are my
-options"/"is this legal"/"what's attacked" that don't need paying for a full `hugm-eval`
-call. `square_control` (added 2026-09-02) is the odd one out in *why* it exists rather than
-what it does: `Board::attacks_from` (shakmaty, occupancy-aware, per-piece) was already used
-internally (`attacked_squares` in this same file), but nothing exposed it for one specific
-piece — a live game hung a bishop by computing "does this diagonal reach that square" by
-hand instead of asking the engine that already gets it right (`FINDINGS.md`, 2026-09-02).
-`nu_plugin_chessdb/scripts/play/control_map.nu` renders its output as an 8x8 grid — the
-primitive stays geometry-only; the grid is presentation, not a second computation of it.
+`mobility_summary`, `attack_summary`, `checker_summary`, `is_legal`, `square_control`,
+`square_attackers` — are now also exposed directly as plugin commands (`chessdb fen-info`,
+`chessdb legal-moves`, `chessdb attack-summary`, `chessdb checker-summary`, `chessdb
+is-legal`, `chessdb square-control`, `chessdb square-attackers`), not just called
+internally. They sit outside the numbered pipeline above (no `SensorReport`, no concepts, no
+ranking) — cheap, single-purpose answers to "what are my options"/"is this legal"/"what's
+attacked" that don't need paying for a full `hugm-eval` call. `square_control` (added
+2026-09-02) is the odd one out in *why* it exists rather than what it does: `Board
+::attacks_from` (shakmaty, occupancy-aware, per-piece) was already used internally
+(`attacked_squares` in this same file), but nothing exposed it for one specific piece — a
+live game hung a bishop by computing "does this diagonal reach that square" by hand instead
+of asking the engine that already gets it right (`FINDINGS.md`, 2026-09-02).
+`square_attackers` (added the same day, same motivation) is the reverse question —
+`Board::attacks_to`, "what attacks this square" rather than "what does this piece see" —
+arguably the more directly useful one for "is it safe to move a piece here," since it works
+whether or not the target square is occupied. `nu_plugin_chessdb/scripts/play/control_map.nu`
+and `attackers_map.nu` render their respective outputs as an 8x8 grid — the primitives stay
+geometry-only; the grid is presentation, not a second computation of it.
+
+This same pass also mined shakmaty for hand-rolled geometry already inside the pipeline
+(`detect_skewers`, now rewritten onto `attacks::rook_attacks`/`bishop_attacks` like its
+sibling `detect_pins`; `chebyshev_distance`, now `Square::distance`; a couple of duplicated
+pawn-attack-destination computations, now `attacks::pawn_attacks`) and, per an explicit
+standing principle (`CLAUDE.md`, "Chessdb defers to shakmaty for anything geometric"),
+attempted — then correctly reverted — a rewrite of `king_safety_score`'s pawn shield/storm
+loop once an A/B numeric diff against real positions showed it wasn't behavior-preserving;
+see the Findings table and `FINDINGS.md` for the full account of what was and wasn't a real
+gap.
 
 ## Findings
 
@@ -257,6 +272,9 @@ again — lives in `FINDINGS.md`, not here.
 | `sensor_report.mate_in_1_exists` was fully computed but reachable only through the ELO-gated `gated_issues` path (`--player-elo`) — a plain `--verbose true` call, the one this session's live-play checking actually used, could walk straight into a real, computed mate-in-1 with zero warning in `.explanations`. Both explanation renderers now check it directly and unconditionally, first, ahead of every other phrase | `render_explanations`, `render_structured_explanations` | `fruit_game_six_mate_in_1_was_computed_but_never_surfaced_in_explanations` |
 | `king_exposure`'s `shelter_files` count (how many of the 3 files centered on the king have *any* friendly pawn anywhere on them) can't distinguish a bare flank file from a completely pawnless king-file — 2 of 3 files "sheltered" read as safe even when the file directly in front of the king (the specifically dangerous one — direct rook/queen access) has no pawn at all. `king_file_open` is now a separate, independently-triggering field for exactly that case | `extract_king_exposure` | `fruit_game_nine_castling_onto_a_pawnless_king_file_read_as_zero_exposure` |
 | One piece's full geometric control (occupancy-aware, either side, independent of whose turn it is) was computable internally (`Board::attacks_from`, already backing `attack_summary`'s whole-board view) but not queryable for a single piece — live play hung a bishop computing "does this diagonal reach that square" by hand instead | `square_control` | `knight_in_the_corner_controls_exactly_its_three_reachable_squares`, `sliding_piece_control_stops_at_the_first_blocker` |
+| The reverse of `square_control` — "what attacks this square" — was also missing, and is arguably the more directly useful question for "is it safe to move here": `Board::attacks_to` answers it for either color on any square, occupied or not, without needing a piece already there | `square_attackers` | `square_attacked_by_exactly_one_side`, `square_attacked_by_both_sides` |
+| `detect_skewers` hand-walked 8 hardcoded direction tuples one square at a time instead of using shakmaty's occupancy-aware `attacks::rook_attacks`/`bishop_attacks` the way its sibling `detect_pins` already did — A/B-verified byte-identical against the old implementation across every known-game/motif test FEN, both colors, before the old code was removed | `detect_skewers` | `runs_cleanly_on_every_known_game_and_motif_test_fen`, `detects_skewer`, `skewer_negative_no_back_piece` |
+| Not every hand-rolled-looking loop is a real gap: `king_safety_score`'s pawn shield/storm computation looks like two independent per-file queries but is genuinely sequential (a shared early-exit couples "nearest own pawn" to "nearest enemy pawn") — an attempted split into independent bitboard queries passed `cargo test` but was caught as a real regression only by an explicit numeric A/B diff against real positions, and was reverted | `king_safety_score` (unchanged) | no dedicated test — caught by manual `groups.king_safety.blended` A/B diff, not `cargo test` alone; see `FINDINGS.md` |
 
 ## What this deliberately does not do (yet)
 

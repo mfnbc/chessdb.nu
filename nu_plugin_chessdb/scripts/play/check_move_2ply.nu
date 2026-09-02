@@ -22,6 +22,13 @@
 # actually play" — the exact line this project's static evaluator
 # deliberately does not cross (PLAN.md's "Pathfinding an exchange instead
 # of calculating it").
+#
+# No see_cp/consequence printed (2026-09-02, matching check_move.nu) —
+# attacker_count/defender_count is the raw fact; verify anything flagged
+# here with calc_line.nu, don't trust a per-fact valuation. No raw FEN
+# printed either, same reasoning — see board_overlay.nu.
+use ./board_overlay.nu *
+
 def main [moves: string, candidate: string] {
     let move_list = if ($moves | str trim | is-empty) { [] } else { $moves | split row " " }
     mut fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -31,7 +38,8 @@ def main [moves: string, candidate: string] {
 
     let after_candidate = (try { $fen | chessdb apply-uci --uci $candidate } catch { null })
     if $after_candidate == null {
-        print $"ILLEGAL: ($candidate) from ($fen)"
+        print $"ILLEGAL: ($candidate) — position before the attempt:"
+        render-board-grid $fen []
         return
     }
 
@@ -58,10 +66,10 @@ def main [moves: string, candidate: string] {
                 print $"    HANGING: ($h.piece.role)@($h.piece.square) value=($h.value) safe_to_capture=($h.safe_to_capture)"
             }
             for o in $my_outnumbered {
-                print $"    OUTNUMBERED: ($o.piece.role)@($o.piece.square) ($o.attacker_count)v($o.defender_count) see_cp=($o.see_cp) consequence=($o.consequence)"
+                print $"    OUTNUMBERED: ($o.piece.role)@($o.piece.square) ($o.attacker_count)v($o.defender_count)"
             }
             for m in $my_mover_favored {
-                print $"    MOVER_FAVORED: ($m.piece.role)@($m.piece.square) ($m.attacker_count)v($m.defender_count) see_cp=($m.see_cp) consequence=($m.consequence)"
+                print $"    MOVER_FAVORED: ($m.piece.role)@($m.piece.square) ($m.attacker_count)v($m.defender_count)"
             }
         }
     }

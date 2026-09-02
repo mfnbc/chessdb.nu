@@ -8,6 +8,11 @@
 # what's *forcing* (a check or capture demands a response; a quiet move
 # doesn't), which is the first thing a human calculates from — follow forcing
 # lines to a quiet position, then judge that position on its own merits.
+#
+# No raw FEN printed (2026-09-02, user feedback) -- rendered as a grid
+# instead, via board_overlay.nu's shared convention.
+use ./board_overlay.nu *
+
 def main [moves: string] {
     let move_list = if ($moves | str trim | is-empty) { [] } else { $moves | split row " " }
     mut fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -15,7 +20,8 @@ def main [moves: string] {
         $fen = ($fen | chessdb apply-uci --uci $m)
     }
     let lm = ($fen | chessdb legal-moves)
-    print $"fen: ($fen)"
+    render-board-grid $fen []
+    print ""
     print $"side to move: ($lm.side_to_move)  \(($lm.legal_move_count) legal moves\)"
     print ""
 

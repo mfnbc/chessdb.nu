@@ -295,6 +295,25 @@ pub struct SquareControl {
     /// by the opponent (what it attacks) alike — the caller distinguishes
     /// those by cross-referencing the board itself.
     pub controls: Vec<String>,
+    /// True for a light square (a1, h8, ...), false for dark — a genuine
+    /// geometric fact (bishop color-complex reasoning: a light-squared
+    /// bishop can never contest a dark square) present regardless of
+    /// whether the square is occupied.
+    pub is_light: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SquareAttackers {
+    pub square: String,
+    /// Every white/black piece (of either side) that attacks this square —
+    /// the reverse question from `SquareControl::controls` ("what attacks
+    /// this square" vs. "what does the piece on this square see"), and the
+    /// more directly useful one for "is it safe to move a piece here":
+    /// occupancy-aware, turn-independent, works on an empty square just as
+    /// well as an occupied one (`Board::attacks_to` takes the target square
+    /// and an explicit attacking color, not a piece that has to be there).
+    pub attacked_by_white: Vec<String>,
+    pub attacked_by_black: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -557,7 +576,35 @@ pub fn square_control(fen_str: &str, square_str: &str, span: Span) -> Result<Squ
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
-    Ok(SquareControl { square: square_str.to_string(), piece, controls })
+    Ok(SquareControl { square: square_str.to_string(), piece, controls, is_light: sq.is_light() })
+}
+
+/// Every piece (either side) that attacks a given square — the reverse of
+/// `square_control`'s "what does this piece see." Answers "is it safe to
+/// move a piece here" directly, without needing a piece to already be on
+/// the target square: `Board::attacks_to` takes the target and an explicit
+/// attacking color, occupancy-aware, turn-independent.
+pub fn square_attackers(fen_str: &str, square_str: &str, span: Span) -> Result<SquareAttackers, LabeledError> {
+    let pos = fen_to_chess(fen_str, span)?;
+    let sq: Square = square_str.parse().map_err(|e| {
+        LabeledError::new(format!("Invalid square '{square_str}': {e}"))
+            .with_label("expected algebraic notation, e.g. 'e4'", span)
+    })?;
+
+    let board = pos.board();
+    let occupied = board.occupied();
+    let attacked_by_white = board
+        .attacks_to(sq, Color::White, occupied)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let attacked_by_black = board
+        .attacks_to(sq, Color::Black, occupied)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    Ok(SquareAttackers { square: square_str.to_string(), attacked_by_white, attacked_by_black })
 }
 
 pub fn checker_summary(fen_str: &str, span: Span) -> Result<CheckerSummary, LabeledError> {
@@ -738,6 +785,58 @@ mod square_control_tests {
     #[test]
     fn invalid_square_is_a_labeled_error_not_a_panic() {
         let result = square_control(STARTPOS, "z9", Span::test_data());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn control_reports_square_color() {
+        // b1 is a light square, c1 is dark (shakmaty's own convention,
+        // doc-verified against Square::D1.is_light()/E1.is_dark()) — spot
+        // check both so the field isn't accidentally inverted.
+        assert!(square_control(STARTPOS, "b1", Span::test_data()).expect("valid square").is_light);
+        assert!(!square_control(STARTPOS, "c1", Span::test_data()).expect("valid square").is_light);
+    }
+}
+
+#[cfg(test)]
+mod square_attackers_tests {
+    use super::*;
+
+    const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+    #[test]
+    fn empty_square_attacked_by_neither_side() {
+        let result = square_attackers(STARTPOS, "e4", Span::test_data()).expect("valid square");
+        assert!(result.attacked_by_white.is_empty());
+        assert!(result.attacked_by_black.is_empty());
+    }
+
+    #[test]
+    fn square_attacked_by_exactly_one_side() {
+        // c3 is reachable by White's Nb1 (b1->c3) and the b2/d2 pawns
+        // (diagonal capture squares) but nothing Black owns reaches it yet
+        // in the start position.
+        let result = square_attackers(STARTPOS, "c3", Span::test_data()).expect("valid square");
+        let mut white = result.attacked_by_white.clone();
+        white.sort();
+        assert_eq!(white, vec!["b1".to_string(), "b2".to_string(), "d2".to_string()]);
+        assert!(result.attacked_by_black.is_empty());
+    }
+
+    #[test]
+    fn square_attacked_by_both_sides() {
+        // White knight a1 and Black knight a3 both reach c2 — the exact
+        // question `square_control` alone can't answer (it only reports
+        // what a piece already sitting on the target square would see).
+        let fen = "4k3/8/8/8/8/n7/8/N3K3 w - - 0 1";
+        let result = square_attackers(fen, "c2", Span::test_data()).expect("valid square");
+        assert_eq!(result.attacked_by_white, vec!["a1".to_string()]);
+        assert_eq!(result.attacked_by_black, vec!["a3".to_string()]);
+    }
+
+    #[test]
+    fn invalid_square_is_a_labeled_error_not_a_panic() {
+        let result = square_attackers(STARTPOS, "z9", Span::test_data());
         assert!(result.is_err());
     }
 }

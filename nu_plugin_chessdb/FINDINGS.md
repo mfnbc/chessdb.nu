@@ -4409,3 +4409,310 @@ tests included), release plugin rebuilt and `plugin add`/re-registered against t
 shell, `chessdb square-control` and `control_map.nu` both smoke-tested live against real
 positions (start position, the actual game-11 blunder FEN, an isolated pawn) before being
 trusted.
+
+---
+
+## 2026-09-02 (continued): Mining shakmaty for more topological visibility, and making "defer to shakmaty" a standing principle
+
+User asked for a full planning-and-review pass mining shakmaty for more visibility like
+`square-control`, with an explicit standing instruction: chessdb always defers to shakmaty
+when it can provide something, not just for live-play tooling but as an architectural
+principle (`CLAUDE.md`, new "Chessdb defers to shakmaty for anything geometric" section).
+Three research passes (full shakmaty 0.30.1 source read; full chessdb hand-rolled-geometry
+audit; baseline of already-exposed tooling) turned up a precise, bounded set of real gaps,
+planned in `/home/mjfarnbach/.claude/plans/snug-popping-turtle.md` and executed in two
+waves.
+
+**Wave 1 — `chessdb square-attackers` (additive).** `Board::attacks_to(sq, attacker,
+occupied)` is the reverse of `attacks_from` — "what attacks this square" instead of "what
+does this piece see." `square-control` only answers the first question; the second is
+arguably the more directly useful one for "is it safe to move a piece here," and works on
+an empty target square (no piece has to be sitting there yet). Added `core::SquareAttackers`
+/`square_attackers`, `chessdb square-attackers --square <sq>`, and
+`scripts/play/attackers_map.nu` (same grid-rendering shape as `control_map.nu`, distinct
+legend: `<P>` white attacker, `{p}` black attacker). Also added `is_light: bool` to the
+existing `SquareControl` struct (bishop color-complex reasoning). Validated directly against
+the real `Bd3` blunder position: `d3` shows `0` white attackers, `1` black — a more direct
+"don't go there" signal than `square-control` gave, since it doesn't require first guessing
+which enemy piece to check.
+
+**Wave 2 — replace hand-rolled geometry with shakmaty primitives, tiered by risk.**
+
+*Tier 1 (trivial, mathematically identical formulas):* `chebyshev_distance` now calls
+`Square::distance` directly (shakmaty's own doc-test confirms it's exactly
+`max(file_dist, rank_dist)`, the same formula the hand-rolled version computed).
+`piece_coordination_score`'s per-axis distance casts now use `File::distance`/
+`Rank::distance` — notation only, the Manhattan sum itself is unchanged (no shakmaty
+primitive computes that directly).
+
+*Tier 2 (`detect_skewers` — a genuine algorithm rewrite, A/B-verified before shipping).*
+Hand-walked 8 hardcoded direction tuples one square at a time via
+`File::offset`/`Rank::offset`, checking occupancy manually — already flagged as a
+deliberately-deferred gap earlier in this file. Rewritten to mirror its sibling
+`detect_pins`'s pattern: for each slider, `reach` is its current attack set via
+`attacks::rook_attacks`/`bishop_attacks`; for each enemy piece in `reach` (`front_sq`),
+recomputing reach with `front_sq` removed reveals at most one new occupied square along
+that exact ray (`reach_behind & !reach`), which is the "behind" candidate. Implemented
+under a temporary name alongside the original, ran both against 8 real positions (the two
+dedicated skewer tests plus 6 FENs already covered by `tests/known_games.rs`) for both
+colors, asserted byte-identical `(count, examples)` output — passed on the first try, no
+bugs found — then deleted the old implementation and renamed. New permanent regression
+test, `runs_cleanly_on_every_known_game_and_motif_test_fen`, keeps that same position set
+as a standing check.
+
+*Tier 3 (feeds the tuned, normally-unread `final_score` — same discipline, one real
+finding).* `pawn_structure_score`'s candidate/weak front-span walk now reuses the file's own
+existing `in_front` bitboard-shift helper instead of re-deriving the same forward span by
+manual rank-stepping (an in-project duplication fix as much as a shakmaty one).
+`piece_activity_score`'s and `pawn_structure_score`'s pawn-capture-destination computations
+now use `attacks::pawn_attacks(color, sq)` directly instead of manually deriving diagonal
+squares from `File::offset`, matching what `pawn_attack_mask` already did elsewhere in the
+same file. `extract_king_exposure` was surveyed and **deliberately left unchanged** — it
+already uses `File::offset`/`Bitboard::from(File)` (legitimate shakmaty primitives, not raw
+arithmetic); the only "manual" part is checking 3 specific adjacent files individually,
+which is unavoidable for "how many of these 3 files have a pawn" (a single combined-mask
+popcount would miscount doubled pawns on one file as two files) — not a real gap.
+
+**The one real finding: `king_safety_score`'s shield/storm loop looked like two independent
+per-file queries and wasn't.** The original loop's `break` — triggered by finding the first
+enemy pawn ascending from rank 1 — exits the *entire* loop, not just the storm half, so
+"nearest own pawn" (shield) and "nearest enemy pawn" (storm) are coupled: once an enemy
+pawn is found, own-pawn tracking stops too, even if an own pawn sits at a higher rank that
+was never reached. For Black in particular, whose enemy (White) pawns typically sit on the
+low ranks the ascending loop reaches first, this means `shield_rank` in the original
+algorithm almost never actually sees Black's own rank-7-ish pawns — a real, load-bearing
+quirk of the existing tuned formula, not a bug to fix (behavior had to be preserved
+byte-for-byte, whatever it was).
+
+A first rewrite split shield/storm into two independent `Bitboard::first()`/`.last()`
+queries per file — clean-looking, compiled, and passed the *entire* `cargo test` suite
+(no test asserts `king_safety.blended`'s exact numeric value on any position). Caught only
+by the explicit before/after numeric diff this pass's own discipline requires: captured
+`groups.{king_safety,pawn_structure,piece_activity,tactical}.blended` and `final_score` for
+9 real positions with the new code, `git stash push -- src/eval/position.rs` to isolate the
+pre-Wave-2 baseline, rebuilt, recaptured the same values with the old code, diffed.
+`pawn_structure`/`piece_activity`/`tactical`/`final_score` matched exactly everywhere
+(confirming the other Tier 2/3 rewrites above are genuinely behavior-preserving) —
+`king_safety` differed on **every single position**, largest gap `-217` on the plain start
+position. Reverted the split back to the original coupled loop (kept using shakmaty's own
+`Rank`/`Square`/`Bitboard` types throughout, as it already did — the sequential coupling is
+inherent to what the computation actually does, not a sign of avoiding a library primitive),
+rebuilt, re-diffed: byte-identical across all 9 positions, `final_score` included.
+
+This is the whole reason the A/B-diff discipline exists rather than trusting `cargo test`
+alone for anything touching the tuned scoring table — recorded here as a genuine "tried,
+caught by verification, reverted" result, which is a more valuable outcome than either
+silently not attempting it or shipping the subtle bug undetected.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean throughout, full
+`cargo test` suite green (113 tests passing, 1 pre-existing ignore — measured directly,
+not derived), `cargo test --test sts_positional -- --ignored` passes, the 9-position numeric
+A/B diff byte-identical end to end, release plugin rebuilt and `plugin add`/re-registered
+against the live nu shell, `chessdb square-attackers` and `attackers_map.nu` smoke-tested
+live against the real `Bd3` blunder position and a constructed both-sides-attack position.
+
+---
+
+## 2026-09-02 (continued): one shared board-overlay convention instead of each grid script inventing its own legend
+
+User named the actual problem with `control_map.nu`/`attackers_map.nu` directly: `()`
+meant something different in each script, and asked for a real convention —
+"interoperable with the conventional 64-bit map" and able to "visualize concepts like
+control, overlap." Answered the design question first (is layering multiple bitboards on
+one grid even legible — yes for 2 layers, workable for 3, not beyond that, since it's
+combinatorial: N boolean layers means 2^N states to distinguish with one glyph per
+square), then built it once approved.
+
+**The convention** (`nu_plugin_chessdb/scripts/play/board_overlay.nu`): any layer is just
+a *square set* — a `list<string>` of algebraic squares, exactly what `controls`/
+`attacked_by_white`/`attacked_by_black`/etc. already return from the plugin, and exactly
+what a `shakmaty::Bitboard` is, just serialized as square names instead of a raw u64 — no
+adapter needed, any existing or future command returning a square list is a valid layer
+for free. Fixed glyph grammar, not caller-chosen: layer 1 → `()`, layer 2 → `[]`, layer 3
+→ `{}`, 2+ layers active on one square → `<>` regardless of which combination overlapped
+(distinguishing the exact combination would need a glyph per combination, illegible past
+2 layers anyway — the per-layer counts printed in the header answer that precisely if
+needed), an optional `--highlight` square → `*X*`, overriding everything.
+
+Rerouted both existing scripts onto it and added a genuinely new one:
+- `control_map.nu`: the one "controls" set split into 3 mutually-exclusive layers by
+  occupant (own piece defended / enemy piece attacked / empty controlled) — `<>` never
+  fires here by construction, which is correct, not a gap.
+- `attackers_map.nu`: white-attackers layer 1, black-attackers layer 2 — these genuinely
+  can overlap (a square attacked by both colors), so `<>` is real and meaningful here.
+- `control_overlap.nu` (new): whole-board version, White-controls vs. Black-controls, no
+  single square of interest — built on `chessdb attack-summary`'s
+  `attacked_by_white`/`attacked_by_black`, which has returned whole-board data since
+  before this session but was never rendered. Answers "who controls the center," "is this
+  square actually contested" — questions neither of the other two scripts, both scoped to
+  one piece or one square, could answer at all.
+
+Verified all three against known-good output: `control_map.nu`/`attackers_map.nu` rerun
+on the real `Bd3`-blunder position and the game-11 bishop's exact 9-square control set
+(2 own/1 enemy/6 empty, matching the counts already established when `square-control` was
+built) — output semantically identical to before, now through the shared renderer.
+`control_overlap.nu` checked on the start position (0 contested, as expected — no contact
+yet) and a real middlegame position with genuine central tension (7 contested squares,
+correctly marked `<>`).
+
+Verified: no Rust changes this entry — pure Nu-side consolidation and one new script, all
+built on already-shipped, already-tested plugin commands (`square-control`,
+`square-attackers`, `attack-summary`). Each script smoke-tested live against real
+positions before being trusted, per the same discipline as every other tool in this
+directory.
+
+---
+
+## 2026-09-02 (continued): Twelfth Fruit game — the board-overlay tools used live for the first time, a real oversight caught cleanly, and an honest look at where the position actually turned
+
+User asked to actually watch a game and see the board-overlay tools (`attackers_map.nu`,
+`control_overlap.nu`) used live, not just built. Played White, Nimzo-Indian (`1.d4 Nf6
+2.c4 e6 3.Nc3 Bb4 4.e3 Ne4 5.Qc2 f5 6.a3 Bxc3+ 7.bxc3 O-O 8.Nf3 b6 9.Be2 Ba6 10.O-O Nc6
+11.Bb2 Na5 12.c5 Bxe2 13.Qxe2 bxc5 14.dxc5 Nb3 15.Rd1 Nxc5 16.Nd4 Qh4 17.g3 Qh6 18.f3 Nd6
+19.Nb5 Nxb5 20.Qxb5 Qxe3+ 21.Kh1 Rb8 22.Qc4 Rxb2`), resigned at `-1253` with no tactics
+or compensation available.
+
+**`control_overlap.nu` used to assess a real Nimzo-Indian tabiya** (move 5, `Nc3` under
+pressure from both `Ne4` and `Bb4`): 33 White-controlled squares, 32 Black, 7 contested —
+`c3` itself correctly shown as a genuine stack `<N>`, matching `hugm-eval`'s own
+`outnumbered` finding on that square (`consequence: Even`, not a real threat).
+
+**`attackers_map.nu` used repeatedly for real move-selection decisions, not just
+demonstration:** caught that `9.Bd3` (the originally planned developing move) would have
+*blocked my own queen's diagonal* onto `e4` rather than adding a second attacker as
+intended — `Bd3` only showed 1 white attacker on `e4`, not 2, because it sits directly on
+the `c2-e4` line the queen was already using. Switched to `9.Be2` instead, which doesn't
+self-block. Also used before `9.a3`/candidate captures to confirm real 2v1/3v1 attacker
+balances (`e4`, `d4`, `c4` at various points) rather than counting pieces by eye.
+
+**A real oversight, caught cleanly by the existing discipline rather than becoming a live
+blunder.** After `21...Rb8`, checked `22.Rd3` via `check_move.nu` and saw `HANGING:
+Queen@b5 value=900 safe_to_capture=true` in the output — correctly read as "don't play
+this move," but the *diagnosis* was wrong: the queen wasn't hanging *because of* `Rd3`, it
+was already hanging to `Rb8` down a fully open b-file (`b7`/`b6` both empty) the moment
+Black played `21...Rb8`, independent of anything White does next. `check_move.nu` applies
+the candidate and evaluates the *resulting* position's hanging list, so it caught the
+problem correctly regardless of which candidate was checked first — the safety net held —
+but attributing the cause to the wrong move meant nearly wasting a check on `Qxc5` (also
+hanging, for an unrelated reason — `Qe3`'s own diagonal) before checking retreat squares
+systematically. Checked seven queen destinations directly (`a4`, `b3`, `b4`, `b6`, `c4`,
+`c5`, `d3`, `e2`, `a5`, `a6`) to find the two (`a5`, `c4`) that don't also hang the queen —
+both still lose the bishop (`Rb8` was blocking a second problem: once the queen leaves the
+b-file, `Bb2` is undefended down the same file), confirming this was a genuinely forced
+loss, not a move-order error. **Lesson for the skill, not the tool:** after any opponent
+move, check the raw current position's own hanging list directly before evaluating
+candidates, so causes get attributed correctly from the start — the candidate-check safety
+net still catches the problem either way, but a wrong diagnosis costs a wasted check and
+risks missing that *multiple* pieces are compromised by the same root cause (the open
+b-file), not just one.
+
+**Where the position actually turned, per `fruit_analyze.sh`'s own search (White-relative,
+normalized by hand):** two real drops, not a single blunder. `19.Nb5` itself: `-147cp →
+-296cp`, a ~149cp decline — the move was calculated and verified sound in the sub-line
+actually checked (`a6` allowing `Nxc7` winning a clean pawn, confirmed via `calc_line.nu`
+against the real position), but Fruit's search rated the move below its actual best
+regardless of that specific line, and Black's simpler practical reply (`19...Nxb5`
+immediately, sidestepping the calculated trap) meant the calculated upside never
+materialized. `22.Qc4` (the forced retreat): `-353cp → -669cp`, a larger ~316cp decline —
+but this reflects the underlying structural vulnerability (the queen's only legal
+recapture square on move 20 sat on the same open file as Black's rook, four moves before
+that consequence actually landed), not a fresh error in *which* retreat square got picked;
+every one of the seven checked was comparably bad or worse.
+
+Verified: no code changes this entry — live play, `attackers_map.nu`/`control_overlap.nu`
+used and relayed throughout (not just at the end), `calc_line.nu` used to verify the
+`Nb5`/`Nxc7` sub-line before committing to it, `fruit_analyze.sh` postmortem run and
+normalized to a consistent perspective before drawing conclusions from it.
+
+---
+
+## 2026-09-02 (continued): stripping `see_cp`/`consequence`/`centipawns` from every live-play tool — the aggregate-score lesson applied one level deeper
+
+Direct user pushback after Game 12: still being misled by scores, even after `final_score`
+was stripped from every live-play tool weeks earlier in this same session. The per-fact
+`see_cp`/`consequence` fields on `Fork`/`Outnumbered`/`MoverFavored` entries had survived
+that earlier cleanup on the reasoning that each is tied to one concrete, individually-
+tested exchange rather than a summed formula — but that distinction doesn't actually hold
+up: `find_forks` is still backed by the known-buggy `see_chain` (documented, deferred), and
+even the direct-subtraction pricing `find_outnumbered`/`find_mover_favored` use is still a
+*computed valuation*, not a raw fact. Game 12's own `19.Nb5` is a real instance of this
+having cost something: the fork's `see_cp=900`/`consequence: Winning` looked decisive, the
+underlying calculation (verified via `calc_line.nu`, not just trusted) *was* real in the
+specific sub-line checked, but Fruit's own search still rated the move below its actual
+best (`fruit_analyze.sh`, `-147cp → -296cp` swing) — leaning on the number, even a
+per-fact one, produced a move that was good but not the best available.
+
+**Removed from every script's output, not just deprioritized:** `see_cp`/`consequence` on
+forks/outnumbered/mover_favored (`check_move.nu`, `check_move_2ply.nu`, `calc_line.nu`),
+and the server-generated `.explanations` prose entirely from `check_move.nu` (it embeds
+`see_cp`/`consequence`/tropism/initiative scores by construction — no way to launder
+individual numbers out of generated sentences without regexing them, and the structured
+counts plus the board-overlay tools already cover the same ground). **What stays:**
+`attacker_count`/`defender_count` (plain counts, not valuations), piece identity and
+standard value (a fixed constant — same numbers the skill already has you count material
+with by hand, not a search result), and fork/skewer *target lists* (who's involved, not
+whether the exchange is worth it). Forks now print as `attacker=... -> target1, target2`
+with no verdict attached.
+
+**New tool, `scripts/play/material.nu`:** raw piece-count material for both sides, and
+nothing else — deliberately never touches `material.balance.centipawns`. This was a real
+gap: game 11/12 resignation decisions were made by directly reading `.centipawns` values
+(`-958`, `-1253`) as a threshold check, exactly the "just check if it's decisive" reflex
+the whole score-stripping effort exists to prevent, just one level removed from
+`final_score` itself. Now there's no path to that field that doesn't require deliberately
+asking for the full `hugm-eval` record — the natural tool for a material check surfaces
+only counts.
+
+**`.claude/skills/position-eval/SKILL.md` updated**: step 2a no longer tells the reader to
+"read `consequence`/`see_cp`... where present" as part of judging whether a tactical
+danger is real — replaced with an explicit instruction to verify via `calc_line.nu`
+(walk the real capture sequence, read the resulting raw piece list) or
+`attackers_map.nu`/`control_map.nu` (see directly what defends what), never by reading a
+precomputed verdict. `safe_to_capture: true`/`false` on `hanging` entries stays fully
+trusted — it's a direct legality/capture fact, not a valuation, and nothing about this
+change touches it.
+
+Verified: all four edited scripts (`check_move.nu`, `check_move_2ply.nu`, `calc_line.nu`,
+plus new `material.nu`) smoke-tested live against real positions from this session's own
+game history (the game-10 `Bxh3` fork position, the game-12 resignation position) —
+confirmed no `see_cp`/`consequence`/`centipawns` appears anywhere in any script's output,
+and that the remaining structural facts (counts, target lists, piece values) still print
+correctly. No Rust changes — every field removed from these scripts' output was already
+being computed and returned by `hugm-eval`; this is purely a Nu-side consumption-discipline
+change, matching how the original `final_score` strip-out was done.
+
+---
+
+## 2026-09-02 (continued): no raw FEN either — the same principle one level further
+
+Direct user follow-up, same conversation: a FEN string is exactly the same class of thing
+as a score — a compact, symbolic encoding that has to be mentally parsed back into a board
+to actually mean anything, and mis-parsing one by eye is precisely the arithmetic that hung
+a bishop in live play (`11.Bd3??`, this file, earlier 2026-09-02 entry). Confirmed and
+applied: every script that previously printed `fen: ...` for a human to read now renders an
+actual grid instead, via `board_overlay.nu`'s already-established convention, extended to a
+"plain board" mode (called with an empty layer list and no `--highlight`) — the legend
+section is skipped entirely in that mode, since there's nothing to key.
+
+`check_move.nu` and `check_move_2ply.nu` now render the resulting/attempted position with
+the candidate's destination square highlighted (`--highlight`, the moved-to square parsed
+from the UCI string) instead of printing its FEN. `calc_line.nu` renders every ply of a
+calculated line as its own grid, highlighting that ply's destination square — genuinely
+more useful than before, not just equivalently safe: watching the actual board change
+square by square through a calculated sequence is closer to how a human calculates than
+reading a string of algebraic notation was. `forcing_moves.nu` renders the starting
+position once before listing branches. `material.nu` — deliberately left without a grid:
+its whole output is already a `list<string>`-adjacent aggregate (piece counts by role),
+which satisfies the "list of pieces you can hand-calculate from" alternative the user named
+directly; adding a grid there would be redundant with its stated single purpose. FEN
+strings still exist inside every script, as plain internal variables threaded between
+`chessdb apply-uci`/`chessdb hugm-eval` calls — that's necessary plumbing, not something
+printed for a human to read, and nothing about this change touches it.
+
+Verified: all five affected scripts (`check_move.nu`, `check_move_2ply.nu`, `calc_line.nu`,
+`forcing_moves.nu`, `material.nu`) smoke-tested live, including each one's illegal-move
+error path (confirmed a grid renders there too, showing the pre-attempt position, instead
+of a bare FEN in the error message) and `board_overlay.nu`'s new empty-layer/no-highlight
+"plain board" mode specifically (confirmed the legend section is correctly omitted, not
+just left blank). `grep`-confirmed zero remaining `"fen: ` string literals anywhere in
+`scripts/play/*.nu` after the edits. No Rust changes.

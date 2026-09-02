@@ -68,14 +68,30 @@ worth noting ("no immediate tactics for either side").
 `tactical.pins`, `tactical.skewers`, `tactical.discovered`. For each non-empty list: whose
 piece is it (`piece.color` / `attacker.color`), is the danger real right now or merely
 geometric (an attacked-but-well-defended piece is not the same as one about to fall — read
-`consequence`/`see_cp`/`attacker_count` vs `defender_count` where present), and who does it
-favor. A real hanging piece or a mate-in-1 makes everything below this section close to
-irrelevant.
+`attacker_count` vs `defender_count` where present), and who does it favor.
+
+**Do not read `consequence`/`see_cp` as the answer to "is the danger real" (2026-09-02,
+user feedback, FINDINGS.md).** These looked more trustworthy than `final_score` because
+each is tied to one concrete exchange rather than a summed formula, but `find_forks` is
+still backed by the known-buggy `see_chain`, and even the direct-subtraction pricing
+`find_outnumbered`/`find_mover_favored` use is still a *computed valuation*, not a raw
+fact — a real game (Game 12) shows leaning on it can lead to a move Fruit's own search
+still rated below its actual best. `check_move.nu`/`calc_line.nu` no longer print these
+fields at all. When `attacker_count`/`defender_count` (or a fork's target list) says a
+piece might be genuinely contested, verify by actually calculating: `calc_line.nu` to walk
+the real capture sequence and read the resulting raw piece list, or
+`attackers_map.nu`/`control_map.nu` to see directly what defends what — never by reading a
+pre-computed verdict. A real hanging piece (`safe_to_capture: true`) or a mate-in-1 makes
+everything below this section close to irrelevant; that field stays trustworthy because
+it's a direct legality/capture fact, not a valuation.
 
 **b. Material** — count it yourself from `material.balance.white`/`.black`
 (pawns=1, knights/bishops=3, rooks=5, queens=9 — standard values, not a computed score) and
 note `bishop_pair_white`/`bishop_pair_black`. State the raw imbalance in plain terms ("White
-is up a clean pawn," "material is level but Black has the bishop pair").
+is up a clean pawn," "material is level but Black has the bishop pair"). Use
+`scripts/play/material.nu` for a quick check mid-game — it prints only the raw piece
+counts, deliberately never `material.balance.centipawns`, so there's nothing to glance at
+and no reflex to trigger.
 
 **c. King safety** — `positional.king_exposure` (`attacker_count`, `shelter_files`,
 `king_file_open`, whichever king it's reported for) and `in_check`. A king with real

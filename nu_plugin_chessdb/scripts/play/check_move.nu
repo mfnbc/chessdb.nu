@@ -1,6 +1,7 @@
 #!/usr/bin/env nu
 # Usage: nu check_move.nu "<space-separated uci move list>" "<candidate uci move>"
-# Applies the candidate move and reports full tactical safety + score.
+# Applies the candidate move and reports tactical safety via raw structural
+# facts only — never a score, never a per-fact SEE valuation.
 #
 # MY PIECES AT RISK is printed first and separately from everything else,
 # on purpose: the Fruit-game postmortem found a real case where the tool
@@ -9,6 +10,32 @@
 # line in this exact kind of dump, and it got missed because attention went
 # to the good news first. This script now filters and surfaces the bad news
 # before anything else, so it can't be skipped by reading order.
+#
+# No `see_cp`/`consequence` anywhere in this output (2026-09-02, user
+# feedback): those numbers looked more trustworthy than `final_score`
+# because each is tied to one concrete exchange rather than a summed
+# formula, but `find_forks` is still backed by the known-buggy `see_chain`,
+# and even the direct-subtraction pricing `find_outnumbered`/
+# `find_mover_favored` use is still a computed valuation, not a raw fact —
+# and a real game (2026-09-02, FINDINGS.md) shows relying on it can lead to
+# a move Fruit's own search still rated below its actual best. What stays:
+# attacker_count/defender_count (a plain count, not a valuation), piece
+# identity and standard value (100/320/330/500/900 — a fixed constant, the
+# same numbers the position-eval skill already has you count material with
+# by hand, not a search result), and fork/skewer *target* lists (who's
+# involved, not whether the exchange is worth it). When a flag fires here,
+# that's the signal to actually calculate the resulting exchange yourself —
+# `calc_line.nu` for the move sequence, `attackers_map.nu`/`control_map.nu`
+# for "is this square/piece really defended" — never to read a verdict off
+# this output directly.
+#
+# No raw FEN printed either (2026-09-02, user feedback): a FEN is exactly
+# the same kind of opaque, hand-parsed encoding that caused the arithmetic
+# slips this whole tool set exists to avoid — it's plumbing between plugin
+# calls, not something to read. The resulting position renders as an actual
+# grid instead, via board_overlay.nu's shared convention.
+use ./board_overlay.nu *
+
 def main [moves: string, candidate: string] {
     let move_list = if ($moves | str trim | is-empty) { [] } else { $moves | split row " " }
     mut fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -17,7 +44,8 @@ def main [moves: string, candidate: string] {
     }
     let ok = (try { $fen | chessdb apply-uci --uci $candidate } catch { null })
     if $ok == null {
-        print $"ILLEGAL: ($candidate) from ($fen)"
+        print $"ILLEGAL: ($candidate) — position before the attempt:"
+        render-board-grid $fen []
         return
     }
     let ev = ($ok | chessdb hugm-eval --verbose true)
@@ -40,14 +68,6 @@ def main [moves: string, candidate: string] {
     }
 
     let my_hanging = ($t.hanging | where { |h| $h.piece.color == $my_color })
-    # outnumbered.consequence/see_cp: find_outnumbered was fixed 2026-09-01
-    # (FINDINGS.md) to price this directly instead of via the buggy
-    # see()/see_chain — the live bug that motivated not filtering by
-    # consequence here (a real hanging knight scored "Losing"/"safe") is
-    # fixed at the source now. Still deliberately not filtering by
-    # consequence: attacker_count > defender_count itself is the ground-truth
-    # signal, and showing every such entry costs nothing now that the number
-    # next to it is trustworthy too.
     let my_outnumbered = ($t.outnumbered | where { |o| $o.piece.color == $my_color })
     let my_mover_favored = ($t.mover_favored | where { |m| $m.piece.color == $my_color })
 
@@ -59,30 +79,24 @@ def main [moves: string, candidate: string] {
             print $"  HANGING: ($h.piece.role)@($h.piece.square) value=($h.value) safe_to_capture=($h.safe_to_capture)"
         }
         for o in $my_outnumbered {
-            print $"  OUTNUMBERED: ($o.piece.role)@($o.piece.square) ($o.attacker_count)v($o.defender_count) see_cp=($o.see_cp) consequence=($o.consequence)"
+            print $"  OUTNUMBERED: ($o.piece.role)@($o.piece.square) ($o.attacker_count)v($o.defender_count) -- verify with calc_line.nu, don't trust a count alone"
         }
         for m in $my_mover_favored {
-            print $"  MOVER_FAVORED \(opponent, despite count looking safe\): ($m.piece.role)@($m.piece.square) ($m.attacker_count)v($m.defender_count) see_cp=($m.see_cp) consequence=($m.consequence)"
+            print $"  MOVER_FAVORED \(count alone said safe, flagged anyway\): ($m.piece.role)@($m.piece.square) ($m.attacker_count)v($m.defender_count) -- verify with calc_line.nu"
         }
     }
     print ""
 
-    # Deliberately not printing final_score/final_score_white_relative at
-    # all (2026-09-02, user feedback, FINDINGS.md): that number is a hand-
-    # tuned, never-battle-tested linear formula, and having it sitting in
-    # this output made it too easy to default to "highest number wins"
-    # instead of actually reasoning about the position — even after
-    # explicitly deciding to stop trusting it, the habit of scanning for the
-    # best score crept straight back in over the very next game. The
-    # per-fact numbers below (see_cp on a specific hanging/outnumbered
-    # piece, consequence, attacker/defender counts) are a different thing —
-    # each is tied to one concrete, individually-tested exchange, not a
-    # summed formula — and stay. See the `position-eval` skill
-    # (.claude/skills/position-eval/) for the reasoning method to use
-    # instead of a score to actually choose between safe candidates.
-    print $"fen: ($ok)"
+    let dest_square = ($candidate | str substring 2..3)
+    render-board-grid $ok [] --highlight $dest_square
+    print ""
     print $"hanging=($t.hanging | length) forks=($t.forks | length) pins=($t.pins | length) skewers=($t.skewers | length) discovered=($t.discovered | length) outnumbered=($t.outnumbered | length) mover_favored=($t.mover_favored | length) overloaded=($t.overloaded | length) false_defense=($t.false_defense | length) false_safety=($t.false_safety | length)"
-    if ($t.forks | length) > 0 { print "  FORKS:"; for f in $t.forks { print $"    attacker=($f.attacker.color) ($f.attacker.role)@($f.attacker.square) consequence=($f.consequence) see_cp=($f.see_cp)" } }
+    if ($t.forks | length) > 0 {
+        print "  FORKS (targets only -- check each target's real defense yourself, e.g. via attackers_map.nu):"
+        for f in $t.forks {
+            let target_list = ($f.targets | each { |x| $"($x.role)@($x.square)" } | str join ", ")
+            print $"    attacker=($f.attacker.color) ($f.attacker.role)@($f.attacker.square) -> ($target_list)"
+        }
+    }
     if ($t.discovered | length) > 0 { print "  DISCOVERED:"; print $t.discovered }
-    print ($ev.explanations | str join "\n")
 }

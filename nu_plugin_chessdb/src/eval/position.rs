@@ -600,7 +600,6 @@ fn pawn_structure_score(
     let mut passed = 0;
     let mut chain = 0;
     let mut files = [false; 8];
-    let step = if color.is_white() { 1 } else { -1 };
 
     let passed_bb = passed_pawn_mask(board, color);
 
@@ -668,21 +667,23 @@ fn pawn_structure_score(
         if passed_here {
             passed += 1;
         } else {
-            let mut own_ahead = 0;
-            let mut opp_ahead = 0;
+            // Count own/enemy pawns on each adjacent file, strictly ahead
+            // of this pawn's rank in its forward direction — exactly the
+            // span `in_front` (defined below in this file) already computes
+            // via a bitboard shift instead of a manual rank walk, called
+            // here on the adjacent file's square at this pawn's own rank
+            // (the reference square only supplies "which file, which rank
+            // to start counting past" — `in_front` itself is file-agnostic
+            // in what it returns, a full forward span on whatever file the
+            // reference square is on). See CLAUDE.md's "chessdb defers to
+            // shakmaty" principle.
+            let mut own_ahead = 0_i64;
+            let mut opp_ahead = 0_i64;
             for df in [-1, 1] {
                 if let Some(f) = file.offset(df) {
-                    let mut r = rank;
-                    while let Some(next_r) = r.offset(step) {
-                        r = next_r;
-                        let bb = Bitboard::from(Square::from_coords(f, r));
-                        if (own & bb) != Bitboard::EMPTY {
-                            own_ahead += 1;
-                        }
-                        if (opp & bb) != Bitboard::EMPTY {
-                            opp_ahead += 1;
-                        }
-                    }
+                    let span = in_front(color, Square::from_coords(f, rank));
+                    own_ahead += (own & span).count() as i64;
+                    opp_ahead += (opp & span).count() as i64;
                 }
             }
             if own_ahead >= opp_ahead && own_ahead > 0 {
@@ -787,22 +788,20 @@ fn pawn_structure_score(
                 }
             }
         }
-        // captures
-        for df in [-1_i8, 1_i8] {
-            if let Some(f) = file.offset(df as i32) {
-                if let Some(next_rank) = if color.is_white() { rank.offset(1) } else { rank.offset(-1) } {
-                    let to = Square::from_coords(f, next_rank);
-                    if (board.by_color(color.other()) & Bitboard::from(to)).any() {
-                        let front = in_front(color, to);
-                        if (opp_pawns_bb & front) == Bitboard::EMPTY {
-                            break_count += 1;
-                            let mut map = serde_json::Map::new();
-                            map.insert("pawn".into(), serde_json::Value::from(piece_square_name(board, sq)));
-                            map.insert("to".into(), serde_json::Value::from(to.to_string()));
-                            map.insert("kind".into(), serde_json::Value::from("capture"));
-                            break_examples.push(serde_json::Value::Object(map));
-                        }
-                    }
+        // captures — attacks::pawn_attacks(color, sq) gives exactly the 1-2
+        // diagonal destination squares directly (board-edge clipping
+        // included), instead of re-deriving them via manual file/rank
+        // offsets. See CLAUDE.md's "chessdb defers to shakmaty" principle.
+        for to in attacks::pawn_attacks(color, sq) {
+            if (board.by_color(color.other()) & Bitboard::from(to)).any() {
+                let front = in_front(color, to);
+                if (opp_pawns_bb & front) == Bitboard::EMPTY {
+                    break_count += 1;
+                    let mut map = serde_json::Map::new();
+                    map.insert("pawn".into(), serde_json::Value::from(piece_square_name(board, sq)));
+                    map.insert("to".into(), serde_json::Value::from(to.to_string()));
+                    map.insert("kind".into(), serde_json::Value::from("capture"));
+                    break_examples.push(serde_json::Value::Object(map));
                 }
             }
         }
@@ -943,6 +942,25 @@ fn king_safety_score(board: &shakmaty::Board, graph: &ThreatGraph, color: Color,
     let file = king_sq.file();
     for df in -1..=1 {
         if let Some(f) = file.offset(df) {
+            // Surveyed for a shakmaty-primitive replacement (CLAUDE.md's
+            // "chessdb defers to shakmaty" principle) and deliberately left
+            // as a manual walk: shield_rank and storm_rank are NOT two
+            // independent queries — the loop below shares one early exit,
+            // so as soon as the first enemy pawn is found ascending from
+            // rank 1, own-pawn tracking stops too, even if an own pawn
+            // sits at a higher rank that was never reached. A first attempt
+            // at decoupling this into two independent `.first()`/`.last()`
+            // bitboard queries (2026-09-02) looked clean but was a real
+            // semantic break, caught by an A/B numeric diff against real
+            // positions before it shipped (FINDINGS.md) — for Black in
+            // particular, whose enemy pawns sit on the low ranks the loop
+            // reaches first, `shield_rank` almost never saw Black's actual
+            // pawns under the "fixed" version. This is already using
+            // shakmaty's own `Rank`/`Square`/`Bitboard` types throughout
+            // (`Rank::new`, `Square::from_coords`, `Bitboard::from`), not
+            // raw index arithmetic — the sequential coupling is inherent to
+            // what this specific computation does, not a sign of avoiding
+            // a library primitive.
             let mut shield_rank = if color.is_white() {
                 Rank::First
             } else {
@@ -1308,16 +1326,10 @@ fn piece_activity_score(
                 m += 1;
             }
         }
-        for df in [-1_i8, 1_i8] {
-            if let Some(f) = file.offset(df as i32) {
-                if let Some(nrank) = if color.is_white() { rank.offset(1) } else { rank.offset(-1) } {
-                    let to = Square::from_coords(f, nrank);
-                    if (board.by_color(color.other()) & Bitboard::from(to)).any() {
-                        m += 1;
-                    }
-                }
-            }
-        }
+        // attacks::pawn_attacks(color, sq) gives the capture destination
+        // squares directly instead of re-deriving them by hand — see
+        // CLAUDE.md's "chessdb defers to shakmaty" principle.
+        m += (attacks::pawn_attacks(color, sq) & board.by_color(color.other())).count() as i64;
         pawn_mob += m;
     }
     let mobility_total = knight_mob + bishop_mob + rook_mob + queen_mob + pawn_mob;
@@ -1343,10 +1355,13 @@ fn piece_activity_score(
 }
 
 /// Tactical motif detectors and king tropism helpers (pins, forks, skewers, discovered, tropism)
+///
+/// King-step (Chebyshev) distance between two squares. Delegates to
+/// shakmaty's own `Square::distance` (doc-tested as exactly
+/// `max(file_distance, rank_distance)`) instead of re-deriving the same
+/// formula by hand — see CLAUDE.md's "chessdb defers to shakmaty" principle.
 fn chebyshev_distance(a: Square, b: Square) -> i64 {
-    let df = (a.file() as i32 - b.file() as i32).abs() as i64;
-    let dr = (a.rank() as i32 - b.rank() as i32).abs() as i64;
-    df.max(dr)
+    a.distance(b) as i64
 }
 
 fn king_tropism_score(board: &shakmaty::Board, color: Color) -> i64 {
@@ -1467,22 +1482,49 @@ fn detect_forks(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, Vec
     (forks, examples)
 }
 
+/// Every enemy piece skewered by one of the mover's sliders — a more
+/// valuable enemy piece in front of a less valuable one on the same ray,
+/// such that moving the front piece exposes the back one. Uses shakmaty's
+/// own occupancy-aware `attacks::rook_attacks`/`attacks::bishop_attacks`,
+/// mirroring the sibling `detect_pins`'s pattern two functions above,
+/// rather than hand-walking 8 hardcoded direction tuples one square at a
+/// time — the exact class of code CLAUDE.md's "chessdb defers to shakmaty"
+/// principle exists to stop (FINDINGS.md, 2026-09-02).
+///
+/// For each of the mover's sliders, `reach` is its current attack set
+/// (stops at the first occupant in every direction, whichever color). Any
+/// enemy piece in `reach` (`front_sq`) is a ray whose first occupant is an
+/// enemy — recomputing the slider's reach with `front_sq` removed
+/// (`reach_behind`) can only ever extend further along that exact one ray
+/// (removing a single blocker never affects any other direction), so
+/// `reach_behind & !reach` is precisely the square(s) newly revealed past
+/// `front_sq`, and at most one of those can be occupied (the next blocker,
+/// if any, in that one direction). A/B-verified byte-identical against the
+/// hand-rolled ray-walk it replaced, across every known-game/motif test FEN
+/// for both colors — see FINDINGS.md, 2026-09-02.
+///
+/// Returns `(count, vec![(attacker_sq, front_sq, back_sq), ...])`.
 fn detect_skewers(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, Square, Square)>) {
-    // returns (count, vec![(attacker_sq, front_sq, back_sq), ...])
-    let mut skewers = 0_i64;
     let enemy = color.other();
-    let directions: &[(i8, i8)] = &[
-        (1, 0),
-        (-1, 0),
-        (0, 1),
-        (0, -1),
-        (1, 1),
-        (-1, 1),
-        (1, -1),
-        (-1, -1),
-    ];
-
+    let occ = board.occupied();
+    let mut skewers = 0_i64;
     let mut examples: Vec<(Square, Square, Square)> = Vec::new();
+    let w = weights();
+    let val = |sq: Square| {
+        if (Bitboard::from(sq) & board.by_role(Role::Queen)).any() {
+            w.val_queen
+        } else if (Bitboard::from(sq) & board.by_role(Role::Rook)).any() {
+            w.val_rook
+        } else if (Bitboard::from(sq) & board.by_role(Role::Bishop)).any() {
+            w.val_bishop
+        } else if (Bitboard::from(sq) & board.by_role(Role::Knight)).any() {
+            w.val_knight
+        } else if (Bitboard::from(sq) & board.by_role(Role::Pawn)).any() {
+            w.val_pawn
+        } else {
+            0
+        }
+    };
 
     for s in board.by_color(color) & (board.by_role(Role::Rook) | board.by_role(Role::Bishop) | board.by_role(Role::Queen)) {
         let s_bb = Bitboard::from(s);
@@ -1490,72 +1532,72 @@ fn detect_skewers(board: &shakmaty::Board, color: Color) -> (i64, Vec<(Square, S
         let is_bishop = (s_bb & board.by_role(Role::Bishop)).any();
         let is_queen = (s_bb & board.by_role(Role::Queen)).any();
 
-        for (df, dr) in directions {
-            // skip directions inappropriate for piece
-            if !is_queen {
-                if is_rook && *dr != 0 && *df != 0 {
-                    continue;
-                }
-                if is_bishop && (*dr == 0 || *df == 0) {
-                    continue;
-                }
+        let mut reach = Bitboard::EMPTY;
+        if is_rook || is_queen {
+            reach |= attacks::rook_attacks(s, occ);
+        }
+        if is_bishop || is_queen {
+            reach |= attacks::bishop_attacks(s, occ);
+        }
+
+        for front_sq in reach & board.by_color(enemy) {
+            let occ_minus = occ ^ Bitboard::from(front_sq);
+            let mut reach_behind = Bitboard::EMPTY;
+            if is_rook || is_queen {
+                reach_behind |= attacks::rook_attacks(s, occ_minus);
+            }
+            if is_bishop || is_queen {
+                reach_behind |= attacks::bishop_attacks(s, occ_minus);
             }
 
-            // walk the ray
-            let mut found: Vec<Square> = Vec::new();
-            let mut cur_file = s.file();
-            let mut cur_rank = s.rank();
-            loop {
-                if let Some(nf) = cur_file.offset(*df as i32) {
-                    if let Some(nr) = cur_rank.offset(*dr as i32) {
-                        cur_file = nf;
-                        cur_rank = nr;
-                        let sq = Square::from_coords(cur_file, cur_rank);
-                        let sq_bb = Bitboard::from(sq);
-                        if (board.occupied() & sq_bb).any() {
-                            if (board.by_color(enemy) & sq_bb).any() {
-                                found.push(sq);
-                                if found.len() >= 2 {
-                                    break; // found both pieces, done
-                                }
-                                // continue ray past first enemy (it would move when skewered)
-                                continue;
-                            }
-                            break; // friendly piece blocks the ray
-                        }
-                        continue; // empty square, keep walking
-                    }
-                }
-                break;
-            }
-
-            if found.len() >= 2 {
-                let w = weights();
-                let val = |sq: Square| {
-                    if (Bitboard::from(sq) & board.by_role(Role::Queen)).any() {
-                        w.val_queen
-                    } else if (Bitboard::from(sq) & board.by_role(Role::Rook)).any() {
-                        w.val_rook
-                    } else if (Bitboard::from(sq) & board.by_role(Role::Bishop)).any() {
-                        w.val_bishop
-                    } else if (Bitboard::from(sq) & board.by_role(Role::Knight)).any() {
-                        w.val_knight
-                    } else if (Bitboard::from(sq) & board.by_role(Role::Pawn)).any() {
-                        w.val_pawn
-                    } else {
-                        0
-                    }
-                };
-                let v0 = val(found[0]);
-                let v1 = val(found[1]);
-                if v0 > v1 {
+            let newly_revealed = reach_behind & !reach;
+            if let Some(back_sq) = (newly_revealed & board.by_color(enemy)).single_square() {
+                if val(front_sq) > val(back_sq) {
                     skewers += 1;
-                    examples.push((s, found[0], found[1]));
+                    examples.push((s, front_sq, back_sq));
                 }
             }
         }
     }
     (skewers, examples)
+}
+
+#[cfg(test)]
+mod detect_skewers_tests {
+    use super::*;
+
+    /// Regression coverage for `detect_skewers` beyond the two dedicated
+    /// tests elsewhere in this file (`detects_skewer`,
+    /// `skewer_negative_no_back_piece`) and `tests/motif_canonical.rs`'s
+    /// `skewer_negative_no_back_piece`: every real-game FEN this function
+    /// was A/B-verified against when it was rewritten onto shakmaty's own
+    /// `rook_attacks`/`bishop_attacks` (FINDINGS.md, 2026-09-02), pinned
+    /// down as an exact-count assertion so a future change to this function
+    /// can't silently drift on positions it was never specifically
+    /// hand-checked against — just doesn't crash and doesn't count.
+    #[test]
+    fn runs_cleanly_on_every_known_game_and_motif_test_fen() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqk2r/ppp2ppp/2n5/2bpp3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 0 5",
+            "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+            "r3kb1r/pp2pppp/2n5/8/3Pb3/1P3N2/1P3PPP/R1B1K2R w KQkq - 2 11",
+            "r1b3k1/p1p2ppp/1p2p3/3rn3/2q5/2PR1Q2/P1P2PP1/R5K1 w - - 2 18",
+            "r2qkb1r/ppp1pppp/1n6/3PN3/2P3b1/2N5/PP3PPP/R1BQKB1R b KQkq - 0 8",
+            "r4rk1/2p1q1pp/p3b3/2b1pp2/2PNn3/2P5/P1Q1BPPP/1R3RK1 b - - 1 19",
+            "r3k2r/2p2ppp/p2bp3/Qp6/3P4/2P1B2q/P1P2P2/1R3RK1 b kq - 1 17",
+            "r1bqr1k1/ppp2p1p/2n5/3p2p1/3Pn3/P3BN2/1PQ1PPPP/2KR1B1R b - - 3 12",
+        ];
+        for fen in fens {
+            let setup: shakmaty::fen::Fen = fen.parse().expect("valid FEN");
+            let pos: Chess = setup.into_position(shakmaty::CastlingMode::Standard).expect("legal position");
+            let board = pos.board();
+            for color in [Color::White, Color::Black] {
+                let (count, examples) = detect_skewers(board, color);
+                assert_eq!(count, examples.len() as i64, "count/examples length mismatch on {fen}");
+            }
+        }
+    }
 }
 
 /// Rough piece values for the discovered-attack "is this actually significant" filter below.
@@ -2203,8 +2245,12 @@ fn piece_coordination_score(board: &shakmaty::Board, color: Color) -> i64 {
         for j in (i + 1)..squares.len() {
             let a = squares[i];
             let b = squares[j];
-            let file_diff = (a.file() as i32 - b.file() as i32).unsigned_abs() as i64;
-            let rank_diff = (a.rank() as i32 - b.rank() as i32).unsigned_abs() as i64;
+            // File::distance/Rank::distance (shakmaty) instead of manual
+            // cast+abs — see CLAUDE.md's "chessdb defers to shakmaty"
+            // principle. No shakmaty primitive computes the Manhattan sum
+            // itself, so the per-axis distances are still summed by hand.
+            let file_diff = a.file().distance(b.file()) as i64;
+            let rank_diff = a.rank().distance(b.rank()) as i64;
             let manhattan = file_diff + rank_diff;
             if manhattan <= 2 {
                 score += 5;

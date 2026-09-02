@@ -116,6 +116,45 @@ architecture summary).
 The same principle applies on the Nu side: prefer a record with named fields over a
 generic key-value table when the shape is known ahead of time.
 
+## Chessdb defers to shakmaty for anything geometric
+
+`shakmaty` already computes attack/reach generation, ray/between/alignment, distance,
+blocker/occupancy-aware sliding attacks, square color, and file/rank masks — correctly,
+and with real test coverage of its own. `chessdb` never re-derives a geometric or
+topological board fact by hand (manual file/rank/diagonal offset arithmetic, walking
+squares one at a time) when a shakmaty primitive already answers the same question,
+directly or via a small, provably-equivalent composition of its public primitives.
+
+Concretely: `nu_plugin_chessdb/src/eval/position.rs`'s `detect_skewers` used to hand-walk
+8 hardcoded direction tuples one square at a time via `File::offset`/`Rank::offset`,
+checking occupancy manually — its own sibling function two lines earlier, `detect_pins`,
+solved an analogous problem correctly via shakmaty's occupancy-aware
+`attacks::rook_attacks`/`attacks::bishop_attacks(sq, occupied)`. `detect_skewers` was
+rewritten onto the same primitives (2026-09-02, A/B-verified byte-identical against real
+positions before the old implementation was removed — see `FINDINGS.md`). `chebyshev_distance`
+similarly used to hand-compute exactly what shakmaty's own `Square::distance` already
+computes. Both are now the pattern to follow, not a violation currently being fixed.
+
+Not every hand-rolled-looking loop is actually a violation, though — check whether the
+computation is a genuinely *sequential* one (state carried and short-circuited across
+steps) before assuming it decomposes into independent primitive queries.
+`king_safety_score`'s pawn shield/storm loop looks like two independent per-file
+bitboard lookups, but its single `break` exits the whole loop, coupling "nearest own
+pawn" and "nearest enemy pawn" together — a first attempt at splitting it into two
+independent `Bitboard::first()`/`.last()` queries (2026-09-02) looked clean and passed
+`cargo test`, but was a real semantic break caught only by an explicit before/after
+numeric diff against real positions (see `FINDINGS.md`); it was reverted, and the manual
+loop — which already uses shakmaty's own `Rank`/`Square`/`Bitboard` types throughout, not
+raw arithmetic — was kept as the correct implementation. Any change to code that feeds
+the tuned scoring table needs this same explicit A/B diff before being considered done,
+not just a passing test suite: no existing test asserts most of these raw group values
+exactly, so a subtly wrong "equivalent" rewrite can pass `cargo test` and still be wrong.
+
+`chessdb square-control`/`chessdb square-attackers` are the live-play-facing reason this
+matters beyond internal code quality: hand-rolled geometry — checking "does this diagonal
+reach that square" by mental arithmetic instead of asking the engine — is exactly the
+failure class that hung a bishop in a real game (`FINDINGS.md`, 2026-09-02).
+
 ## Canonical (White-to-move) position identity — the tablebase simplification
 
 Everything stored under `positions.zobrist`/`positions.fen` and `openings.fen`

@@ -10,6 +10,13 @@
 # you think it is, in one call, instead of losing track between separate
 # single-move checks. Stops and flags the exact ply where an illegal move or
 # a miscalculation (something you didn't expect to hang) is found.
+#
+# No raw FEN printed (2026-09-02, user feedback) — a FEN is the same kind of
+# opaque, hand-parsed encoding the whole calculation-tooling effort exists
+# to route around. Every ply renders as an actual grid instead, highlighting
+# the square that just moved, via board_overlay.nu's shared convention.
+use ./board_overlay.nu *
+
 def material_line [bal: record] {
     let w = $bal.white
     let b = $bal.black
@@ -25,7 +32,7 @@ def main [moves: string, line: string] {
         $fen = ($fen | chessdb apply-uci --uci $m)
     }
     print $"=== starting position \(after history\) ==="
-    print $"fen: ($fen)"
+    render-board-grid $fen []
     print ""
 
     mut ply = 0
@@ -33,7 +40,7 @@ def main [moves: string, line: string] {
         $ply = $ply + 1
         let applied = (try { $fen | chessdb apply-uci --uci $m } catch { null })
         if $applied == null {
-            print $"=== ply ($ply): ($m) — ILLEGAL from ($fen) — calculation stops here ==="
+            print $"=== ply ($ply): ($m) — ILLEGAL, calculation stops here \(see position above\) ==="
             return
         }
         $fen = $applied
@@ -42,7 +49,8 @@ def main [moves: string, line: string] {
         let mover_just_played = if $ev.side_to_move == "white" { "black" } else { "white" }
 
         print $"=== ply ($ply): ($m)  \(played by ($mover_just_played)\) ==="
-        print $"fen: ($fen)"
+        let dest_square = ($m | str substring 2..3)
+        render-board-grid $fen [] --highlight $dest_square
         if $s.mate_in_1_exists {
             print $"  !!! MATE IN 1 EXISTS for ($ev.side_to_move) !!!"
         }
@@ -58,8 +66,11 @@ def main [moves: string, line: string] {
         }
         let forks = $s.tactical.forks
         if ($forks | is-not-empty) {
-            print "  FORKS:"
-            for f in $forks { print $"    attacker=($f.attacker.color) ($f.attacker.role)@($f.attacker.square) consequence=($f.consequence) see_cp=($f.see_cp)" }
+            print "  FORKS (targets only -- verify each target's real defense yourself):"
+            for f in $forks {
+                let target_list = ($f.targets | each { |x| $"($x.role)@($x.square)" } | str join ", ")
+                print $"    attacker=($f.attacker.color) ($f.attacker.role)@($f.attacker.square) -> ($target_list)"
+            }
         }
         let ke = $s.positional.king_exposure
         if ($ke | is-not-empty) {
