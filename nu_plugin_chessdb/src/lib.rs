@@ -1,12 +1,17 @@
 pub mod apply_uci_cmd;
+pub mod attack_summary_cmd;
 pub mod canonical;
 pub mod canonicalize_fen_cmd;
+pub mod checker_summary_cmd;
 pub mod chess;
 pub mod collapse_criticality_cmd;
 pub mod core;
 // critter_eval_cmd removed — undifferentiated alias for hugm-eval (BUG-7)
 pub mod hugm_eval_cmd;
 pub mod eval;
+pub mod fen_info_cmd;
+pub mod is_legal_cmd;
+pub mod legal_moves_cmd;
 pub mod pgn_to_fens;
 pub mod process_corpus;
 pub mod game_parse;
@@ -54,6 +59,11 @@ impl Plugin for ChessdbPlugin {
             Box::new(canonicalize_fen_cmd::CanonicalizeFen),
             Box::new(collapse_criticality_cmd::CollapseCriticalityCmd),
             Box::new(apply_uci_cmd::ApplyUci),
+            Box::new(fen_info_cmd::FenInfo),
+            Box::new(legal_moves_cmd::LegalMoves),
+            Box::new(attack_summary_cmd::AttackSummaryCmd),
+            Box::new(checker_summary_cmd::CheckerSummaryCmd),
+            Box::new(is_legal_cmd::IsLegal),
         ]
     }
 }

@@ -3365,3 +3365,463 @@ was checked — all five items of that plan are now complete.
 Verified: `cargo check --all-targets` clean, `cargo clippy --all-targets` zero warnings,
 `cargo test` (28 lib + 10 `known_games` + other integration suites, all passing), STS
 smoke test (`--ignored`) passes.
+
+---
+
+## 2026-08-31: Fruit game — nu-plugin/shakmaty/pgn-reader had drifted stale, and forks with defended targets read as `Even`
+
+Played a live game against the Fruit 2.1 UCI engine, driving it entirely through Nu +
+the `chessdb` plugin, to shake out real usability gaps. Two separate things came out of it.
+
+**The plugin didn't load at all.** `nu-plugin`/`nu-protocol` were pinned to `0.114` while
+the installed `nu` shell was `0.115.1` — the plugin silently failed `plugin add`. While
+fixing that, `shakmaty` (`0.26`, four minor versions behind `0.30.1`) and `pgn-reader`
+(`0.24`, five behind `0.29.0`) turned out to be stale too — both pre-1.0 crates where every
+minor bump can break the API, so brought forward in the same pass:
+- `shakmaty` 0.30.1: mechanical — `Uci`→`UciMove`, dropped the `ZobristHash` trait import
+  (`zobrist_hash` moved onto `Position` directly), `into_setup`→`to_setup`,
+  `Board::from_bitboards`→`try_from_bitboards` (now fallible), and
+  `Fen::from_position`/`play`/`play_unchecked`/`San::from_move`/`SanPlus::from_move` all
+  flipped their `Move`/position argument between owned and `&`-reference.
+- `pgn-reader` 0.29.0: real rewrite — `Visitor` moved from plain callback methods to a
+  `ControlFlow`-based API with `Tags`/`Movetext`/`Output` associated types;
+  `BufferedReader`→`Reader`, `RawHeader`→`RawTag`. Ported `core.rs`'s `GameVisitor` to the
+  new shape, preserving identical behavior (same `self.error` sentinel, same accumulation
+  into `self.rows`/`self.headers`).
+
+**Blundered a piece three separate times before the tooling was actually usable** — a
+knight and a pawn from careless mental board-tracking, then (once the plugin was working
+again) a bishop from `13.d5`, which self-opened the 4th rank onto the bishop on c4. From
+move 14 on, every candidate move was verified via `apply-uci` (authoritative FEN, rejects
+illegal moves) + `hugm-eval --verbose true` (tactical concept lists) before being played —
+no further material was hung outright for the rest of the game, though the position was
+already lost by then and Fruit converted with `22...Qxg2#` down the long diagonal (the g2
+pawn was absolutely pinned by `Bb7`, so it could never have defended that square).
+
+**The real finding: `ThreatGraph::find_forks` already ran a proper SEE, but threw the
+result away twice.** First, the public `Fork` struct (`concept_types.rs`) only exposed
+`attacker`/`targets` — `EvaluatedFork`'s already-computed `see_cp`/`consequence` fields
+were dropped at the one conversion site (`position.rs`'s `TacticalReport` construction).
+Second, and more interesting: `find_forks`'s own target selection (`undefended_target`,
+now removed) only ran SEE on a fork target if it had *zero* defenders — so a fork where
+every target happened to have exactly one defender (a rook covered by a pawn, a queen
+covered by a pawn) silently reported `consequence: Even, see_cp: 0`, even when capturing
+was still objectively winning material once the recapture was played out. This is exactly
+what happened mid-game: `17...Ne5` forked a rook on d3 (defended once by a c2 pawn) and a
+queen on f3 (defended once by a g2 pawn) — a real winning fork (`...Nxf3+ gxf3` wins the
+queen for a knight) that the tool reported as nothing worth noting. Fixed by replacing
+`undefended_target` with `best_fork_target`, which runs full `see_chain` on *every* target
+and keeps whichever gives the attacker the best net result — defended or not. Same fix
+applied to `Outnumbered` (`find_outnumbered` now also computes `see_cp`/`consequence`),
+which previously had no profitability signal at all beyond raw attacker/defender counts.
+
+**Important caveat surfaced by this fix**: making `Fork`/`Outnumbered`'s `see_cp` live for
+the first time means an already-documented, still-unfixed `see_chain` bug (this file's
+"`ThreatGraph::see_chain` gives wrong answers for 2+ step exchanges" entry, further up)
+is now user-visible instead of silently discarded. Re-verified against that exact ground
+truth and against the Ne5 fork itself: `see_chain` prices the initial capture correctly,
+but every recapture from the first one onward charges the *recapturing* piece's own value
+instead of what it's actually capturing — for the Ne5→Qf3 case, correct math is
+`900 (queen) − 320 (knight) = 580`, the tool reports `800` (`900 − 100`, using the
+recapturing pawn's own value instead of the knight's). Also independently noticed while
+re-tracing this: `att_sq = recap_sq` reassigns the contested square to the *recapturing
+piece's origin square* (confirmed against shakmaty 0.30.1's `Board::attacks_to(sq,
+attacker, occupied) -> Bitboard`, which returns attacker origin squares, not the target) —
+a second, distinct bug affecting any chain past the first recapture, not previously called
+out explicitly. Neither bug was introduced by this pass; both predate it and were already
+flagged as needing the actual SEE backward swap-off algorithm, not a quick patch — still
+true, still deferred, not attempted here. What changed: the `Consequence` verdict (not the
+raw `see_cp` number) is now the thing actually load-bearing for a caller's "is this worth
+it" decision, and it landed correctly on the Ne5 case (`800` and the true `580` both clear
+the `Winning` threshold) — but that's not a guarantee the bucket can never flip near a
+threshold boundary. `Fork.see_cp`/`Outnumbered.see_cp`'s doc comments (`concept_types.rs`)
+now state this caveat directly rather than leaving it only in this file.
+
+Also fixed while in there: `render_explanations`'s opponent-fork phrase had `opp` (the
+threat's *source*) as the sentence's grammatical subject — "White has 1 fork(s) (by
+opponent)" when describing a fork *against* White, reading backwards. Now `side` (the
+mover, who must actually defend) is the subject: "{side} faces N fork(s) from {opp}".
+Both fork phrases and a new `outnumbered` phrase (didn't exist before, even though
+`sensor.tactical.outnumbered` was already populated) now include the SEE verdict in plain
+language instead of just naming the pattern.
+
+Also added: a `final_score_white_relative` field on `PositionRecord`, purely additive —
+`final_score` itself stays `us − them` (`us = chess.turn()`), the convention every scoring
+function in this file already uses and that mirrors the DB's canonical (White-always-to-
+move) position identity. The new field exists because comparing `final_score` across two
+positions with different sides to move requires manually flipping its sign — an easy
+mistake, and exactly the kind of thing a report-layer convenience field should absorb
+instead of every caller re-deriving it.
+
+Also exposed five `core.rs` functions that were fully implemented but never wired to a
+`PluginCommand`: `chessdb fen-info`, `chessdb legal-moves`, `chessdb attack-summary`,
+`chessdb checker-summary`, `chessdb is-legal` — cheap, single-purpose commands for
+questions (material, legal moves, attacked squares, check status, "is this move legal")
+that previously required paying for a full `hugm-eval` call to answer.
+
+New regression test: `tests/known_games.rs`'s
+`fruit_game_knight_fork_wins_material_even_though_both_targets_are_defended`, anchored on
+the exact `17...Ne5` FEN from the game, asserting `consequence == Winning`, `see_cp > 0`,
+and `hangs` pointing at the queen (not just the lower-value rook).
+
+Verified: `cargo check --all-targets` / `cargo clippy --all-targets` clean, full `cargo
+test` suite green (47 tests, including the new regression test), STS smoke test passes,
+release build's plugin binary registered and round-tripped against the live nu 0.115.1
+shell for every new command plus the Ne5 fork FEN and the white-relative score sign flip.
+
+---
+
+## 2026-09-01: Fruit-game postmortem, a `see_chain` bug worse than previously documented, `MoverFavored` narrowed to what's actually verified, and a mover-perspective audit
+
+Ran the finished second Fruit game through Fruit's own search (not `hugm-eval`) at every
+ply, converting each UCI `score cp` to a consistent White-relative curve. Two moves
+accounted for essentially the entire swing from balanced to lost: `17.dxc5` (+16 → −220)
+and `23.c5` (−430 → −1113, the single biggest swing of the game). Asked whether any
+*existing, non-search* tool would have caught either — since "run a real search" isn't
+what this project is building (see PLAN.md's "Pathfinding an exchange instead of
+calculating it").
+
+**`23.c5` — the tool already had a signal, but I misread it, and separately the number
+itself turned out to be unreliable too.** The `check_move.nu` output for that move already
+listed `OUTNUMBERED: white Rook@e4 ... Losing see_cp=-400` a few lines below an exciting
+`material win for White (~900cp)` fork line. My first read of this (recorded earlier in
+this session) was "the tool caught it and I didn't prioritize my own risk over the good
+news" — a real, worth-fixing triage problem regardless. But re-deriving the *correct*
+static-exchange value for that exact 2-attacker/1-defender square by hand (the standard
+swap-off algorithm, backward minimax pass included) gave **+180 favoring the mover**, not
+`-400` — meaning the current tool's number doesn't just need better triage, it's simply
+wrong for this square. Confirmed by trying to actually fix it: hand-re-derived the
+standard SEE swap-off algorithm (square drift and per-step pricing, the two bugs already
+diagnosed in `see_chain`'s doc comments and the 2026-08-31 entry above, both fixed in the
+derivation), got a plausible `+180` — then sanity-checked the same derivation against the
+simplest possible case (pawn takes pawn, pawn recaptures, no further attackers, which must
+net exactly 0 for the initiator by direct arithmetic) and got **100**, not 0. That's a real
+bug in the derivation itself, not a subtlety. Per the standing "never fabricate/guess data"
+rule, did not commit an unverified rewrite — `see_chain`'s three known bugs (value pricing,
+square drift, missing backward pass) stay exactly as documented and deferred, not
+"fixed" by something that failed its own sanity check. **Correction to the earlier read**:
+tonight's actual, verified lesson from `23.c5` is narrower than first claimed — a real
+triage problem was real, but the specific number that triggered it wasn't trustworthy
+either, so "read the tool's existing output more carefully" is not by itself a fix here.
+
+**`17.dxc5` — the motivating case, and where the story gets more interesting than "fixed."**
+My own knight on e4 had two attackers (Bb7, Nf6) and two defenders (Bd3, Re1) — an equal
+count that neither `find_hanging` (needs zero defenders) nor `find_outnumbered` (needs
+attackers > defenders) can ever flag, regardless of whether the exchange is actually good
+or bad by value. First attempt: new detector `ThreatGraph::find_mover_favored` computing
+`see_cp` for exactly this gap via `ThreatGraph::see` (the same chain-walker `find_forks`/
+`find_outnumbered` already use), reporting a square whenever the SEE value clears
+`Consequence::Winning`/`Minor` despite the raw count looking safe. This correctly flagged
+the real `17.dxc5` position's Nf6 knight (`see_cp: 1120`, matching the independently-found
+`Qc3` fork exactly) and passed three checks: a hand-built minimal 2v2 fixture where the
+known bugs happen to net near-zero (no false positive), the existing
+`equal_attacker_defender_count_is_not_outnumbered` test fixture (also empty as expected),
+and a direct Rust-level test bypassing the Nu/JSON layers entirely (which is what caught
+the plugin-staleness issue below, separately from the correctness question).
+
+**Then a deeper, more damaging `see_chain` bug turned up, and the detector had to be
+narrowed.** Live-testing `find_mover_favored` during game 3 flagged a plain d4 pawn,
+defended once by the queen, attacked once by the enemy queen down an open file, as
+`Minor +100` — favorable for the attacker. That's obviously backwards (losing a queen for a
+pawn is bad for whoever does it), and reproduced in a minimal, flip-independent fixture:
+`3qk3/8/8/8/3P4/8/8/3QK3 b - - 0 1`. Root cause, traced by hand through `see_chain` line by
+line: the function never actually *places* a capturing piece back on the contested square
+— it only ever calls `discard_piece_at`, so once both the original piece and the
+recapturing piece are removed from the board clone, the contested square goes fully empty.
+On the very next loop iteration, `board.attacks_to` (recomputed fresh, on the now-emptied
+board) finds the enemy queen still geometrically "attacks" that empty square via the
+now-open file and happily lets it "recapture" a piece that isn't there anymore — a third,
+phantom capture that flips the sign of the whole exchange. This is strictly worse than the
+already-documented pricing/square-drift bugs: it means even the *simplest* 1-attacker/
+1-defender case — previously assumed exact, per `see_chain`'s own doc comment — can be
+wrong, not just approximate. A same-day attempt to fix `see_chain` properly (the standard
+swap-off algorithm, backward minimax pass included) initially looked right on this position
+(`+180`, plausible) but failed its own sanity check on the simplest possible input
+(pawn-takes-pawn-takes-pawn, which must net exactly 0) — see the paragraph above. Not
+committing an unverified rewrite left `find_mover_favored` needing an actual fix, not just a
+caveat.
+
+**The fix that shipped**: narrowed `find_mover_favored` to *exactly* 1 attacker / 1
+defender — the one shape where the outcome is a single forced capture and a single forced
+recapture with no further real captures possible — and compute `see_cp` **directly**
+(`victim value − attacker's own piece value`), bypassing `ThreatGraph::see`/`see_chain`
+entirely for this concept. No chain to walk means no square to drift and no phantom
+capture to invent. Verified against both the false positive above (now correctly empty)
+and a fresh, hand-verified positive case (a pawn attacking a knight defended only by a
+rook: `4k3/8/8/5p2/4N3/8/8/4RK2 b - - 0 1`, `see_cp: 220`, exactly `knight(320) −
+pawn(100)`). Both are now regression tests in `tests/motif_canonical.rs`
+(`mover_favored_pawn_attacks_knight_defended_only_by_a_rook`,
+`mover_favored_does_not_fire_when_the_lone_defender_outvalues_the_attacker`) — moved out of
+`tests/known_games.rs` since they're constructed positions, not real games, matching that
+file's own stated convention. **Honest cost of this fix**: the original `17.dxc5` motivating
+case (2 attackers, 2 defenders) is no longer caught by anything — `find_mover_favored`'s
+scope is now strictly narrower than what prompted building it. That gap is real and still
+open; reporting nothing for it is more honest than reporting a number already shown to have
+the wrong sign for cases far simpler than 2v2.
+
+Also worth being precise about: even the still-in-place `find_forks`/`find_outnumbered`
+`see_cp` values (unchanged by this pass) are now understood to be less reliable than their
+doc comments previously claimed — "exact for the first capture and first recapture" was
+also disproven by this exact bug. Their doc comments and PLAN.md's "What this deliberately
+does not do" section have been updated accordingly; no code change to those two detectors
+in this pass beyond the wording.
+
+**A real bug caught along the way: a stale plugin process, not a logic bug.** First attempt
+to verify `find_mover_favored` through the actual `chessdb hugm-eval` command returned
+nonsense square labels (`white Knight@f3`, `black Bishop@d6` — neither matched a real piece
+on the board, confirmed independently via `chessdb attack-summary`). A direct Rust-level
+test calling `analyze_fen` on the identical FEN, bypassing the Nu plugin process entirely,
+returned the correct answer immediately. The nu shell was talking to a plugin binary from
+before the fix — `plugin add`/`plugin use` against the freshly-rebuilt release binary
+resolved it. Lesson for next time: when a *newly-added* field's output looks structurally
+wrong (right shape, wrong values) right after a rebuild, check whether the plugin process
+is actually current before debugging the Rust logic — cross-check via a command that reads
+the real board directly (`attack-summary`) and, if that disagrees with the field under
+test, suspect staleness before correctness.
+
+**Mover-perspective audit, requested directly**: renamed `BadExchange` → `MoverFavored`
+(the name itself was a judgment — "bad" for whom? — where "favors the mover" states the
+fact without requiring the reader to already know the perspective convention). Reworded
+every `see_cp`/`consequence` doc comment (`Fork`, `Outnumbered`, `MoverFavored`, plus
+`threat_graph.rs`'s module doc and `find_mover_favored`'s own doc comment) to consistently
+say "the mover" instead of a mix of "attacking side"/"attacker". Explicitly did **not** add
+a `Side`/color field to carry "who the mover is" — this crate's positions are always
+analyzed in the canonical White-to-move frame (`CLAUDE.md`), so a literal color field would
+be uselessly constant; the mover is already fully determined (the opponent of whoever owns
+the attacked piece) and doesn't need its own field. Renamed the `consequence_phrase`
+helper's parameter from `attacker` to `mover` to match. Redesigned the session's
+`check_move.nu` scratch helper to print a "MY PIECES AT RISK" section — hanging entries,
+plus any `outnumbered`/`mover_favored` entry whose consequence actually favors the
+opponent — first and separately from everything else, specifically so a real risk can't be
+buried under an exciting "you have a winning fork" line the way it was on `23.c5`.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (99 tests, including both new `MoverFavored` regression tests — the positive
+case and the false-positive-that-must-not-return case), STS smoke test passes, release
+build's plugin binary re-registered and round-tripped against the live nu 0.115.1 shell,
+confirming the corrected (empty) result on the false-positive fixture, the correct positive
+result on the pawn-vs-knight fixture, and the corrected explanation text in both directions.
+
+---
+
+## 2026-09-01 (continued): `find_mover_favored`'s 1-vs-1 restriction was itself too narrow — generalized, again live-verified against a real blunder
+
+Playing a third game against Fruit (using the just-fixed `MoverFavored`/reordered
+`check_move.nu` from the entry above), move 8 (`Nxe5`) was checked clean — `MY PIECES AT
+RISK: (none)` — and played. Black replied `8...Bxd1`, winning the queen outright for a
+bishop. Fruit's own post-game search confirms this was the single largest swing of the
+game by far (+32 → −422 white-relative, ply 15).
+
+**Root cause**: the knight that had just moved from f3 to e5 had been the whole time
+absolutely pinning itself between the bishop on g4 and the queen on d1 (`Bg4-Nf3-Qd1`, one
+diagonal) — moving it opened a direct line from the bishop straight to the queen. Not a
+new or exotic pattern; the exact "moving a piece exposes something behind it" shape this
+session already fixed once for a *rook* (`23.c5` in the 2026-08-31 entry). But `find_hanging`
+correctly did **not** flag the queen (it has two real defenders: the king on e1, and — missed
+by eye at the actual board — a knight on c3 that also reaches d1), and `find_outnumbered`
+correctly did **not** fire either (1 attacker vs 2 defenders is the opposite of outnumbered).
+And the just-shipped `find_mover_favored`, restricted that same day to *exactly* 1
+attacker/1 defender, also didn't fire — this position is 1-vs-2, one square outside that
+exact box.
+
+**Why "exactly 1-vs-1" was the wrong restriction in hindsight**: the reasoning that produced
+it was sound (avoid `see_chain`'s proven wrong-sign bug by not chain-walking at all), but
+the scope was drawn one level too narrow. The actual question `MoverFavored` needs to
+answer — "is the *first* exchange on this square bad for the defender" — never depended on
+*how many* defenders exist, only on whether the *cheapest attacker* is worth less than the
+piece it's attacking, and whether at least one real recapture exists at all (so the
+question is meaningful — zero defenders is `find_hanging`'s job). A queen attacked by a
+single bishop is just as lost with one defender as with three, because the attacker only
+ever risks their cheapest piece to win it; a deeper question (would the attacker's side
+regret continuing past the first recapture) is exactly the multi-step territory
+`see_chain` still can't be trusted for, and `find_mover_favored` still doesn't attempt it.
+
+**Fix**: generalized `find_mover_favored` (`threat_graph.rs`) to fire whenever
+`attacker_count >= 1`, `defender_count >= 1`, and `attacker_count <= defender_count` (i.e.
+real defenders exist and don't run out first — the gap left by `find_hanging` and
+`find_outnumbered`), computing `see_cp` from the board's **cheapest** attacker rather than
+assuming exactly one. Still no call into `ThreatGraph::see`/`see_chain` at all — same
+direct-subtraction approach as before, just no longer gated to an artificially exact count.
+Verified: the existing 1-vs-1 regression tests (`mover_favored_pawn_attacks_knight_...`,
+`mover_favored_does_not_fire_...`) still pass unchanged (1-vs-1 is a special case of the
+general rule), and a new real-game regression test,
+`fruit_game_three_queen_lost_to_a_bishop_despite_two_defenders`
+(`tests/known_games.rs`), anchored on the exact `8.Nxe5` position, asserts the queen is now
+flagged (`1 attacker, 2 defenders, Winning, see_cp: 570 = 900 − 330`). Re-ran the original
+`check_move.nu` checklist against the exact candidate move that was missed in the live game
+(`f3e5`) and confirmed it now surfaces `MOVER_FAVORED ... Queen@d1 1v2 ... Winning` in the
+"MY PIECES AT RISK" section before the move would ever be played — the actual failure mode
+this session has been chasing, closed for this shape of position.
+
+**Still explicitly open**: `render_explanations` only has a "my own risk" (`mover_favored_us`)
+text block for this concept, not an "opportunity against the opponent" one (same asymmetry
+`Outnumbered`'s prose already had, predating this session) — the structured
+`sensor_report.tactical.mover_favored` field is complete and correct regardless, which is
+what `check_move.nu` actually reads, but the natural-language explanation for "you have a
+won exchange available" doesn't surface it the way "you're about to lose material" does.
+Not fixed in this pass. And the original 2-attacker `dxc5`/`Nf6` case that started this
+whole thread is *still* not caught (its cheapest attacker still needs correct multi-step
+pricing to resolve, i.e. still blocked on `see_chain`) — this generalization widened the
+box without ever revisiting that specific unresolved case.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (100 tests), STS smoke test passes, release build's plugin binary re-registered
+and round-tripped against the live nu 0.115.1 shell confirming the real `8.Nxe5` position
+now correctly flags the queen.
+
+---
+
+## 2026-09-01 (continued): `find_outnumbered`'s `see()`-backed `consequence` had the same sign-flip bug, caught live before a knight was actually lost, and fixed at the source
+
+Fourth game against Fruit, played with the generalized `find_mover_favored`/reordered
+`check_move.nu` from the two entries above. Move 19, candidate `Nd4` was checked before
+playing it: `check_move.nu` reported `MY PIECES AT RISK: (none)` — clean — but the raw
+`hugm-eval` output underneath it also showed `outnumbered=1` in the summary line, unlisted
+in the filtered section. Pulling that entry directly showed `Knight@d4, 2 attackers (pawn
+e5, bishop c5) vs 1 defender (pawn c3), consequence: Losing, see_cp: -360`. `check_move.nu`'s
+filter explicitly excluded `Losing`/`Even` outnumbered entries from "my pieces at risk" —
+reasonable *if* `consequence` were reliable, since "Losing" should mean the exchange is bad
+for the attacker (i.e. safe for me). Directly simulating the capture (`e5xd4`) before
+trusting the label showed otherwise: the eval crashed from roughly even to −2289 — the
+knight is plainly just lost to the cheaper pawn. `find_outnumbered` was still calling
+`self.see()` (confirmed by reading `threat_graph.rs:541` at the time) — the exact multi-step
+`see_chain` machinery already documented as buggy (2026-09-01, earlier entry: phantom
+captures on squares its own walk already emptied) and already known to be unused by
+`find_mover_favored` for precisely this reason. `find_outnumbered` was the one detector that
+still routed through it, and its sign was wrong on a real, live board.
+
+**Immediate fix** (before the source bug was addressed, to keep playing safely):
+`check_move.nu`'s filter was changed to stop trusting `outnumbered[].consequence` at all —
+it now surfaces every `outnumbered` entry on the mover's own pieces regardless of
+consequence, with the printed line flagged `[see_cp/consequence UNVERIFIED - see_chain
+bug]`. The raw `attacker_count > defender_count` fact (from `attackers_to`/`by_color`, not
+from `see()`) was never in question — only the priced verdict layered on top of it was.
+
+**Root fix**: `find_outnumbered` (`threat_graph.rs`) was rewritten to price `see_cp` the
+same way `find_mover_favored` does — direct subtraction, `victim_value − cheapest_attacker_value`,
+no call into `see()`/`see_chain` at all. This is a first-exchange-only approximation (same
+scope limitation `find_mover_favored` already carries and documents), not a full multi-step
+SEE, but it's provably correct for that first exchange, unlike the buggy chain it replaces.
+`find_forks` is now the only remaining consumer of `see()`/`see_chain` — its `see_cp`/
+`consequence` should still be treated as unverified for 2+ attacker/defender positions,
+same caveat as before, just narrower in scope than it used to be.
+
+New regression test, `fruit_game_four_outnumbered_knight_was_mislabeled_safe_by_the_buggy_see_chain`
+(`tests/known_games.rs`), anchored on the exact live FEN (`r4rk1/2p1q1pp/p3b3/2b1pp2/2PNn3/2P5/P1Q1BPPP/1R3RK1
+b - - 1 19`), asserts the knight is now flagged `consequence: Winning, see_cp: 220 = 320 − 100`
+— the correct sign, matching what the direct capture simulation showed. All prior
+`find_outnumbered` tests (`outnumbered_piece_is_detected`,
+`outnumbered_piece_survives_the_flip_with_real_terms`) pass unchanged, since neither
+asserted on `see_cp`/`consequence` — those two fields were the only thing this fix
+touched.
+
+Also, once the move-19 trap was correctly avoided (played `Rbe1` instead of `Nd4`), the
+rest of the game continued as a straightforward, steadily losing position rather than a
+single missed tactic — White had been structurally worse since the early-middlegame
+piece odyssey (`2.Nc3 d4 3.Nb5 a6 4.Na3`) and every subsequent forced exchange
+(`21...Nxc3`, `22.Qb3`, `26...Nd3`, `27.Nxd3`) was independently checked and confirmed to
+be the best available reply, not an avoidable blunder — confirmed against Fruit's own
+`fruit_analyze.sh` search postmortem, whose score curve tracks smoothly downward through
+those exchanges rather than jumping sharply at any one of them (the only sharp jumps are at
+forced captures already recognized as forced, e.g. ply 43's `−545 → −894` after `22.Qb3`,
+which was independently verified to be the best of the four candidates checked). Resigned
+around move 30 (`Bxf2`, eval ≈ −3864) as a practical stopping point rather than playing out
+an already-decided king hunt.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (101 tests, including the new `find_outnumbered` regression), STS smoke test
+passes, release build's plugin binary re-registered and round-tripped against the live nu
+0.115.1 shell, confirming the corrected `see_cp`/`consequence` directly through
+`chessdb hugm-eval` on the exact live position.
+
+---
+
+## 2026-09-01 (continued): sign-convention audit — `Concept`/`GatedIssue` retyped from `Side` to `Mover`, `unflip_phrase` deleted, `final_score_white_relative` removed
+
+After the `find_outnumbered` fix above, user request: "we need a way to audit and simplify
+the sign convention to minimize flipping... I like letting it just be mover vs non mover...
+and let the client keep track of if that is white or black." A full audit of every
+color/sign-flip mechanism in the eval crate turned up **five separate layers**, not one:
+
+1. `normalize_to_white_to_move`/`flip_colors` (`canonical.rs`) — mirrors the board
+   internally so `compute_groups`/`ThreatGraph` always run in one "White to move" frame.
+   Architecturally sound (mirrors the DB's canonical-position pattern) — kept as-is.
+2. `unflip_piece_ref`/`unflip_square_str` — corrects every `PieceRef` (square + color) back
+   to real board terms. Necessary: squares/colors are board facts a caller needs to actually
+   play the move, not a sign convention — kept as-is.
+3. `GatedIssue.side = GatedIssue.side.other()` — a structural color-swap, same pattern as #2
+   but applied to `Concept`/`GatedIssue`'s one non-`PieceRef` color field.
+4. **`unflip_phrase`** (`canonical.rs`) — a blanket find/replace of the literal words
+   `"White"`/`"Black"` inside already-rendered English sentences (`GatedIssue.phrase`),
+   needed because `concepts.rs` baked color words into `format!` strings *while still in the
+   internal flipped frame* (`material_imbalance`, `bishop_pair`, `doubled_pawn`, and ~40
+   other phrase sites). Verified it round-tripped correctly today (a real Black-to-move,
+   Black-up-material test came back "Black is up 298cp" correctly) — but it was a landmine:
+   any future phrase that didn't route color through `us_color`/`them_color`, or that
+   legitimately needed the word "white"/"black" for something unrelated (e.g. a
+   "light-squared bishop"), would have silently corrupted text headed straight into the
+   `chess-coach` LLM prompt (`ai/mod.nu`).
+5. `final_score_white_relative` — a separate, simple sign-flip
+   (`if side_to_move==White {final_score} else {-final_score}`) duplicating what any client
+   can compute in one line from `final_score` + `side_to_move`. Used directly by this
+   session's `check_move.nu`.
+
+Layers 1-2 are a *different* kind of correction (real board facts) and stayed untouched.
+Layers 3-5 all existed to translate an internal, mover-relative computation back into real
+White/Black terms for a value-judgment field — exactly the "sign convention" the user wanted
+minimized. The pattern already done right: `Fork.see_cp`/`Outnumbered.see_cp`/
+`MoverFavored.see_cp` need none of this, because they're computed directly relative to "the
+mover," never mention White/Black, and the client derives real color from `piece.color`
+itself (no server-side flip, nothing to get wrong).
+
+**Fix**: extended that same pattern to `Concept`/`GatedIssue`.
+
+- New `Mover` enum (`concept_types.rs`): exactly two variants, `Us`/`Them` — never a real
+  color, and structurally incapable of needing a flip (`Us` always means "whoever
+  `side_to_move` says is to move," by definition, in every frame). Serializes to `"us"`/
+  `"them"`; `Display` renders `"the mover"`/`"the opponent"`.
+- `Concept.side: Side` → `Concept.mover: Mover`; `GatedIssue.side: Side` → `GatedIssue.mover:
+  Mover`. Every one of the ~40 construction sites in `concepts.rs` (forks, pins, skewers,
+  material_imbalance, bishop_pair, doubled_pawn, king_exposed, development, center_control,
+  etc.) updated — mechanical in most cases, since `us_color`/`them_color` (the existing local
+  variables) already meant exactly `Mover::Us`/`Mover::Them` semantically, just typed `Side`
+  because reusing `Side` was how this shipped originally.
+- Every `format!` phrase rewritten to use `Mover`'s `Display` instead of a literal color
+  word or `Side`'s `Display` — e.g. `"White is up {n} centipawns in material"` →
+  `"{Mover::Us} is up {n} centipawns in material"` → renders `"the mover is up 298 centipawns
+  in material"`.
+- `unflip_sensor_report`'s `GatedIssue` block (`.side.other()` + `unflip_phrase`) deleted
+  outright — nothing color-shaped is left in that struct to correct. `unflip_phrase` itself
+  deleted from `canonical.rs` (its only caller).
+- `final_score_white_relative` removed from `PositionRecord` entirely; `final_score`'s doc
+  comment updated to show the one-line client-side computation
+  (`if side_to_move==White {final_score} else {-final_score}`) instead of promising a
+  precomputed field. `check_move.nu` (this session's scratch tool) updated to compute it
+  itself — the exact "let the client keep track of if that is white or black" the user asked
+  for.
+- `ai/mod.nu`'s `chess-coach` system-prompt example schema updated (`"side": "white"` →
+  `"mover": "us"`, with a note distinguishing `mover` — always translated, never a color —
+  from `data`'s piece references, which correctly stay real color/square).
+  `chessdb/sync.nu`'s `tactical_events` table was checked and needed no change: its `side`
+  column reads straight from the raw failure-lattice structs' `piece.color` (real,
+  `PieceRef`-backed), never from `Concept`/`GatedIssue` — a different, correctly-real-color
+  field that was never part of this problem.
+
+One test needed more than a mechanical rename:
+`king_exposed_concept_is_invariant_to_side_to_move` asserted the *same* `.side` came back
+regardless of who was to move — correct under real-color labeling (the same real king's
+exposure is a fixed fact), but backwards under mover-relative labeling, where the same real
+fact is *supposed* to flip between `Us`/`Them` as `side_to_move` flips. Renamed to
+`king_exposed_concept_tracks_the_real_king_relative_to_whoever_is_to_move` and rewritten to
+assert `movers[0] != movers[1]` instead. (A first attempt at this rewrite also asserted the
+severity magnitude stayed invariant between the two calls — that turned out to be false for
+this position, 121 vs 204, because `king_safety.blended` legitimately incorporates
+side-to-move-dependent terms like tempo/mobility; not a bug, just a wrong assumption in the
+new test, removed.)
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (101 tests — same count, one test renamed/rewritten, none added or removed), STS
+smoke test passes, release build's plugin binary re-registered and round-tripped against the
+live nu 0.115.1 shell — confirmed `final_score_white_relative` is gone from `hugm-eval`'s
+output and `gated_issues[].mover`/`.phrase` read `"them"`/`"the opponent is up 298cp..."`
+(never a color word) on a real Black-to-move, White-up-material position.

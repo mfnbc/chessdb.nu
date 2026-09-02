@@ -86,21 +86,6 @@ pub fn unflip_square_str(s: &str) -> String {
     }
 }
 
-/// Swap "White"/"Black"/"white"/"black" words embedded in free text (e.g.
-/// `GatedIssue.phrase`, built via `format!` before any un-flip pass runs, so
-/// there's no structured field to derive a corrected phrase from). Both
-/// capitalizations are swapped via a sentinel so a phrase containing both
-/// words doesn't get double-flipped by a naive sequential replace.
-pub fn unflip_phrase(phrase: &str) -> String {
-    const SENTINEL: &str = "\u{0}";
-    phrase
-        .replace("White", SENTINEL)
-        .replace("Black", "White")
-        .replace(SENTINEL, "Black")
-        .replace("white", SENTINEL)
-        .replace("black", "white")
-        .replace(SENTINEL, "black")
-}
 
 /// Translate a move into the canonical (White-to-move) frame. `Move`'s
 /// variants reference only `Square`/`Role` fields — no color at all — so

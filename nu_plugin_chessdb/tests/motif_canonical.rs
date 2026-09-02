@@ -4,7 +4,7 @@
 // - Wikipedia: Positional play / pawn structures (examples adapted)
 // - Lichess public puzzles / study examples (representative)
 
-use nu_plugin_chessdb::eval::{analyze_fen, analyze_fen_with_engine_score, extract_concepts, rank_issues_for_position, Side};
+use nu_plugin_chessdb::eval::{analyze_fen, analyze_fen_with_engine_score, extract_concepts, rank_issues_for_position, Consequence, Mover, Side};
 
 #[test]
 fn wikipedia_pawn_break_detected() {
@@ -159,25 +159,34 @@ fn pawn_break_color_is_invariant_to_side_to_move() {
 }
 
 #[test]
-fn king_exposed_concept_is_invariant_to_side_to_move() {
-    // Regression: the king_exposed concept used to hardcode "white"/"black"
-    // based on the sign of king_safety.blended, rather than mapping through
+fn king_exposed_concept_tracks_the_real_king_relative_to_whoever_is_to_move() {
+    // Regression, updated 2026-09-01 for the Side->Mover audit (FINDINGS.md):
+    // the king_exposed concept used to hardcode "white"/"black" based on the
+    // sign of king_safety.blended, rather than mapping through
     // us_color/them_color the way every sibling concept (e.g. development)
-    // already did. Whichever king is actually less safe on this board must
-    // be reported the same way regardless of whose turn it is.
+    // already did — this test originally asserted the *same* `.side` came
+    // back regardless of who was to move, which was the right check under
+    // real-color labeling. `Concept.mover` (`Mover::Us`/`Mover::Them`) is
+    // deliberately relative to whoever is actually to move, so that
+    // invariant is no longer the right one to check — it's now *supposed*
+    // to flip: whichever real king this position's king-safety evaluation
+    // considers less safe doesn't change, but whether that's "us" or "them"
+    // flips with side_to_move by definition. (The severity *magnitude* is
+    // not asserted invariant here — king_safety.blended legitimately
+    // incorporates side-to-move-dependent terms, e.g. tempo/mobility, so a
+    // different number on each call is expected, not a bug this test is
+    // about.) What must hold is that the concept fires both times and never
+    // reports the same mover twice in a row.
     let board = "5rk1/5ppp/8/8/8/8/8/4K3";
-    let mut sides = Vec::new();
+    let mut movers = Vec::new();
     for stm in ["w", "b"] {
         let fen = format!("{board} {stm} - - 0 1");
         let rec = analyze_fen(&fen).expect("FEN should parse");
         let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
-        let king_exposed = concepts.iter().find(|c| c.name == "king_exposed");
-        if let Some(c) = king_exposed {
-            sides.push(c.side);
-        }
+        let king_exposed = concepts.iter().find(|c| c.name == "king_exposed").expect("king_exposed should fire");
+        movers.push(king_exposed.mover);
     }
-    assert_eq!(sides.len(), 2, "expected king_exposed to fire both times, got {sides:?}");
-    assert_eq!(sides[0], sides[1], "king_exposed side must be invariant to side to move, got {sides:?}");
+    assert_ne!(movers[0], movers[1], "the same real king's exposure must flip Us/Them when side_to_move flips, got {movers:?}");
 }
 
 #[test]
@@ -217,11 +226,15 @@ fn board_normalization_reports_real_squares_and_colors_for_black_to_move() {
     // Same physical fact mirrored — the mover-relative score must match.
     assert_eq!(rec1.final_score, rec2.final_score, "final_score should be identical for mirrored positions (mover-relative, not White-relative)");
 
-    // GatedIssue.phrase embeds color words as free text, built before the
-    // un-flip pass runs — this must be corrected too, not just .side.
+    // GatedIssue.mover/.phrase never carry real color at all (see `Mover`'s
+    // doc comment) — real White is up material here, and rec2 is Black to
+    // move, so the mover (Black) is the one *down* material: `Mover::Them`.
+    // No flip needed to get this right; there's nothing color-shaped left to
+    // flip.
     let mat2 = rec2.sensor_report.gated_issues.iter().find(|g| g.name == "material_imbalance").expect("material_imbalance issue");
-    assert_eq!(mat2.side, Side::White);
-    assert!(mat2.phrase.starts_with("White"), "phrase should say White, got: {}", mat2.phrase);
+    assert_eq!(mat2.mover, Mover::Them);
+    assert!(mat2.phrase.contains("the opponent"), "phrase should be mover-relative, got: {}", mat2.phrase);
+    assert!(!mat2.phrase.contains("White") && !mat2.phrase.contains("Black"), "phrase must never leak a real color word, got: {}", mat2.phrase);
 }
 
 // Regression (found 2026-07-30 in a "what's detected but never surfaced"
@@ -242,7 +255,7 @@ fn mate_in_1_is_detected_and_ranks_above_material_imbalance() {
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let mate = concepts.iter().find(|c| c.name == "mate_in_1").expect("mate_in_1 concept should be present");
-    assert_eq!(mate.side, Side::White);
+    assert_eq!(mate.mover, Mover::Us, "White is to move here, so the mover is Us");
 
     let issues = rank_issues_for_position(&concepts, 400);
     assert_eq!(issues.first().map(|i| i.name.as_str()), Some("mate_in_1"), "mate_in_1 should rank first, got {issues:?}");
@@ -296,7 +309,7 @@ fn pawn_islands_is_detected() {
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let islands = concepts.iter().find(|c| c.name == "pawn_islands").expect("pawn_islands concept should be present");
-    assert_eq!(islands.side, Side::White);
+    assert_eq!(islands.mover, Mover::Us, "White is to move here, so the mover is Us");
     assert_eq!(islands.elo_min, 1600);
 }
 
@@ -329,7 +342,7 @@ fn hanging_piece_severity_is_anchored_on_the_biggest_at_risk() {
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let concept = concepts.iter().find(|c| c.name == "hanging_piece").expect("hanging_piece concept should be present");
-    assert_eq!(concept.side, Side::Black);
+    assert_eq!(concept.mover, Mover::Them, "White is to move; both hanging pieces are Black's, so this concerns the opponent");
     // max (900) + 0.3 * rest (320) = 996, not a flat 60*2=120 or a naive sum of 1220.
     assert_eq!(concept.severity, 996, "severity should be max-anchored with a smaller weight for the second piece, got {}", concept.severity);
 
@@ -364,10 +377,10 @@ fn hanging_piece_is_suppressed_when_no_attacker_can_safely_capture() {
     assert!(knight.safe_to_capture, "Rxh4 is completely safe for White, unrelated to the pawn's false hang");
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
-    assert!(concepts.iter().all(|c| !(c.name == "hanging_piece" && c.side == Side::White)),
-        "no attacker can safely capture White's pawn, so hanging_piece must not fire for White, got {concepts:?}");
-    assert!(concepts.iter().any(|c| c.name == "hanging_piece" && c.side == Side::Black),
-        "Black's knight is genuinely, safely hanging and should still be reported");
+    assert!(concepts.iter().all(|c| !(c.name == "hanging_piece" && c.mover == Mover::Us)),
+        "no attacker can safely capture White's (the mover's) pawn, so hanging_piece must not fire for Us, got {concepts:?}");
+    assert!(concepts.iter().any(|c| c.name == "hanging_piece" && c.mover == Mover::Them),
+        "Black's (the opponent's) knight is genuinely, safely hanging and should still be reported");
 }
 
 // Regression for the "pathfind the graph" design pass (2026-07-30): overload
@@ -392,7 +405,7 @@ fn overloaded_piece_is_detected() {
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let concept = concepts.iter().find(|c| c.name == "overloaded").expect("overloaded concept should be present");
-    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.mover, Mover::Us, "White is to move here, so the mover is Us");
     assert_eq!(concept.severity, 1000);
     assert_eq!(concept.elo_min, 1400);
 }
@@ -455,7 +468,7 @@ fn false_defense_is_detected_when_the_only_defender_is_pinned_off_line() {
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let concept = concepts.iter().find(|c| c.name == "false_defense").expect("false_defense concept should be present");
-    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.mover, Mover::Us, "White is to move here, so the mover is Us");
     assert_eq!(concept.severity, 500);
     assert_eq!(concept.elo_min, 1600);
 }
@@ -519,7 +532,7 @@ fn outnumbered_piece_is_detected() {
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let concept = concepts.iter().find(|c| c.name == "outnumbered").expect("outnumbered concept should be present");
-    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.mover, Mover::Us, "White is to move here, so the mover is Us");
     assert_eq!(concept.severity, 100);
     assert_eq!(concept.elo_min, 800);
     assert!(concept.phrase.contains("isn't simply hanging"), "phrase should state the shallower check that passed, got: {}", concept.phrase);
@@ -587,7 +600,7 @@ fn false_safety_is_detected_when_the_count_looks_safe_but_a_defender_is_compromi
 
     let concepts = extract_concepts(&rec.sensor_report, &rec.groups, rec.side_to_move);
     let concept = concepts.iter().find(|c| c.name == "false_safety").expect("false_safety concept should be present");
-    assert_eq!(concept.side, Side::White);
+    assert_eq!(concept.mover, Mover::Us, "White is to move here, so the mover is Us");
     assert_eq!(concept.severity, 100);
     assert_eq!(concept.elo_min, 1800);
 }
@@ -616,4 +629,45 @@ fn false_safety_survives_the_flip_with_real_terms() {
     assert_eq!(fs[0].piece.square, "d5", "mirrored pawn square must be un-flipped to real terms");
     assert_eq!(fs[0].compromised_defenders[0].color, Side::Black);
     assert_eq!(fs[0].compromised_defenders[0].square, "b6");
+}
+
+// `MoverFavored`: a piece with exactly one attacker and one defender (the
+// raw count reads as "covered", outside both find_hanging's and
+// find_outnumbered's territory) where the single forced exchange still
+// favors the mover, since the attacking piece is worth less than what it's
+// attacking. Deliberately restricted to 1-attacker/1-defender and computed
+// by direct subtraction (not ThreatGraph::see/see_chain) — see
+// `MoverFavored`'s doc comment for why: see_chain was tried on exactly this
+// shape of position first and gave the wrong sign (FINDINGS.md, 2026-09-01).
+#[test]
+fn mover_favored_pawn_attacks_knight_defended_only_by_a_rook() {
+    // Black pawn f5 attacks the white knight on e4; only Re1 defends it
+    // (defended once by a piece worth much more than the pawn attacking).
+    // 1 attacker, 1 defender — outside outnumbered's territory entirely —
+    // but capturing still nets Black the knight for a pawn.
+    let fen = "4k3/8/8/5p2/4N3/8/8/4RK2 b - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    let mf = &rec.sensor_report.tactical.mover_favored;
+    let knight = mf.iter().find(|m| m.piece.square == "e4" && m.piece.color == Side::White)
+        .unwrap_or_else(|| panic!("Ne4 should be flagged mover-favored despite 1v1 count, got {mf:?}"));
+    assert_eq!(knight.attacker_count, 1);
+    assert_eq!(knight.defender_count, 1);
+    assert_eq!(knight.consequence, Consequence::Winning, "got {knight:?}");
+    assert_eq!(knight.see_cp, 220, "knight(320) - pawn(100) = 220, got {}", knight.see_cp);
+}
+
+#[test]
+fn mover_favored_does_not_fire_when_the_lone_defender_outvalues_the_attacker() {
+    // The mirror case: a white pawn, defended only by a queen, is attacked
+    // by a black queen down an open file. 1 attacker, 1 defender — but
+    // capturing here is bad for Black (their queen for a pawn), so this
+    // must NOT be reported as mover-favored. This exact position is the
+    // reproduction that caught `see_chain` giving the wrong sign here
+    // (FINDINGS.md, 2026-09-01) — the direct-subtraction fix must not
+    // regress it back to a false positive.
+    let fen = "3qk3/8/8/8/3P4/8/8/3QK3 b - - 0 1";
+    let rec = analyze_fen(fen).expect("FEN should parse");
+    let mf = &rec.sensor_report.tactical.mover_favored;
+    assert!(mf.iter().all(|m| m.piece.square != "d4"),
+        "the queen-defended pawn on d4 must not read as mover-favored, got {mf:?}");
 }

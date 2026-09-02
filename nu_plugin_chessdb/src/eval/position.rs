@@ -6,7 +6,7 @@ use crate::eval::concept_types::*;
 use crate::eval::sensor::{TacticalReport, PositionalReport, SensorReport, AggregatedScores, MaterialConceptReport};
 use crate::eval::concepts::{encode_state, extract_concepts, rank_issues_for_position};
 use crate::eval::threat_graph::{king_ring, role_name, ThreatGraph};
-use crate::canonical::{normalize_to_white_to_move, unflip_phrase, unflip_square_str};
+use crate::canonical::{normalize_to_white_to_move, unflip_square_str};
 
 // Configurable constants (GUESS values) collected here for easier tuning.
 const TACTICAL_BASE_PINS: i64 = 50;
@@ -206,6 +206,27 @@ pub struct PositionRecord {
     pub normalized_fen: String,
     pub side_to_move: Side,
     pub phase: u8,
+    /// `us − them` where `us = chess.turn()` — relative to whoever is
+    /// actually to move in *this* position, not to White. This is the
+    /// convention every scoring function in this module already uses (see
+    /// `normalize_for_eval`'s doc comment), and it stays that way here: it's
+    /// what every internal consumer wants, and it mirrors the DB's canonical
+    /// (White-always-to-move) position-identity simplification.
+    ///
+    /// Comparing this value across two positions with different sides to
+    /// move requires knowing whose turn each one is — `side_to_move` above
+    /// carries exactly that, in one line: `if side_to_move == White {
+    /// final_score } else { -final_score }`. A `final_score_white_relative`
+    /// convenience field used to precompute that flip server-side; removed
+    /// (FINDINGS.md, 2026-09-01) as part of a broader audit that found this
+    /// crate had accumulated several *different* flip conventions living
+    /// side by side (mover-relative scores, a White-relative score,
+    /// mover-relative `Concept`/`GatedIssue` tags that were nonetheless
+    /// unflipped back to real color for output, real-color `PieceRef`
+    /// squares). One convention — mover-relative, plus `side_to_move` for
+    /// whoever wants to translate it — is enough; a client that needs
+    /// White-relative can compute it as easily as this field's own
+    /// implementation did.
     pub final_score: i64,
     pub engine_score: Option<i64>,
     pub legal: LegalInfo,
@@ -2854,11 +2875,15 @@ pub fn build_sensor_report(board: &shakmaty::Board, fen: &str, groups: &EvalGrou
         forks: evaluated_forks.iter().map(|ef| Fork {
             attacker: ef.attacker.clone(),
             targets: ef.targets.clone(),
+            hangs: ef.hangs.clone(),
+            see_cp: ef.see_cp,
+            consequence: ef.consequence.clone(),
         }).collect(),
         skewers:    { let mut v = skewers_to_typed(board, &raw.skew_ex_us); v.extend(skewers_to_typed(board, &raw.skew_ex_them)); v },
         discovered: { let mut v = discovered_to_typed(board, &raw.disc_ex_us); v.extend(discovered_to_typed(board, &raw.disc_ex_them)); v },
         hanging: graph.find_hanging(),
         outnumbered: graph.find_outnumbered(),
+        mover_favored: graph.find_mover_favored(),
         overloaded,
         false_defense: { let mut v = graph.find_false_defense(us, &pins); v.extend(graph.find_false_defense(them, &pins)); v },
         false_safety,
@@ -3028,6 +3053,9 @@ fn unflip_sensor_report(sensor: &mut SensorReport) {
     for on in &mut sensor.tactical.outnumbered {
         unflip_piece_ref(&mut on.piece);
     }
+    for be in &mut sensor.tactical.mover_favored {
+        unflip_piece_ref(&mut be.piece);
+    }
     for o in &mut sensor.tactical.overloaded {
         unflip_piece_ref(&mut o.piece);
         for t in &mut o.critical_for { unflip_piece_ref(t); }
@@ -3094,13 +3122,19 @@ fn unflip_sensor_report(sensor: &mut SensorReport) {
         for p in &mut dev.undeveloped_pieces { unflip_piece_ref(p); }
     }
 
-    // gated_issues.side/.phrase are built inside build_sensor_report from
-    // the same flipped SensorReport, so both are in flipped-color terms and
-    // need correcting — .side structurally, .phrase as embedded text.
-    for issue in &mut sensor.gated_issues {
-        issue.side = issue.side.other();
-        issue.phrase = unflip_phrase(&issue.phrase);
-    }
+    // gated_issues carries no color at all (Concept/GatedIssue.mover is
+    // `Mover::Us`/`Mover::Them` — see concept_types.rs's doc comment) and its
+    // `.phrase` text is built from `Mover`'s Display ("the mover"/"the
+    // opponent"), never a literal "White"/"Black" word — so unlike every
+    // other field in this function, nothing here needs correcting for the
+    // flip at all. This used to require a structural `.side.other()` swap
+    // plus a blanket find/replace of "White"/"Black" inside already-rendered
+    // phrase text (`unflip_phrase`, now deleted) — the single most fragile
+    // part of this whole function, since any future phrase that didn't
+    // route color through `us_color`/`them_color`, or that legitimately
+    // needed the word "white"/"black" for something unrelated, would have
+    // silently corrupted text headed straight into the `chess-coach` LLM
+    // prompt. See `Mover`'s doc comment and FINDINGS.md's 2026-09-01 entry.
 }
 
 pub fn analyze_fen(fen: &str) -> Result<PositionRecord> {
@@ -3283,6 +3317,23 @@ pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json
     out
 }
 
+/// Plain-language verdict for a `Fork`/`Outnumbered`/`MoverFavored` SEE
+/// result. `see_cp`/`consequence` are always mover-relative (see their own
+/// doc comments), and this phrase deliberately names the mover explicitly
+/// rather than leaving it implicit — "wins material" with no named subject
+/// reads as attaching to whichever side the sentence is *about* ("White's
+/// rook is outnumbered — wins material" easily misreads as White winning),
+/// which is backwards whenever the mover isn't the sentence's grammatical
+/// subject.
+fn consequence_phrase(consequence: &Consequence, see_cp: i64, mover: &str) -> String {
+    match consequence {
+        Consequence::Winning => format!("a material win for {mover} (~{see_cp}cp)"),
+        Consequence::Minor => format!("a small edge for {mover} (~{see_cp}cp)"),
+        Consequence::Losing => format!("not currently favorable for {mover} (~{see_cp}cp)"),
+        Consequence::Even => format!("roughly balanced for {mover} if captured"),
+    }
+}
+
 /// Reads only `record.sensor_report` — no `groups.*.terms` access here.
 pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -3297,7 +3348,7 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     if !forks_us.is_empty() {
         let f = forks_us[0];
         let t_str = f.targets.iter().map(|t| t.notation()).collect::<Vec<_>>().join(", ");
-        out.push(format!("{} has {} fork(s) detected (e.g. {} -> {}) — check for immediate tactical threats or trade opportunities.", side, forks_us.len(), f.attacker.notation(), t_str));
+        out.push(format!("{} has {} fork(s) detected (e.g. {} -> {}) — {} — check for immediate tactical threats or trade opportunities.", side, forks_us.len(), f.attacker.notation(), t_str, consequence_phrase(&f.consequence, f.see_cp, side)));
     }
     let skewers_us: Vec<_> = sensor.tactical.skewers.iter().filter(|s| s.attacker.color == us_color).collect();
     if !skewers_us.is_empty() {
@@ -3315,12 +3366,40 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
         out.push(format!("{} has {} discovered-attack opportunity(ies) (e.g. {} moves, {} attacks {}) — watch for moves that uncover attacks.", side, disc_us.len(), d.mover.notation(), d.attacker.notation(), d.target.notation()));
     }
 
-    // Opponent tactical warnings
+    // Opponent tactical warnings — `side` (the mover, who must actually
+    // defend) is the sentence subject; `opp` names the threat's source. This
+    // used to put `opp` in the subject position ("White has forks (by
+    // opponent)"), which reads as if the opponent were the one forked —
+    // backwards from what the sentence needs to communicate.
     let forks_them: Vec<_> = sensor.tactical.forks.iter().filter(|f| f.attacker.color == opp_color).collect();
     if !forks_them.is_empty() {
         let f = forks_them[0];
         let t_str = f.targets.iter().map(|t| t.notation()).collect::<Vec<_>>().join(", ");
-        out.push(format!("{} has {} fork(s) (by opponent) (e.g. {} -> {}) — consider defensive resources.", opp, forks_them.len(), f.attacker.notation(), t_str));
+        out.push(format!("{} faces {} fork(s) from {} (e.g. {} -> {}) — {} — consider defensive resources.", side, forks_them.len(), opp, f.attacker.notation(), t_str, consequence_phrase(&f.consequence, f.see_cp, opp)));
+    }
+
+    // Outnumbered pieces — real defenders exist (unlike hanging), but the
+    // attacking side has more attackers than the defending side has
+    // defenders. This block didn't exist before even though the structured
+    // data (`sensor.tactical.outnumbered`) was already populated.
+    let outnumbered_us: Vec<_> = sensor.tactical.outnumbered.iter().filter(|o| o.piece.color == us_color).collect();
+    if !outnumbered_us.is_empty() {
+        let o = outnumbered_us[0];
+        // The outnumbered piece belongs to `us` (side); the side that would
+        // actually do the capturing — and whose perspective `consequence`/
+        // `see_cp` are computed from — is the opponent, not `side` itself.
+        out.push(format!("{}'s {} on {} is outnumbered ({} attackers vs {} defenders) — {}.", side, o.piece.role, o.piece.square, o.attacker_count, o.defender_count, consequence_phrase(&o.consequence, o.see_cp, opp)));
+    }
+
+    // Pieces that look adequately defended by raw count (defenders >=
+    // attackers — outside outnumbered's territory) but where the real
+    // exchange still favors whoever would initiate it. This is the gap a
+    // count comparison alone can never see — see `MoverFavored`'s doc
+    // comment for the real game this was missed in.
+    let mover_favored_us: Vec<_> = sensor.tactical.mover_favored.iter().filter(|m| m.piece.color == us_color).collect();
+    if !mover_favored_us.is_empty() {
+        let m = mover_favored_us[0];
+        out.push(format!("{}'s {} on {} looks defended by count ({} attackers vs {} defenders) but {} — worth a second look before relying on it.", side, m.piece.role, m.piece.square, m.attacker_count, m.defender_count, consequence_phrase(&m.consequence, m.see_cp, opp)));
     }
 
     // King safety / tropism

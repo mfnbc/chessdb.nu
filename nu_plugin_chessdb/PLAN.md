@@ -105,6 +105,20 @@ this reasoning wired directly into the ladder: a piece with zero raw defenders i
 reported as a real `hanging_piece` concept if at least one attacker could actually capture
 it without its own king ending up in check.
 
+None of the above means this system never computes a real static-exchange-evaluation — it
+answers a different question than `collapse_criticality` does. `ThreatGraph::see`/
+`see_chain` *does* run an optimal-recapture-sequence search and return a real centipawn net
+score; `Fork.see_cp`/`consequence` is the one field still backed by it (`Outnumbered.see_cp`/
+`consequence` and `MoverFavored.see_cp`/`consequence` both moved to direct-subtraction
+pricing instead — see "What this deliberately does not do" below). The distinction:
+`collapse_criticality` asks "is capturing here even safe" (a legality/check question, no
+material value involved); `see`/`see_chain` asks "if it's captured, what's the material
+outcome" (a value question, once safety is already established or irrelevant).
+Both are real searches over a small local exchange, deliberately kept separate because they
+answer different questions — this section is about avoiding a *third* thing (a full
+position search to judge whether a capture is strategically good, which is the real
+engine's job), not about avoiding exchange arithmetic entirely.
+
 ## How primitives become features
 
 None of the sections above stop at being interesting facts about a position — each one is a
@@ -114,9 +128,34 @@ before it needs to:
 1. `control(sq, color)` — one signed number per square. The only raw primitive.
 2. `attackers()`, `zone_control()`, `checkers()`, `is_in_check()` — named relations read
    directly off that one number, still nothing but geometry.
-3. The failure lattice (`find_hanging` … `find_false_safety`) and `collapse_criticality` —
-   composed *detectors*, each returning a typed struct that names the piece, the square, and
-   the raw counts behind its conclusion, not a bare yes/no.
+3. The failure lattice (`find_hanging` … `find_false_safety`, now also `find_mover_favored`)
+   and `collapse_criticality` — composed *detectors*, each returning a typed struct that
+   names the piece, the square, and the raw counts behind its conclusion, not a bare
+   yes/no. `find_forks` attaches a static-exchange-evaluation verdict (`see_cp`/
+   `consequence`, always from the mover's perspective — the side that would actually
+   initiate the capture, never a separate White/Black field since positions here are always
+   the canonical White-to-move frame) via `ThreatGraph::see_chain` — see "Pathfinding an
+   exchange instead of calculating it" above for how this differs from
+   `collapse_criticality`, and "What this deliberately does not do" below for exactly which
+   of these numbers are currently trustworthy (less than their own doc comments used to
+   claim — see the 2026-09-01 findings). `find_outnumbered` attaches the same kind of
+   verdict but, since 2026-09-01, computes it by direct subtraction instead — see below,
+   `find_forks` is now the only detector still backed by `see_chain`. `find_mover_favored`
+   is the rung `find_hanging`/`find_outnumbered` structurally can't reach — a piece with at
+   least as many defenders as attackers (the raw count says it's fine, so neither of the
+   other two detectors fires) where the *first* exchange still favors the mover because the
+   cheapest attacking piece is worth less than what it's attacking. `see_cp` is computed by
+   direct subtraction (piece value minus the cheapest attacker's value) — never through
+   `see_chain` at all, which was tried on this exact shape first and found to give the
+   wrong sign (`FINDINGS.md`, 2026-09-01). Originally shipped restricted to *exactly* 1
+   attacker/1 defender, then generalized the same day after a live game lost a queen with
+   *two* real defenders to a single bishop — a bad first exchange doesn't stop being bad
+   just because more defenders exist, and the detector never actually needed to know the
+   exact defender count beyond "at least one, and not fewer than the attacker count."
+   `find_outnumbered` used the same direct-subtraction approach applied to it later the same
+   day, once a live game caught `see_chain`'s sign-flip bug mislabeling a genuinely hanging
+   knight `consequence: Losing` (i.e. "safe") — see the Findings table and the 2026-09-01
+   (continued) entry in `FINDINGS.md`.
 4. `build_sensor_report` (`position.rs`) folds every detector's output for one position into
    `SensorReport` — the single typed representation of "what did this ply's board actually
    show," replacing the older, string-keyed `EvalGroups.terms` grab-bag as the one thing
@@ -127,10 +166,12 @@ before it needs to:
    comprehensive.
 5. `extract_concepts` (`concepts.rs`) turns a `SensorReport` into `Vec<Concept>` — the same
    shape regardless of whether a `Concept` originated from a tactical detector, a positional
-   extractor, or a material scalar, so everything downstream treats them uniformly.
+   extractor, or a material scalar, so everything downstream treats them uniformly. Every
+   `Concept` carries `mover: Mover` (`Us`/`Them` — never a real color, see below), never
+   `side: Side`.
 6. `rank_issues_for_position`/`rank_issues_for_player` turn `Concept`s into `GatedIssue`s:
    severity × ELO-relevance × confidence, ranked — the actual coaching output a player or an
-   LLM sees.
+   LLM sees. `GatedIssue.mover` is the same `Mover` type, carried straight through.
 7. `chess-tactical-events` (Nu layer) persists the *structured* facts from step 3 — not
    step 6's ranked narrative — per ply, per square, per concept, so the same feature can be
    read back move-to-move: this is what makes it possible to graph where a game got
@@ -139,6 +180,51 @@ before it needs to:
 Every arrow in that chain is a composition of something simpler, never a re-derivation from
 scratch — the "emergence" in the one-paragraph version above is this whole stack, not just
 `control` on its own.
+
+`PositionRecord.final_score` (step 4's home for the whole-position score) is `us − them`
+relative to whoever is actually to move — that stays the convention everything in this file
+computes with, and mirrors the DB's canonical (White-always-to-move) position identity.
+There is deliberately **no** `final_score_white_relative` sibling field — a caller comparing
+scores across positions with different sides to move has `side_to_move` right there and can
+compute `if side_to_move==White {final_score} else {-final_score}` itself in one line. That
+field existed once and was removed (`FINDINGS.md`, 2026-09-01): a sign-convention audit found
+this crate had accumulated several *different* flip conventions side by side — a
+White-relative score, mover-relative `Concept`/`GatedIssue` tags that were nonetheless
+un-flipped back to real color for output via a blanket text-substitution pass
+(`unflip_phrase`, since deleted), and real-color `PieceRef` squares/colors (a genuinely
+different, necessary kind of correction — see below). One numeric convention
+(mover-relative, plus `side_to_move` for whoever wants to translate it) turned out to be
+enough; every place that used to compute or consume a second, White-relative convention now
+just does that one-line translation itself, matching how `Fork.see_cp`/`Outnumbered.see_cp`/
+`MoverFavored.see_cp` already worked (no color field at all, client derives real color from
+`piece.color`).
+
+`Concept.mover`/`GatedIssue.mover` extend that same pattern to the two structs that can't
+anchor to one piece (`material_imbalance`, `bishop_pair`, `king_exposed`, …): `Mover::Us`/
+`Mover::Them`, never `Side::White`/`Side::Black`. This isn't just a stylistic rename —
+`Concept`/`GatedIssue` are built entirely inside `normalize_to_white_to_move`'s internal
+frame (`canonical.rs`, where the mover is always literally `White`), so a `Side` field there
+either meant "the mover" in disguise (true for almost every concept) or, if a future concept
+ever needed a genuinely real, mover-independent color, had no way to say so — the type
+couldn't distinguish the two. `Mover` can't accidentally mean the wrong thing: `Us` always
+means "whoever `side_to_move` says is to move," full stop, in every frame, with nothing to
+flip. The real-color `PieceRef` fields these concepts sometimes reference (e.g. a fork's
+`attacker`) are a genuinely different, orthogonal kind of information — *where a piece is* is
+a board fact needing the real, un-flipped square/color; *who a finding favors* is a value
+judgment that should never have claimed a color in the first place. Conflating the two inside
+one `Side`-typed field is what made `unflip_phrase` (a blanket find/replace of the literal
+words "White"/"Black" inside already-rendered coaching phrases, deleted) necessary, and it
+was the most fragile part of the whole pipeline — any future phrase that didn't route color
+through the internal `us_color`/`them_color` variables would have silently corrupted text
+sent straight into the `chess-coach` LLM prompt (`ai/mod.nu`).
+
+A handful of `core.rs` functions that predate this whole pipeline — `fen_info`,
+`mobility_summary`, `attack_summary`, `checker_summary`, `is_legal` — are now also exposed
+directly as plugin commands (`chessdb fen-info`, `chessdb legal-moves`, `chessdb
+attack-summary`, `chessdb checker-summary`, `chessdb is-legal`), not just called internally.
+They sit outside the numbered pipeline above (no `SensorReport`, no concepts, no ranking) —
+cheap, single-purpose answers to "what are my options"/"is this legal"/"what's attacked"
+that don't need paying for a full `hugm-eval` call.
 
 ## Findings
 
@@ -159,14 +245,47 @@ again — lives in `FINDINGS.md`, not here.
 | Kings are explicitly excluded from every one of the five ladder detectors — a checked king is never reported as an ordinary hanging or outnumbered piece | all five ladder detectors | `checked_king_is_not_reported_as_hanging_or_outnumbered`, `checked_king_is_excluded_from_overloaded_false_defense_and_false_safety_too` |
 | `is_in_check` is defined directly in terms of `checkers()`: checking is just asking whether that list is non-empty, not a second computation that happens to agree with it | `ThreatGraph::checkers` | `is_in_check_matches_shakmatys_own_is_check` |
 | `positions.fen` is normalized so White is always shown to move; feeding it directly into the analysis pipeline as if it were the real board gives systematically wrong square and color labels whenever Black is actually to move | `chess-tactical-events` (Nu layer) | replays `moves.uci` (stored in real terms) through `chessdb apply-uci` instead of reading the stored FEN directly |
+| A piece with real defenders — even more defenders than attackers — can still favor the mover on the first exchange if the cheapest attacker is worth less than the piece it's attacking (a queen with two defenders, a king and a knight, still lost outright to one bishop). Neither `find_hanging` nor `find_outnumbered` can see this, since both are pure count comparisons. Computed by direct subtraction (cheapest attacker) rather than `see_chain`, which was found to give the wrong sign even on the simplest 1-vs-1 shape | `find_mover_favored` | `mover_favored_pawn_attacks_knight_defended_only_by_a_rook`, `mover_favored_does_not_fire_when_the_lone_defender_outvalues_the_attacker`, `fruit_game_three_queen_lost_to_a_bishop_despite_two_defenders` |
+| `find_outnumbered`'s `see_cp`/`consequence` used to be priced via `ThreatGraph::see` and inherited its sign-flip bug — a real 2-attacker/1-defender knight (cheapest attacker a pawn) was labeled `consequence: Losing` ("safe for the defender") when it was actually just lost to the pawn. Switched to the same direct-subtraction pricing `find_mover_favored` uses; `find_forks` is now the only detector still backed by `see_chain` | `find_outnumbered` | `fruit_game_four_outnumbered_knight_was_mislabeled_safe_by_the_buggy_see_chain` |
 
 ## What this deliberately does not do (yet)
 
-- **No search, no exchange pricing.** `see`/`see_chain` (static exchange evaluation) exist
-  in the codebase but are deliberately not depended on by anything described above, and are
-  known to have an unfixed bug in their multi-step math (see `FINDINGS.md`). The whole ladder
-  and `collapse_criticality` are built specifically to answer safety questions *without*
-  that kind of calculation.
+- **Exchange pricing exists and is depended on, but `ThreatGraph::see`/`see_chain` itself
+  is now known to be unreliable even on the simplest possible case, not just imprecise on
+  deep chains.** `Fork.see_cp`/`consequence` (`concept_types.rs`) is live output backed by
+  `see_chain`, always priced from **the mover's perspective** (the side that would actually
+  initiate the capture — the opponent of whoever owns the attacked piece), never as a
+  separate White/Black field, since every position here is already normalized to the
+  canonical White-to-move frame. `see_chain`'s bugs (wrong per-step pricing, the contested
+  square drifting past the first recapture — `FINDINGS.md`'s "see_chain gives wrong answers
+  for 2+ step exchanges") were originally believed to leave the *first* capture-and-recapture
+  exact. **That turned out to be false**: because the function only ever removes pieces from
+  the board clone and never places a capturing piece back on the contested square, once both
+  the original piece and the recapturer are gone the square reads as fully empty — and a
+  completely unrelated piece that now has a freshly-opened line to that empty square gets
+  treated as a further, real attacker. This flips the sign of even a bare "piece defended
+  once, attacked once" exchange (`FINDINGS.md`, 2026-09-01, exact minimal reproduction
+  included). An attempt to fix `see_chain` itself directly (the standard swap-off algorithm,
+  backward minimax pass included) looked plausible on a real position, then failed its own
+  sanity check on the simplest possible input (pawn-takes-pawn-takes-pawn, which must net
+  exactly zero) — not committed, per this project's standing rule against shipping
+  unverified numbers. `find_mover_favored` (see the failure lattice above) sidesteps this
+  entirely by not using `see_chain` at all — it computes `see_cp` by direct subtraction
+  (piece value minus the cheapest attacker's value) for real-defenders-exist,
+  attackers-don't-outnumber-defenders positions, deliberately answering only "was the
+  *first* exchange favorable," not "what does the whole square resolve to."
+  `find_outnumbered` was switched to the same direct-subtraction pricing the same day, after
+  a live game caught `see_chain`'s sign-flip bug mislabeling a genuinely hanging knight as
+  `consequence: Losing` ("safe") right before it would have been played into — see
+  `FINDINGS.md`'s 2026-09-01 (continued) entry and the
+  `fruit_game_four_outnumbered_knight_was_mislabeled_safe_by_the_buggy_see_chain` regression
+  test. `Fork.see_cp`/`consequence` is now the *only* field still backed by the still-buggy
+  `see_chain` and should be treated as unverified for any case with 2+ attackers or
+  defenders, not merely approximate — a correct fix still needs the real swap-off algorithm,
+  done carefully enough to pass its own sanity checks, which the 2026-09-01 attempt did not.
+  The safety ladder and `collapse_criticality` remain answering a different question
+  entirely (is capturing even legal/safe, no material value involved) — see "Pathfinding an
+  exchange instead of calculating it" above.
 - **No positional-entrapment or long-term-pressure sensors.** Two of the findings above are
   deliberate null results, not gaps quietly left open: a permanently trapped piece (Noah's
   Ark) and a slow file-domination squeeze (Alekhine's Gun) both need a different kind of

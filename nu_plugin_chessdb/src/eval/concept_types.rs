@@ -1,5 +1,11 @@
 use serde::Serialize;
 
+// Re-exported (not just used) since `Fork`/`Outnumbered` below expose this
+// as part of their own public field surface — callers doing the established
+// `use crate::eval::concept_types::*;` glob import get it too, without
+// needing a second import from `threat_graph` just for the enum.
+pub use crate::eval::threat_graph::Consequence;
+
 /// White or black, for every color/side field in this module's typed output
 /// structs. Serializes to exactly the same `"white"`/`"black"` strings the
 /// fields here used to hold as bare `String`s (`#[serde(rename_all =
@@ -44,6 +50,55 @@ impl std::fmt::Display for Side {
     }
 }
 
+/// Which side of a position a `Concept`/`GatedIssue` concerns: the side
+/// actually to move (`Us`) or their opponent (`Them`) — **never** a real
+/// color, and deliberately never converted to one anywhere in this crate.
+///
+/// This exists because `Concept`/`GatedIssue` used to carry a `Side` field
+/// for this (`Side::White` standing in for "the mover," `Side::Black` for
+/// "the opponent") — reusing `Side` here worked only because
+/// `extract_concepts` runs entirely inside the internal normalized frame
+/// (`normalize_to_white_to_move`, `canonical.rs`) where the mover is always
+/// literally `White`. It shipped that way, was then quietly un-flipped back
+/// to real color for every consumer (`GatedIssue.side = GatedIssue.side.other()`
+/// plus a blanket find/replace of the words "White"/"Black" inside already-
+/// rendered phrase text, `unflip_phrase`, both now deleted) — a second,
+/// fragile flip layer sitting on top of the first, whose only job was to
+/// undo a labeling choice this module never needed to make. An audit
+/// (FINDINGS.md, 2026-09-01) found this was the single most fragile part of
+/// the whole scoring pipeline: any future concept phrase that didn't route
+/// its color word through `us_color`/`them_color`, or that legitimately
+/// needed the word "white"/"black" for an unrelated reason (e.g. a
+/// "light-squared bishop" mention), would have silently corrupted text sent
+/// straight into the `chess-coach` LLM prompt (`ai/mod.nu`).
+///
+/// The fix: never claim a real color for `Concept`/`GatedIssue` in the first
+/// place. `Mover::Us`/`Mover::Them` are computed once, directly, and never
+/// need correcting — `Us` always means "whoever `side_to_move` says is to
+/// move" by definition, in every frame, with no flip required. A caller that
+/// wants real White/Black has everything needed to compute it in one line:
+/// `if mover == Mover::Us { side_to_move } else { side_to_move.other() }` —
+/// this is the "let the client keep track of which color is the mover"
+/// convention already used by `Fork`/`Outnumbered`/`MoverFavored`'s
+/// `see_cp`/`consequence` (no color field at all — the client derives mover
+/// from `piece.color`), extended to the two structs that couldn't avoid
+/// carrying an explicit field because they aren't anchored to one piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mover {
+    Us,
+    Them,
+}
+
+impl std::fmt::Display for Mover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mover::Us => "the mover",
+            Mover::Them => "the opponent",
+        })
+    }
+}
+
 /// Reference to a piece on the board — human-readable, no bitboards.
 #[derive(Debug, Clone, Serialize)]
 pub struct PieceRef {
@@ -68,6 +123,42 @@ impl PieceRef {
 pub struct Fork {
     pub attacker: PieceRef,
     pub targets: Vec<PieceRef>,
+    /// Which target this fork's `see_cp`/`consequence` are anchored on —
+    /// the target that gives the attacker the best real SEE outcome, not
+    /// necessarily the (or an) undefended one. A rook defended once by a
+    /// pawn can still be this fork's real point (net +180 to capture it
+    /// with a knight) even though it technically "has a defender."
+    pub hangs: Option<PieceRef>,
+    /// Net material result (centipawns) of playing out the best capture
+    /// sequence on `hangs`'s square — a real static-exchange evaluation
+    /// (`ThreatGraph::see`), not a face-value guess. **Always from the
+    /// mover's perspective** (the side that owns `attacker` — the piece
+    /// that would actually make the capture), regardless of whose turn it
+    /// is: positive means the fork actually wins material for the mover,
+    /// not merely that a fork-shaped pattern exists. Same perspective rule
+    /// as `Outnumbered.see_cp`/`MoverFavored.see_cp`, just already explicit
+    /// here since `attacker` names the mover directly instead of leaving it
+    /// as "`piece.color`'s opponent."
+    ///
+    /// **Known limitation, not yet fixed**: `see_chain` prices the initial
+    /// capture correctly (that part is exact — it equals `HangingPiece`'s
+    /// own zero-defender-case math), but every recapture from the first one
+    /// onward is currently mispriced (it charges the *recapturing* piece's
+    /// own value instead of the value of whatever it's actually capturing),
+    /// and the contested square silently drifts to the wrong square past
+    /// the first recapture too — see `FINDINGS.md`'s "see_chain gives wrong
+    /// answers for 2+ step exchanges" and the 2026-08-31 follow-up entry.
+    /// In practice this means: exact only when `hangs` has zero defenders
+    /// (no recapture happens at all); approximate — sometimes by a lot —
+    /// whenever `hangs` has at least one defender. The bucketed
+    /// `consequence` below has still landed correctly on every case checked
+    /// so far (the direction of the error hasn't flipped a verdict yet),
+    /// but that's not a guarantee for every position.
+    pub see_cp: i64,
+    /// `see_cp` bucketed into a plain verdict, same attacker-perspective
+    /// convention as `see_cp` — same known limitation for exchanges longer
+    /// than one capture-and-recapture.
+    pub consequence: Consequence,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,17 +207,97 @@ pub struct HangingPiece {
 
 /// The plainest form of miscalculation, and the most direct application of
 /// `ThreatGraph::control`: a piece with real defenders (so `find_hanging`
-/// doesn't touch it) where attackers still outnumber them. Not a value
-/// judgment — piece values could still make the actual trade fine, that's
-/// exactly the pricing question this system deliberately doesn't calculate
-/// — just the raw count fact that the defending side runs out of recapture
-/// material before the attacking side does.
+/// doesn't touch it) where attackers still outnumber them. `attacker_count`/
+/// `defender_count`/`value` are the raw count fact alone — the defending
+/// side runs out of recapture material before the attacking side does —
+/// independent of whether the actual trade is favorable; `see_cp`/
+/// `consequence` below are the (currently imprecise, see their own doc
+/// comments) attempt at that pricing question.
 #[derive(Debug, Clone, Serialize)]
 pub struct Outnumbered {
     pub piece: PieceRef,
     pub attacker_count: u8,
     pub defender_count: u8,
     pub value: i64,
+    /// Net material result (centipawns) of the mover — the side that would
+    /// actually initiate a capture here, always `piece.color`'s opponent —
+    /// playing out the capture sequence on this square (`ThreatGraph::see`).
+    /// Real defenders exist here (unlike `HangingPiece`), so unlike
+    /// `HangingPiece.value` this is not automatically the full piece value.
+    /// **Always from the mover's perspective, never `piece`'s own side's**
+    /// — same convention as `Fork.see_cp`/`MoverFavored.see_cp`, one
+    /// perspective rule for all three concepts. No color/side field is
+    /// carried alongside it: this crate's positions are always analyzed in
+    /// the canonical White-to-move frame (see `CLAUDE.md`), so a `Side`
+    /// value here would be uselessly constant — "the mover" is the only
+    /// perspective that means anything at this layer, and it's fixed by
+    /// definition (the opponent of whoever owns `piece`), not a fact that
+    /// needs its own field.
+    ///
+    /// **Same known limitation as `Fork.see_cp`** (see its doc comment):
+    /// every recapture is currently mispriced, and since `Outnumbered` by
+    /// definition always has at least one defender, this value should be
+    /// treated as approximate, not exact.
+    pub see_cp: i64,
+    /// `see_cp` bucketed into a plain verdict, same convention as `Fork` —
+    /// same known limitation on the underlying `see_cp`.
+    pub consequence: Consequence,
+}
+
+/// The gap between `HangingPiece` (zero defenders) and `Outnumbered`
+/// (attackers exceed defenders): a piece with real defenders, at least as
+/// many as it has attackers — the raw count says it's covered — where the
+/// *first* exchange still favors the mover because the cheapest attacking
+/// piece is worth less than the piece it's attacking (a pawn attacking a
+/// knight that only a rook can recapture, say — 1 attacker, 1 defender; or
+/// a queen attacked by a single bishop but "defended" by both a king and a
+/// knight — 1 attacker, 2 defenders, still lost outright). It isn't
+/// automatically safe just because the count matches or the defender count
+/// is generous; neither `find_hanging` nor `find_outnumbered` can see this
+/// at all, since both are pure count comparisons, blind to piece values.
+///
+/// This started life trying to catch a real miscalculation — playing
+/// `dxc5` in a session game left a knight with 2 attackers and 2 defenders
+/// that a (buggy) chain-walk claimed still favored the mover — and was
+/// first shipped restricted to *exactly* 1 attacker/1 defender once
+/// `ThreatGraph::see`/`see_chain` was found to give the wrong sign even on
+/// that simplest case (see `see_cp`'s doc comment). That 1-vs-1 restriction
+/// then turned out to be too narrow in its own right: a later live game
+/// lost a queen with *two* real defenders (a king and a knight, the second
+/// missed by eye at the board) to a single bishop, for exactly the same
+/// underlying reason a 1-vs-1 case would be lost — a bad first exchange
+/// doesn't stop being bad just because more defenders exist. What ships now
+/// is the generalization that's still verified correct: any real
+/// attacker/defender counts, as long as attackers don't outnumber
+/// defenders, computed from just the cheapest attacker's value. The
+/// original `dxc5` 2-attacker case that motivated this remains a genuinely
+/// open gap (its answer depends on which of *two* attackers is cheapest
+/// AND on the deeper multi-step exchange `see_chain` still can't be
+/// trusted for) — see `FINDINGS.md`'s "MoverFavored" entries (2026-08-31
+/// and 2026-09-01, both dated).
+#[derive(Debug, Clone, Serialize)]
+pub struct MoverFavored {
+    pub piece: PieceRef,
+    pub attacker_count: u8,
+    pub defender_count: u8,
+    /// Net material result (centipawns): the piece's own value minus the
+    /// *cheapest* attacker's value, for the mover (`piece.color`'s
+    /// opponent) — same perspective rule as `Outnumbered.see_cp`, see its
+    /// doc comment for why no separate color field accompanies it. Computed
+    /// directly, **not** through `ThreatGraph::see`/`see_chain` — that was
+    /// tried first and found to give the wrong sign on exactly this shape
+    /// of position (see `find_mover_favored`'s doc comment for the full
+    /// reproduction and root cause). This is a deliberately
+    /// **first-exchange-only** number: it doesn't account for what a
+    /// *second* attacker or a longer recapture chain would change — see
+    /// `find_mover_favored`'s doc comment for exactly what is and isn't
+    /// covered. Only ever populated when this actually favors the mover
+    /// enough to clear the same `Consequence::Winning`/`Minor` bar the
+    /// other two concepts use — a `MoverFavored` entry always means the
+    /// mover really does come out ahead on the first exchange, not "here's
+    /// a number, judge for yourself."
+    pub see_cp: i64,
+    pub consequence: Consequence,
 }
 
 /// The mirror image of a fork: one piece is the *sole* defender of two or
@@ -358,7 +529,9 @@ pub struct GatedIssue {
     pub confidence: f64,
     pub score: f64,
     pub phrase: String,
-    pub side: Side,
+    /// See `Mover`'s doc comment: `Us`/`Them`, never a real color — the
+    /// client already has `PositionRecord.side_to_move` and can translate.
+    pub mover: Mover,
     /// Which rung of the piece-safety ladder this issue represents
     /// (`threat_graph.rs`'s module doc): 1 = `hanging_piece` (no defenders
     /// at all), 2 = `outnumbered` (raw count insufficient), 3 =

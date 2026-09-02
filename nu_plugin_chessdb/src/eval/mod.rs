@@ -67,4 +67,4 @@ pub mod threat_graph;
 
 pub use position::{analyze_fen, analyze_fen_with_engine_score, compute_phase, compute_groups, build_sensor_report, PositionRecord, render_explanations, render_structured_explanations, set_weights_from_file};
 pub use concepts::{encode_state, decode_state_id, SensorTier, attenuation, extract_concepts, rank_issues_for_position, StateVector};
-pub use concept_types::{GatedIssue, Side};
+pub use concept_types::{Consequence, GatedIssue, Mover, Side};

@@ -53,6 +53,7 @@ pub struct TacticalReport {
     pub discovered: Vec<DiscoveredAttack>,
     pub hanging: Vec<HangingPiece>,
     pub outnumbered: Vec<Outnumbered>,
+    pub mover_favored: Vec<MoverFavored>,
     pub overloaded: Vec<Overloaded>,
     pub false_defense: Vec<FalseDefense>,
     pub false_safety: Vec<FalseSafety>,

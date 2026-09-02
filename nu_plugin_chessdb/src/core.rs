@@ -14,7 +14,7 @@ use shakmaty::{
 use crate::canonical::{flip_move, normalize_to_white_to_move};
 use crate::chess::fen_to_chess;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FenInfoData {
     pub fen: String,
     pub turn: String,
@@ -251,7 +251,7 @@ impl Visitor for GameVisitor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AttackSummary {
     pub attacked_by_white: Vec<String>,
     pub attacked_by_black: Vec<String>,
@@ -259,14 +259,14 @@ pub struct AttackSummary {
     pub black_attack_count: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MobilitySummary {
     pub side_to_move: String,
     pub legal_move_count: i64,
     pub mobility_san: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CheckerSummary {
     pub side_to_move: String,
     pub is_check: bool,

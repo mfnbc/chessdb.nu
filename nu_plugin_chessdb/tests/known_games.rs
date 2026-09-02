@@ -39,7 +39,7 @@
 //   (lichess.org/study/cpuqVg6h/u0Ppk2Ul.pgn, study by CPCurley), matching
 //   a chess.com blog's independently-quoted first 26 moves exactly.
 
-use nu_plugin_chessdb::eval::{analyze_fen, Side};
+use nu_plugin_chessdb::eval::{analyze_fen, Consequence, Side};
 use shakmaty::fen::Fen;
 use shakmaty::san::San;
 use shakmaty::{Chess, EnPassantMode, Position};
@@ -268,3 +268,81 @@ fn alekhines_gun_mutual_hang_after_the_queenside_pawn_break() {
     assert!(hanging.iter().any(|h| h.piece.square == "b5" && h.piece.color == Side::Black && h.value == 100),
         "Black's pawn on b5 should be hanging right back to the bishop, got {hanging:?}");
 }
+
+#[test]
+fn fruit_game_knight_fork_wins_material_even_though_both_targets_are_defended() {
+    // From a real session-logged game against the Fruit UCI engine: 17...Ne5
+    // forks White's rook on d3 and queen on f3. Both targets are
+    // individually defended once (c2 pawn on d3, g2 pawn on f3) — exactly
+    // the case `find_forks` used to miss entirely, since its target
+    // selection only ran SEE on strictly-undefended targets and silently
+    // reported this fork as `consequence: Even, see_cp: 0` even though the
+    // real continuation (...Nxf3+ gxf3) wins the queen for a knight.
+    let fen = "r1b3k1/p1p2ppp/1p2p3/3rn3/2q5/2PR1Q2/P1P2PP1/R5K1 w - - 2 18";
+    let rec = analyze_fen(fen).expect("valid FEN");
+    let forks = &rec.sensor_report.tactical.forks;
+    let knight_fork = forks
+        .iter()
+        .find(|f| f.attacker.square == "e5" && f.attacker.color == Side::Black)
+        .expect("Ne5 should be detected as a forking piece");
+    assert_eq!(knight_fork.consequence, Consequence::Winning,
+        "Ne5's fork on Rd3/Qf3 should read as Winning for Black even though both targets are defended, got {knight_fork:?}");
+    assert!(knight_fork.see_cp > 0, "see_cp should be positive, got {}", knight_fork.see_cp);
+    let hangs = knight_fork.hangs.as_ref().expect("fork should identify a real target");
+    assert_eq!(hangs.square, "f3",
+        "the fork's real point is the queen on f3, not just the lower-value rook, got {hangs:?}");
+}
+
+#[test]
+fn fruit_game_three_queen_lost_to_a_bishop_despite_two_defenders() {
+    // From a third real session-logged game against Fruit: right after
+    // 8.Nxe5, White's queen on d1 is attacked by a single bishop on g4 (the
+    // knight that used to block that diagonal, pinning it to the queen all
+    // along, just moved away to capture on e5). The queen has TWO
+    // defenders — the king on e1 and a knight on c3 (missed by eye at the
+    // board during the actual game) — so neither find_hanging (needs zero
+    // defenders) nor find_outnumbered (needs attackers > defenders, and
+    // here it's the reverse: 1 attacker, 2 defenders) can ever flag this.
+    // The trade is still catastrophic for White: a bishop (330) is winning
+    // a queen (900) outright, regardless of how many pieces could
+    // eventually recapture. This is exactly why find_mover_favored had to
+    // be generalized beyond its first, narrower "exactly 1-vs-1" version —
+    // see FINDINGS.md's 2026-09-01 entries.
+    let fen = "r2qkb1r/ppp1pppp/1n6/3PN3/2P3b1/2N5/PP3PPP/R1BQKB1R b KQkq - 0 8";
+    let rec = analyze_fen(fen).expect("valid FEN");
+    let mf = &rec.sensor_report.tactical.mover_favored;
+    let queen = mf.iter().find(|m| m.piece.square == "d1" && m.piece.color == Side::White)
+        .unwrap_or_else(|| panic!("Qd1 should be flagged mover-favored despite 2 defenders, got {mf:?}"));
+    assert_eq!(queen.attacker_count, 1);
+    assert_eq!(queen.defender_count, 2);
+    assert_eq!(queen.consequence, Consequence::Winning, "got {queen:?}");
+    assert_eq!(queen.see_cp, 570, "queen(900) - bishop(330) = 570, got {}", queen.see_cp);
+}
+
+#[test]
+fn fruit_game_four_outnumbered_knight_was_mislabeled_safe_by_the_buggy_see_chain() {
+    // From a fourth real session-logged game against Fruit: a candidate
+    // 19.Nd4 was checked before playing it. White's knight would land on
+    // d4, attacked by 2 (pawn on e5, bishop on c5) and defended by only 1
+    // (pawn on c3) -- a real 2-vs-1 outnumbered piece, and the pawn is the
+    // cheaper attacker, so it plainly just wins the knight (exd4, cxd4 nets
+    // Black a knight for a pawn). At the time, `find_outnumbered` priced
+    // this via `self.see()` and reported `consequence: Losing, see_cp:
+    // -360` -- read by the coaching script as "bad for the attacker, i.e.
+    // safe for me" and filtered out of the danger list entirely, even
+    // though directly simulating exd4 crashed the eval by nearly 1300cp.
+    // `find_outnumbered` was switched to the same direct-subtraction,
+    // first-exchange-only pricing `find_mover_favored` uses instead of the
+    // buggy `see()` call; this anchors that fix to the exact position that
+    // caught it. See FINDINGS.md's 2026-09-01 entries.
+    let fen = "r4rk1/2p1q1pp/p3b3/2b1pp2/2PNn3/2P5/P1Q1BPPP/1R3RK1 b - - 1 19";
+    let rec = analyze_fen(fen).expect("valid FEN");
+    let outnumbered = &rec.sensor_report.tactical.outnumbered;
+    let knight = outnumbered.iter().find(|o| o.piece.square == "d4" && o.piece.color == Side::White)
+        .unwrap_or_else(|| panic!("Nd4 should be flagged outnumbered (2v1), got {outnumbered:?}"));
+    assert_eq!(knight.attacker_count, 2);
+    assert_eq!(knight.defender_count, 1);
+    assert_eq!(knight.consequence, Consequence::Winning, "must read as dangerous for White (winning for the mover), got {knight:?}");
+    assert_eq!(knight.see_cp, 220, "knight(320) - pawn(100) = 220, got {}", knight.see_cp);
+}
+

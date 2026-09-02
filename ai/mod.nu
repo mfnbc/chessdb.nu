@@ -263,7 +263,7 @@ Input: A JSON record with detected concepts filtered by player ELO:
   \"fen\": \"r3kq2/ppp1np2/...\",
   \"player_elo\": 1400,
   \"concepts\": [{
-    \"name\": \"fork\", \"severity\": 240, \"elo_min\": 1000, \"side\": \"white\",
+    \"name\": \"fork\", \"severity\": 240, \"elo_min\": 1000, \"mover\": \"us\",
     \"data\": {
       \"attacker\": {\"role\":\"Knight\",\"color\":\"white\",\"square\":\"d5\"},
       \"targets\": [{\"role\":\"Queen\",\"color\":\"black\",\"square\":\"f6\"},
@@ -272,6 +272,12 @@ Input: A JSON record with detected concepts filtered by player ELO:
   }],
   \"scores\": {\"material_cp\": 285, \"positional_cp\": -42, \"tactical_cp\": 80, \"total_cp\": 323}
 }
+
+\"mover\" is always \"us\" (whoever's turn it is) or \"them\" (the opponent) —
+never a real color, so it needs no translation. \"data\"'s own piece
+references (\"attacker\"/\"targets\") DO carry real \"color\"/\"square\" —
+those describe where pieces actually are on the board, not who a finding
+favors, so they stay real.
 
 Concepts are ranked by severity descending and already filtered to the player's ELO.
 

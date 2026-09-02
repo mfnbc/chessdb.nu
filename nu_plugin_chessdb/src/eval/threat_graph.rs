@@ -21,16 +21,36 @@
 //!   real defenders, respectively; `find_outnumbered` was the completeness
 //!   gap noticed only after the fancier cross-references below were already
 //!   built (FINDINGS.md).
-//! - **Pricing — `see`/`see_chain`, consumed by `find_forks`.** A genuinely
-//!   different question: not "who's here" but "what would this be worth."
-//!   Runs an actual capture/recapture simulation. Has a known, unfixed
-//!   correctness bug in its multi-step chain math (FINDINGS.md) — deliberately
-//!   not depended on by anything in the geometry layer above, so that bug
-//!   doesn't reach `hanging_piece`/`detect_outposts`/`king_safety_score`/etc.
+//! - **Pricing — `see`/`see_chain`, consumed by `find_forks` only now.** A
+//!   genuinely different question: not "who's here" but "what would this be
+//!   worth." Runs an actual capture/recapture simulation, always priced from
+//!   the mover's perspective — the side that would actually initiate the
+//!   capture, i.e. the opponent of whoever owns the attacked piece — never as
+//!   a separate White/Black field, since every position this crate analyzes
+//!   is already normalized to the canonical White-to-move frame
+//!   (`CLAUDE.md`), where a literal color field would be uselessly constant.
+//!   Has a known, unfixed correctness bug in its multi-step chain math
+//!   (FINDINGS.md: phantom captures on squares its own walk already emptied,
+//!   among others) — deliberately not depended on by anything in the
+//!   geometry layer above, so that bug doesn't reach
+//!   `hanging_piece`/`detect_outposts`/`king_safety_score`/etc.
 //!   `find_hanging`'s recorded piece `value` happens to equal what `see`
 //!   would compute for that specific case (zero defenders means no
 //!   recapture to walk), but it's read directly from `piece_value`, not
-//!   routed through the buggy chain logic.
+//!   routed through the buggy chain logic. `find_outnumbered` used to call
+//!   `see()` too; a live game caught the bug in the act (a real
+//!   2-attacker/1-defender knight scored `Losing`/"safe" by `see()` while
+//!   the board showed it plainly hanging to the cheaper attacker,
+//!   FINDINGS.md's 2026-09-01 entries) and it was switched to the same
+//!   direct-subtraction, first-exchange-only pricing `find_mover_favored`
+//!   uses (below) instead. `find_outnumbered` and `find_mover_favored` both
+//!   attach a real `see_cp`/`consequence` verdict, computed the same
+//!   bug-avoiding way — the first two attacker/defender-*count* comparisons;
+//!   the third the case a raw count can't see at all (equal-or-better count,
+//!   still favors the mover by value) — see `find_mover_favored`'s doc
+//!   comment. `find_forks` is the one holdout still depending on the buggy
+//!   `see_chain` — its `see_cp`/`consequence` should be treated as
+//!   unverified for now, same as `see_chain` itself.
 //!
 //! **Not built from this graph at all**: pins, skewers, and discovered
 //! attacks are detected independently in `position.rs` (`detect_pins`,
@@ -349,6 +369,17 @@ impl ThreatGraph {
         self.see_chain(sq, initiator).1
     }
 
+    /// Bucket a SEE net score (always initiator/attacker-perspective, same
+    /// convention as `see`/`see_chain`) into a plain verdict. One threshold
+    /// set shared by every concept that reports a `Consequence`, so
+    /// "winning" means the same centipawn range everywhere in this file.
+    fn consequence_of(see_cp: i64) -> Consequence {
+        if see_cp > 150 { Consequence::Winning }
+        else if see_cp > 0 { Consequence::Minor }
+        else if see_cp < -50 { Consequence::Losing }
+        else { Consequence::Even }
+    }
+
     /// Find all forks: a piece attacks ≥2 enemy pieces.
     pub fn find_forks(&self, color: Color) -> Vec<EvaluatedFork> {
         let mut out = Vec::new();
@@ -377,19 +408,21 @@ impl ThreatGraph {
                     color: Side::from(color),
                     square: sq.to_string(),
                 };
-                // Find which target hangs (lowest-value undefended)
-                let hangs = self.undefended_target(&targets, enemy);
-                // SEE: optimal recapture chain + net score
-                let (chain, see_gain) = if let Some(ref h) = hangs {
-                    let h_sq = match shakmaty::Square::from_ascii(h.square.as_bytes()) {
-                        Ok(sq) => sq, Err(_) => continue,
-                    };
-                    self.see_chain(h_sq, color)
-                } else { (Vec::new(), 0) };
-                let consequence = if see_gain > 150 { Consequence::Winning }
-                    else if see_gain > 0 { Consequence::Minor }
-                    else if see_gain < -50 { Consequence::Losing }
-                    else { Consequence::Even };
+                // Which target is this fork's real point: the one that gives
+                // the attacker the best SEE outcome, not just whichever
+                // target happens to have zero defenders. A rook defended
+                // once by a pawn is still very much worth capturing with a
+                // knight (net +180) — restricting this to strictly-
+                // undefended targets silently reported a fork's true
+                // material swing as "Even" whenever every target happened to
+                // have exactly one defender (see FINDINGS.md's Fruit-game
+                // entry: this is exactly what happened to the Ne5 fork on a
+                // rook and a queen that were each individually defended).
+                let (hangs, chain, see_gain) = match self.best_fork_target(&targets, color) {
+                    Some((piece, chain, gain)) => (Some(piece), chain, gain),
+                    None => (None, Vec::new(), 0),
+                };
+                let consequence = Self::consequence_of(see_gain);
 
                 out.push(EvaluatedFork {
                     attacker,
@@ -404,29 +437,27 @@ impl ThreatGraph {
         out
     }
 
-    /// Among fork targets, find the lowest-value undefended one.
-    fn undefended_target(&self, targets: &[PieceRef], color: Color) -> Option<PieceRef> {
-        let mut best: Option<(PieceRef, i64)> = None;
+    /// Among fork targets, find the one that gives the attacking side
+    /// (`attacker`) the best real SEE outcome — full static-exchange
+    /// evaluation per target, not a defender-count shortcut. Zero-defender
+    /// targets are still very much included (SEE on an undefended piece just
+    /// returns its full value, same as before), but so are defended targets
+    /// where capturing is still net-favorable once the recapture is played
+    /// out.
+    fn best_fork_target(&self, targets: &[PieceRef], attacker: Color) -> Option<(PieceRef, Vec<CaptureStep>, i64)> {
+        let mut best: Option<(PieceRef, Vec<CaptureStep>, i64)> = None;
         for t in targets {
             let t_sq = match shakmaty::Square::from_ascii(t.square.as_bytes()) {
                 Ok(sq) => sq, Err(_) => continue,
             };
-            let defenders = self.attackers_to[Self::idx(t_sq)]
-                & self.board.by_color(color)
-                & !Bitboard::from(t_sq);
-            if defenders == Bitboard::EMPTY {
-                let val = match t.role.as_str() {
-                    "Queen" => 900, "Rook" => 500, "Bishop" => 330,
-                    "Knight" => 320, "Pawn" => 100, _ => 0,
-                };
-                match best {
-                    None => best = Some((t.clone(), val)),
-                    Some((_, existing)) if val < existing => best = Some((t.clone(), val)),
-                    _ => {}
-                }
+            let (chain, see_gain) = self.see_chain(t_sq, attacker);
+            match &best {
+                None => best = Some((t.clone(), chain, see_gain)),
+                Some((_, _, existing)) if see_gain > *existing => best = Some((t.clone(), chain, see_gain)),
+                _ => {}
             }
         }
-        best.map(|(p, _)| p)
+        best
     }
 
     /// Raw hanging-piece scan, `safe_to_capture` left as a placeholder —
@@ -513,6 +544,26 @@ impl ThreatGraph {
                 & !Bitboard::from(sq)).count();
             if defender_count == 0 { continue; } // find_hanging's job, not this one
             if attacker_count > defender_count {
+                // First-exchange-only pricing (victim minus the mover's
+                // cheapest attacker), same direct-subtraction approach
+                // `find_mover_favored` uses — deliberately NOT `self.see()`.
+                // A live game caught this the hard way: a real 2-attacker/
+                // 1-defender knight got labeled `consequence: Losing` (i.e.
+                // "safe") by the old `see()`-backed computation here, while
+                // the actual board showed the cheap attacker simply wins the
+                // knight outright. `see()`/`see_chain` has a known sign-flip
+                // bug from phantom captures on squares emptied earlier in
+                // its own walk (see `find_mover_favored`'s doc comment,
+                // FINDINGS.md's 2026-09-01 entries) — real defenders existing
+                // here doesn't make that bug go away, so this detector must
+                // not depend on it either.
+                let attackers = self.attackers_to[idx] & self.board.by_color(piece.color.other());
+                let cheapest_val = attackers.into_iter()
+                    .filter_map(|a_sq| self.pieces[Self::idx(a_sq)])
+                    .map(|p| Self::piece_value(p.role))
+                    .min()
+                    .unwrap_or(0);
+                let see_cp = Self::piece_value(piece.role) - cheapest_val;
                 out.push(Outnumbered {
                     piece: PieceRef {
                         role: role_name(piece.role),
@@ -522,7 +573,107 @@ impl ThreatGraph {
                     attacker_count: attacker_count as u8,
                     defender_count: defender_count as u8,
                     value: Self::piece_value(piece.role),
+                    see_cp,
+                    consequence: Self::consequence_of(see_cp),
                 });
+            }
+        }
+        out
+    }
+
+    /// Find pieces where the raw attacker/defender count looks safe (real
+    /// defenders exist — outside `find_hanging`'s territory — and attackers
+    /// don't exceed defenders, so `find_outnumbered` doesn't fire either)
+    /// but the *first* exchange on that square still favors the mover (the
+    /// side that would initiate the capture): the cheapest attacking piece
+    /// is worth less than the piece it's attacking.
+    ///
+    /// Computed *directly* — `victim value − cheapest attacker's own piece
+    /// value` — never through `ThreatGraph::see`/`see_chain`. This is
+    /// deliberately a **first-exchange-only** check: it only asks "if the
+    /// opponent's cheapest attacker captures here and I recapture with my
+    /// best response, was that first trade good for them" — not "what
+    /// happens if the whole square gets fought over to the end" (that's
+    /// exactly the question `see_chain` tries and fails to answer
+    /// correctly, see below). Answering the first-exchange question this
+    /// way doesn't actually require knowing the *defender* count at all
+    /// beyond "at least one" (there has to be a real recapture for the
+    /// formula's second half to mean anything) — a queen attacked by a
+    /// pawn is a bad trade for the queen's side whether it has one defender
+    /// or five, because the opponent only ever risks their cheapest piece
+    /// to win it. This is a real generalization from an earlier, narrower
+    /// version of this detector that required *exactly* one attacker and
+    /// one defender — found too narrow in a live game where a queen with
+    /// **two** defenders (a king and a knight, one of which was missed by
+    /// eye at the board) was still lost outright to a single bishop, for
+    /// exactly this reason (`FINDINGS.md`, 2026-09-01).
+    ///
+    /// **What "attacker"/"defender" access means here**: immediate
+    /// geometric access to the square on the *current* board — the same
+    /// snapshot `attackers_to` gives every other detector in this file —
+    /// not a simulation of the capture actually being played out. It does
+    /// not account for a piece that would only gain a line to the square
+    /// once pieces in front of it move (an x-ray attacker/defender). That's
+    /// a real, known scope limit, not an oversight.
+    ///
+    /// Why direct subtraction instead of the general chain-walker:
+    /// `see_chain` was tried on exactly this shape of position (one real
+    /// attacker, one real defender, nothing more) and found to give the
+    /// **wrong sign**: it never actually places a capturing piece back on
+    /// the contested square (only ever discards, never sets), so once both
+    /// the original piece and the recapturing piece are gone from the
+    /// board, any other piece that now happens to have a clear line to the
+    /// (empty) square gets treated as a further, real attacker — even
+    /// though there's nothing left there to capture. See `FINDINGS.md`'s
+    /// 2026-09-01 entry for the exact reproduction (a bare queen-defended
+    /// pawn attacked by an enemy queen down an open file: `see_chain`
+    /// reports the trade as *favorable* for the attacker who is actually
+    /// about to lose their queen for a pawn). Deeper questions — what a
+    /// *second* attacker changes, whether a long chain is worth playing out
+    /// to the end — are not attempted here at all until `see_chain` itself
+    /// is fixed; reporting nothing for those is more honest than reporting
+    /// a number already shown to have the wrong sign.
+    pub fn find_mover_favored(&self) -> Vec<MoverFavored> {
+        let mut out = Vec::new();
+        for sq in Square::ALL {
+            let idx = Self::idx(sq);
+            let Some(piece) = self.pieces[idx] else { continue };
+            if piece.role == Role::King { continue; }
+            let attackers = self.attackers_to[idx] & self.board.by_color(piece.color.other());
+            let attacker_count = attackers.count();
+            if attacker_count == 0 { continue; } // find_hanging's job, not this one
+            let defenders = self.attackers_to[idx]
+                & self.board.by_color(piece.color)
+                & !Bitboard::from(sq);
+            let defender_count = defenders.count();
+            if defender_count == 0 { continue; } // find_hanging's job, not this one
+            if attacker_count > defender_count { continue; } // find_outnumbered's job, not this one
+
+            // Cheapest attacker: the opponent's rational first choice, and
+            // the only one this first-exchange check needs to know about.
+            let Some(cheapest_val) = attackers.into_iter()
+                .filter_map(|a_sq| self.pieces[Self::idx(a_sq)])
+                .map(|p| Self::piece_value(p.role))
+                .min()
+            else { continue };
+
+            let victim_val = Self::piece_value(piece.role);
+            let see_cp = victim_val - cheapest_val;
+            match Self::consequence_of(see_cp) {
+                Consequence::Winning | Consequence::Minor => {
+                    out.push(MoverFavored {
+                        piece: PieceRef {
+                            role: role_name(piece.role),
+                            color: Side::from(piece.color),
+                            square: sq.to_string(),
+                        },
+                        attacker_count: attacker_count as u8,
+                        defender_count: defender_count as u8,
+                        see_cp,
+                        consequence: Self::consequence_of(see_cp),
+                    });
+                }
+                Consequence::Even | Consequence::Losing => {}
             }
         }
         out
@@ -848,7 +999,7 @@ impl ThreatGraph {
 
 // ── Output types ──
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Consequence { Winning, Minor, Losing, Even }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1138,4 +1289,6 @@ mod tests {
             "the checked king must not appear as a false_safety piece either, got {false_safety:?}");
     }
 }
+
+
 

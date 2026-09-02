@@ -160,6 +160,11 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chessdb apply-uci` | Apply a UCI move to a FEN, returning the resulting FEN in the same (real, non-canonical) frame |
 | `chessdb collapse-criticality` | Clear a square's local cluster and place each candidate piece back individually to read its true control/check/mate consequences, independent of the other candidates |
 | `chessdb stockfish-eval` | Evaluate FEN(s) via Stockfish (external oracle, UCI subprocess) — not this project's own eval |
+| `chessdb fen-info` | Material, check/checkmate/stalemate, en passant, move counters, legal move count — cheaper than `hugm-eval` when that's all you need |
+| `chessdb legal-moves` | Side to move, legal move count, and the full legal move list in SAN |
+| `chessdb attack-summary` | Every square attacked by White and by Black, plus per-side attack counts |
+| `chessdb checker-summary` | is_check/is_checkmate and the named checking square(s) |
+| `chessdb is-legal` | Cheap yes/no legality check for a move (SAN or UCI) in a given FEN |
 
 ## Database
 
