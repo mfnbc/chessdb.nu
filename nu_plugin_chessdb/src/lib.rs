@@ -17,6 +17,7 @@ pub mod process_corpus;
 pub mod game_parse;
 pub mod stockfish_eval_cmd;
 pub mod coach_derive_cmd;
+pub mod square_control_cmd;
 pub mod stockfish;
 pub mod utils;
 pub mod zobrist;
@@ -64,6 +65,7 @@ impl Plugin for ChessdbPlugin {
             Box::new(attack_summary_cmd::AttackSummaryCmd),
             Box::new(checker_summary_cmd::CheckerSummaryCmd),
             Box::new(is_legal_cmd::IsLegal),
+            Box::new(square_control_cmd::SquareControlCmd),
         ]
     }
 }

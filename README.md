@@ -165,6 +165,7 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chessdb attack-summary` | Every square attacked by White and by Black, plus per-side attack counts |
 | `chessdb checker-summary` | is_check/is_checkmate and the named checking square(s) |
 | `chessdb is-legal` | Cheap yes/no legality check for a move (SAN or UCI) in a given FEN |
+| `chessdb square-control` | Every square the piece on `--square` geometrically controls (occupancy-aware, independent of whose turn it is) — the primitive behind a spatial "what does this piece see" render |
 
 ## Database
 

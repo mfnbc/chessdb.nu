@@ -4363,3 +4363,49 @@ recapture were both checked directly against `calc_line.nu`/`chessdb apply-uci` 
 being written down, not assumed from board-visualization alone — the second check is what
 caught the misread this entry describes, just one move after it happened live rather than
 during the live move itself.
+
+---
+
+## 2026-09-02 (continued): `chessdb square-control` — a spatial view of what one piece controls, prompted directly by the `Bd3` blunder
+
+User's own diagnosis of the `Bd3` blunder above, offered directly rather than waited for:
+mental file/rank-difference arithmetic ("does this diagonal reach that square") is exactly
+the wrong way to answer a question the engine already answers correctly internally —
+proposed padding a FEN with marks for every square a piece controls as a more
+"topographical" way to see it, instead of a flat list of square names to place by hand.
+
+`Board::attacks_from(sq)` (shakmaty, occupancy-aware — stops at the first blocker in each
+direction, includes squares held by either side) was already used internally
+(`attacked_squares` in `core.rs`, backing `chessdb attack-summary`'s whole-board view), but
+nothing exposed it for one specific piece. Added `core::square_control(fen, square)` —
+returns the piece on that square (`None` if empty) and every square it controls, wrapped as
+`chessdb square-control --square <sq>`. Deliberately a thin wrapper around the same tested
+primitive `attack_summary` already uses, not new geometric logic: the whole point was to
+stop re-deriving this by hand, so the fix can't itself be another hand-derivation.
+
+Four unit tests pin down the behavior directly (`core.rs`, `square_control_tests`): an empty
+square returns `None`/`[]`; a corner knight (`Nb1` in the start position) controls exactly
+its 3 reachable squares; a boxed-in bishop (`Bc1`, start position) controls exactly its two
+blockers (`b2`, `d2`) and nothing past them — the blocker-awareness a hand-rolled diagonal
+walk would have to get right on its own; an invalid square is a labeled error, not a panic.
+
+Built `nu_plugin_chessdb/scripts/play/control_map.nu` on top of it — an 8x8 grid renderer
+that marks empty-and-controlled squares `x`, own pieces it defends `(P)`, enemy pieces it
+attacks `[p]`, and the piece itself `*B*`, reading everything else straight off the FEN.
+The rendering script does no geometry of its own (file/rank math, diagonal walks) — it only
+places characters at squares `chessdb square-control` already named, which is the actual
+fix: the class of code that caused the blunder doesn't get a second chance to exist here.
+
+Validated directly against the real blunder position: rendering Black's bishop on `e4` (the
+position right before `11.Bd3` was played) shows `d3` marked `x` — a bare "don't go there"
+signal, no diagonal arithmetic required, right where the actual mistake happened. Also
+validated the control/mobility distinction on a pawn (`e4` white pawn controls `d5`/`f5`
+only, not its forward push square `e5`) — confirming `controls` answers "what does this
+piece see," not "where can it legally move," which matters most exactly for pawns.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (107 tests passing, 1 pre-existing ignore, the 4 new `square_control` unit
+tests included), release plugin rebuilt and `plugin add`/re-registered against the live nu
+shell, `chessdb square-control` and `control_map.nu` both smoke-tested live against real
+positions (start position, the actual game-11 blunder FEN, an isolated pawn) before being
+trusted.

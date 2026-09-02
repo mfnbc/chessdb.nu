@@ -42,6 +42,15 @@ see `.claude/skills/position-eval/SKILL.md` for why.
   perspective flips every ply, normalize by hand before comparing across
   plies). Used for postmortems, not live play.
 
+- **`control_map.nu "<FEN>" <square>`** — renders the board as an 8x8 grid
+  with every square the piece on `<square>` controls marked (`x` empty,
+  `(P)` own piece defended, `[p]` enemy piece attacked), built on
+  `chessdb square-control`. Built directly in response to the `Bd3` blunder
+  (`FINDINGS.md`, 2026-09-02): a spatial view instead of mentally computing
+  "does this diagonal/file/knight-jump reach that square," which is exactly
+  the arithmetic that went wrong live. Reach for this before any move that
+  places a piece on a square you haven't independently confirmed is safe.
+
 ## Method (see `.claude/skills/position-eval/SKILL.md` for the full version)
 
 1. `check_move.nu` any candidate before playing it — cheap, catches the

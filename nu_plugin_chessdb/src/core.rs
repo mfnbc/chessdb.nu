@@ -8,7 +8,7 @@ use shakmaty::{
     san::San,
     uci::UciMove,
     zobrist::Zobrist64,
-    Bitboard, Chess, Color, EnPassantMode, Piece, Position, Role,
+    Bitboard, Chess, Color, EnPassantMode, Piece, Position, Role, Square,
 };
 
 use crate::canonical::{flip_move, normalize_to_white_to_move};
@@ -273,6 +273,31 @@ pub struct MobilitySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PieceOnSquare {
+    pub role: String,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SquareControl {
+    pub square: String,
+    /// None if the square is empty — there's nothing to compute control
+    /// from, geometric attack generation always starts from an occupied
+    /// square.
+    pub piece: Option<PieceOnSquare>,
+    /// Every square this one piece geometrically controls — occupied-aware
+    /// for sliding pieces (a piece behind a blocker doesn't count), but
+    /// deliberately independent of whose turn it is, check, and pins. This
+    /// is raw board control ("what does this piece see"), not legal
+    /// mobility ("what can this piece actually play right now") — the two
+    /// differ whenever the piece is pinned or it isn't its side's move.
+    /// Includes squares held by the piece's own side (what it defends) and
+    /// by the opponent (what it attacks) alike — the caller distinguishes
+    /// those by cross-referencing the board itself.
+    pub controls: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CheckerSummary {
     pub side_to_move: String,
     pub is_check: bool,
@@ -491,6 +516,50 @@ pub fn mobility_summary(fen_str: &str, span: Span) -> Result<MobilitySummary, La
     })
 }
 
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Pawn => "Pawn",
+        Role::Knight => "Knight",
+        Role::Bishop => "Bishop",
+        Role::Rook => "Rook",
+        Role::Queen => "Queen",
+        Role::King => "King",
+    }
+}
+
+/// Every square one specific piece geometrically controls, board-occupancy
+/// aware — the primitive behind a "what does this piece actually see"
+/// spatial view, so that question is answered by the same tested move-
+/// generation the rest of this crate relies on rather than by re-deriving
+/// file/rank/diagonal offsets by hand at the call site (the exact class of
+/// arithmetic slip that hung a bishop in live play, FINDINGS.md,
+/// 2026-09-02 — "reasoning based on visibility" instead of mental
+/// geometry, per the user's own framing of that request).
+pub fn square_control(fen_str: &str, square_str: &str, span: Span) -> Result<SquareControl, LabeledError> {
+    let pos = fen_to_chess(fen_str, span)?;
+    let sq: Square = square_str.parse().map_err(|e| {
+        LabeledError::new(format!("Invalid square '{square_str}': {e}"))
+            .with_label("expected algebraic notation, e.g. 'e4'", span)
+    })?;
+
+    let board = pos.board();
+    let piece = board.piece_at(sq).map(|p| PieceOnSquare {
+        role: role_name(p.role).to_string(),
+        color: match p.color {
+            Color::White => "white",
+            Color::Black => "black",
+        }
+        .to_string(),
+    });
+    let controls = board
+        .attacks_from(sq)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    Ok(SquareControl { square: square_str.to_string(), piece, controls })
+}
+
 pub fn checker_summary(fen_str: &str, span: Span) -> Result<CheckerSummary, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
     let side_to_move = side_to_move_string(&pos);
@@ -621,4 +690,54 @@ pub fn canonicalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledErro
     let (canonical_pos, _) = normalize_to_white_to_move(&pos)
         .map_err(|e| LabeledError::new(format!("Canonicalization error: {e}")))?;
     Ok(Fen::from_position(&canonical_pos, EnPassantMode::Legal).to_string())
+}
+
+#[cfg(test)]
+mod square_control_tests {
+    use super::*;
+
+    const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+    #[test]
+    fn empty_square_has_no_piece_and_no_control() {
+        let result = square_control(STARTPOS, "e4", Span::test_data()).expect("valid square");
+        assert!(result.piece.is_none());
+        assert!(result.controls.is_empty());
+    }
+
+    #[test]
+    fn knight_in_the_corner_controls_exactly_its_three_reachable_squares() {
+        // Nb1 in the start position: only 3 of a knight's usual 8
+        // destinations fit on the board from here, and all 3 are its own
+        // side's pawns/empty squares — control includes defended own
+        // pieces, not just enemy-facing attacks (see the field doc comment
+        // on SquareControl::controls).
+        let result = square_control(STARTPOS, "b1", Span::test_data()).expect("valid square");
+        let piece = result.piece.expect("b1 is occupied in the start position");
+        assert_eq!(piece.role, "Knight");
+        assert_eq!(piece.color, "white");
+        let mut controls = result.controls.clone();
+        controls.sort();
+        assert_eq!(controls, vec!["a3".to_string(), "c3".to_string(), "d2".to_string()]);
+    }
+
+    #[test]
+    fn sliding_piece_control_stops_at_the_first_blocker() {
+        // Bc1 in the start position is boxed in by its own pawns on b2 and
+        // d2 — it controls exactly those two squares (where it stops) and
+        // nothing past them, the blocker-awareness a hand-rolled diagonal
+        // check would need to get right on its own.
+        let result = square_control(STARTPOS, "c1", Span::test_data()).expect("valid square");
+        let piece = result.piece.expect("c1 is occupied in the start position");
+        assert_eq!(piece.role, "Bishop");
+        let mut controls = result.controls.clone();
+        controls.sort();
+        assert_eq!(controls, vec!["b2".to_string(), "d2".to_string()]);
+    }
+
+    #[test]
+    fn invalid_square_is_a_labeled_error_not_a_panic() {
+        let result = square_control(STARTPOS, "z9", Span::test_data());
+        assert!(result.is_err());
+    }
 }
