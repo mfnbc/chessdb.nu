@@ -1738,8 +1738,14 @@ fn extract_king_exposure(board: &shakmaty::Board) -> Vec<KingExposure> {
                 if pawns.any() { shelter_files += 1; }
             }
         }
-        if attacker_count > 0 || shelter_files < 2 {
-            results.push(KingExposure { color: Side::from(color), shelter_files, attacker_count });
+        // The king's own file counted separately and more strictly than
+        // the flank-file tally above: a rook/queen has direct access down
+        // this specific file, unlike the other two, so it needs its own
+        // signal rather than being averaged into `shelter_files` (see the
+        // field's doc comment).
+        let king_file_open = (board.by_color(color) & board.by_role(Role::Pawn) & Bitboard::from(file)).is_empty();
+        if attacker_count > 0 || shelter_files < 2 || king_file_open {
+            results.push(KingExposure { color: Side::from(color), shelter_files, attacker_count, king_file_open });
         }
     }
     results
@@ -3215,6 +3221,14 @@ pub fn render_structured_explanations(record: &PositionRecord) -> Vec<serde_json
         serde_json::Value::Object(obj)
     };
 
+    // Checked first — see render_explanations's mate_in_1 comment (same
+    // gap, same fix, both renderers).
+    if sensor.mate_in_1_exists {
+        out.push(make_obj("mate_in_1", us_color, 1000,
+            format!("{side_cap} has a mate in 1! Check for a forced checkmate before anything else."),
+            serde_json::Map::new()));
+    }
+
     // Forks
     let forks_us: Vec<_> = sensor.tactical.forks.iter().filter(|f| f.attacker.color == us_color).collect();
     if !forks_us.is_empty() {
@@ -3342,6 +3356,23 @@ pub fn render_explanations(record: &PositionRecord) -> Vec<String> {
     let opp = if side == "White" { "Black" } else { "White" };
     let opp_color = us_color.other();
     let sensor = &record.sensor_report;
+
+    // Checked first, ahead of every tactical/positional concept below: the
+    // single most decisive fact a position can have (mate_in_1 outranks
+    // everything in extract_concepts's own severity ordering too, 1000 vs a
+    // max-realistic material_imbalance around 900). Was computed on
+    // SensorReport all along (build_sensor_report) but never surfaced here —
+    // a real gap: `.explanations` is what `--verbose true` callers actually
+    // read (this session's own check_move.nu scratch tool included), and
+    // `mate_in_1_exists` only ever reached the ELO-gated `gated_issues` path
+    // via extract_concepts, which nothing in this session's live-play
+    // checking called (`--player-elo` was never passed). Caught the hard way
+    // (FINDINGS.md, 2026-09-01): played straight into `17...Qxh2#` with
+    // `sensor_report.mate_in_1_exists` sitting `true` on the position one
+    // move earlier, completely invisible to the tool actually being read.
+    if sensor.mate_in_1_exists {
+        out.push(format!("{side} has a mate in 1! Check for a forced checkmate before anything else."));
+    }
 
     // Tactical explanations with examples when available
     let forks_us: Vec<_> = sensor.tactical.forks.iter().filter(|f| f.attacker.color == us_color).collect();

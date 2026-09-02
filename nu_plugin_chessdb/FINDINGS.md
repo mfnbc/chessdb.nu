@@ -3825,3 +3825,541 @@ smoke test passes, release build's plugin binary re-registered and round-tripped
 live nu 0.115.1 shell — confirmed `final_score_white_relative` is gone from `hugm-eval`'s
 output and `gated_issues[].mover`/`.phrase` read `"them"`/`"the opponent is up 298cp..."`
 (never a color word) on a real Black-to-move, White-up-material position.
+
+---
+
+## 2026-09-01 (continued): Fifth Fruit game — a forced-move ranking where the static tool and a real search engine actually disagreed
+
+Fifth game against Fruit (White), played with the post-audit `Mover`-based `check_move.nu`.
+Opening: 1.e4 d5 2.exd5 Nf6 3.d4 Nxd5 4.Nc3 Nc6 5.Nf3 Bg4 6.Qd3 (a real, if minor,
+inaccuracy per Fruit's own search — see below) Nb4 7.Qd1 Ncxd4 8.Be3 (pinned in place: every
+move of the f3 knight reopens the Bg4→Qd1 diagonal and hangs the queen outright, verified
+live before playing — see the `f3d4`/`f3d2` checks below) Nxc2+ 9.Qxc2 Nxc2+ 10.Ke2 Nxa1,
+down a queen and a rook for two knights by move 11. Resigned in spirit around move 11 (eval
+≈ −4000) and ran the finished game through `fruit_analyze.sh` for the postmortem.
+
+**Correction (same session, caught before this was left standing): the actual queen loss was
+*not* a single-ply blind spot.** `d1c2` (`Qxc2`, the forced-or-worse response to
+`8...Nxc2+`) was checked with `check_move.nu` before it was played, and it *did* correctly
+show `HANGING: Queen@c2 ... safe_to_capture=true` right there in "MY PIECES AT RISK" — the
+danger was visible at the very first ply, because the second black knight (still on d4 from
+`7...Ncxd4`) was already attacking c2 before Black made any further move at all; no reply was
+needed to "create" the threat. The real mistake was three moves earlier, at move 6 (`Qd3`)
+— see below, where a genuine one-ply-deeper visualizer *does* catch it. Recorded here rather
+than silently deleted, since getting this wrong once is itself worth keeping as a reminder to
+verify "the tool didn't see it" claims against the actual saved output before writing them
+down.
+
+**Built the visualizer this game's postmortem argued for, and it immediately paid for
+itself — three moves before the actual blunder, not at the blunder itself.** Prompted
+directly ("there is a two move visualizer no? it is okay to speculate moves ahead just not
+calculate specific order"): `check_move_2ply.nu` (session scratchpad), a breadth-first, not a
+search — after the candidate move, it enumerates *every* legal opponent reply (`chessdb
+legal-moves`'s `mobility_uci`, a new field added to `MobilitySummary` since `chessdb
+apply-uci` only accepts UCI) and re-runs the same "MY PIECES AT RISK" check on each resulting
+position, with no ranking, no opponent "best move" chosen, nothing minimaxed — pure
+enumeration of what's reachable, deliberately staying on this project's side of the
+"pathfind the graph, don't calculate the exchange" line (`PLAN.md`). Run against the actual
+move 6 (`6.Qd3`, which `check_move.nu`'s single-ply check had shown as completely clean —
+`final_score_white_relative: 53`, "MY PIECES AT RISK: (none)"), it immediately surfaced
+`MOVER_FAVORED: Queen@d3 ... Winning` after *six different* knight replies (`Nxe3`, `Nb4`,
+`Nf4`, `Nc6-b4`, `Nc6-e5`, `Bf5`) — including the exact `...Nb4` that was actually played and
+led, three moves later, to the queen being lost outright. `check_move.nu`'s single-position
+check structurally cannot see this: nothing attacks the queen in the position right after
+`Qd3` itself, only in several of the positions one ply past it. This is the real,
+concretely-demonstrated case the "not a search, just enumeration" design is for — worth
+formalizing (promoting out of the scratchpad, wiring into the regular per-move check) in a
+future pass; not done in this one.
+
+**A sharper, more novel finding: at the actual forced juncture, the static tool's own
+ranking of the two legal replies disagreed with what Fruit's real search preferred.** After
+`8...Nxc2+`, exactly two legal replies exist (`chessdb legal-moves` confirmed it): `Kd2` and
+`Qxc2`. `check_move.nu` ranked them by `final_score_white_relative` immediately after each —
+`Qxc2`: −187, `Kd2`: −1374 — so `Qxc2` looked like the clearly-better, "least bad" choice by
+a wide margin, and that's what got played. But re-running the finished game through
+`fruit_analyze.sh` shows Fruit's own search, at that exact position, preferred **`Kd2`**
+(`ponder e1d2` at ply 16) over `Qxc2` — the opposite ranking. The static tool's snapshot
+eval at each resulting position is plausible in isolation (`Kd2` does walk into a discovered
+attack on the exposed king, which the tool correctly flagged as `MOVER_FAVORED ... Rook@a1
+... Winning`), but a real search evidently finds `Qxc2`'s consequences (losing the queen to
+the second knight's fork, unconditionally) worse over the following few plies than `Kd2`'s
+immediate exposure. This is the concrete, numbers-attached version of "that's Stockfish
+thinking, not what we can do" from earlier in this session (2026-08-31 entries): a forced,
+two-option decision where correctly reading *both* resulting positions' immediate tactics
+still wasn't enough to match a real engine's choice, because the engine is comparing full
+lines, not single resulting snapshots. Not something to fix in this pass — recorded as a
+concrete, load-bearing example of the gap between this project's static failure-lattice and
+an actual search, for whenever that boundary needs re-justifying.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (101 tests, no new ones needed — `mobility_uci` is a same-order sibling of the
+already-tested `mobility_san`, no new logic to assert on beyond "shakmaty's own `UciMove`
+formatting," already exercised elsewhere in `core.rs`), release build's plugin binary
+re-registered and round-tripped against the live nu 0.115.1 shell — confirmed `legal-moves`
+now returns `mobility_uci` and `check_move_2ply.nu` runs end-to-end against the real move-6
+position above, both by hand-reading its output and cross-checking a couple of the flagged
+replies (`Nb4`, `Nxe3`) directly against `chessdb hugm-eval` on the resulting FEN.
+`check_move.nu`'s output for both legal replies to `8...Nxc2+`, and `fruit_analyze.sh`'s
+full move-by-move White-relative curve for the game, are the source data for the earlier
+findings in this entry.
+
+---
+
+## 2026-09-01 (continued): Sixth Fruit game — `mate_in_1_exists` was fully computed and completely invisible in the field actually being read
+
+Sixth game against Fruit (White), using the previous entry's 2-ply visualizer alongside
+`check_move.nu`. A pawn-grabbing queen infiltration down the h-file/kingside diagonal
+(`13...Qxf3`, `15...Qxh3`) got progressively worse despite every candidate being checked
+before playing. Move 17 (`Qa5`) was checked and read clean — `MY PIECES AT RISK: (none)`,
+score `-1019` (bad, but nothing forced) — and played. Black replied `17...Qxh2#`: the queen
+delivering mate, defended by the bishop on d6 down the long a3–f8/h2 diagonal, king boxed in
+by its own `f1` rook and `f2` pawn.
+
+**Root cause: `sensor_report.mate_in_1_exists` was already `true` on the position right after
+`17.Qa5`, and neither `render_explanations` nor `render_structured_explanations` ever
+mentioned it.** Verified directly: `chessdb hugm-eval --verbose true` on that exact position
+returned `mate_in_1_exists: true` in the structured `sensor_report`, but the `.explanations`
+field — the one field `check_move.nu` (and every other live-play check this whole session)
+actually prints and reads — said nothing about it at all. Grepping `position.rs` confirmed
+why: `mate_in_1_exists` is computed once in `build_sensor_report` and stored on
+`SensorReport`, but its only consumer was `extract_concepts` (`concepts.rs`), which only
+ever reaches a caller through the ELO-gated `gated_issues` path (`--player-elo`) —
+never called by this session's plain `--verbose true` checking. The single most decisive
+fact a chess position can have (severity 1000 in `extract_concepts`'s own ranking, above
+even a full queen's material swing) was fully computed and completely unreachable from the
+one output actually being trusted.
+
+**Fixed at the source, not just patched in the scratch script**, since this affects every
+caller of `.explanations`/`explanations_structured`, not just this session's tooling: both
+`render_explanations` and `render_structured_explanations` (`position.rs`) now check
+`sensor.mate_in_1_exists` directly and unconditionally — no `--player-elo` required — and
+push it as the very first entry, ahead of every other phrase, matching
+`extract_concepts`'s own priority ordering. New regression test,
+`fruit_game_six_mate_in_1_was_computed_but_never_surfaced_in_explanations`
+(`tests/known_games.rs`), anchored on the exact real position (`r3k2r/2p2ppp/p2bp3/Qp6/
+3P4/2P1B2q/P1P2P2/1R3RK1 b kq - 1 17`), asserts both renderers now carry the warning and
+that it's first in `render_explanations`'s output. Also added an explicit, louder check to
+`check_move.nu` itself — `sensor_report.mate_in_1_exists` printed as its own `!!! MATE IN 1
+EXISTS !!!` line before even "MY PIECES AT RISK," since a script this session has been
+trusting all game should never depend on a human noticing one sentence buried in a paragraph
+of explanation text for the single most catastrophic possible signal. Verified live against
+the exact position: the warning now appears, first, through the rebuilt release plugin.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (102 tests, the new mate-in-1 regression passing on the first run), STS smoke
+test passes, release build's plugin binary re-registered and round-tripped against the live
+nu 0.115.1 shell, confirming the new warning appears (and appears first) on the exact
+position that caused the loss.
+
+---
+
+## 2026-09-02: Seventh Fruit game — avoiding `hugm-eval`'s untested score, the `position-eval` skill's reasoning worked early, and the multi-step verify habit caught several illusory captures late
+
+Seventh game against Fruit (White), explicitly avoiding `final_score_white_relative` as a
+ranking basis per the user's request ("avoid hugm, it is not battle tested... build a
+position evaluation skill"). Practical outcome: material stayed level or favorable through
+roughly move 20, then a fork (`23...Nb3`, hitting both Ra1 and Bd2) started a decline that
+ended in a clearly lost rook ending (down a bishop and three pawns) by move 30 — resigned in
+spirit there.
+
+**Where the qualitative-reasoning approach genuinely changed a decision, correctly.** Move 8
+(after `7...Qd5`): the raw score favored `Qd3` (-197) over `Qe2` (-228), and `Qd3` was
+literally the square that got the queen harassed for the rest of the previous (sixth) game.
+Checked the actual knight geometry independently (`b4`/`e5` both attack `d3`, neither
+attacks `e2`) before trusting the intuition, confirmed it, and played `Qe2` against the
+score's preference — the queen was never once threatened by a knight hop for the rest of
+this game, unlike last time. A second case at move 18: instinct said "contest the open
+d-file with `Rad1`," but checking `positional.open_files` directly showed White's own `d4`
+pawn still blocked that file for a white rook there — the naive positional instinct was
+wrong and the score's preference (`Re2`) was actually correct. Both cases used the same
+discipline: pull the structured facts, reason from them explicitly, don't take either the
+score or a generic heuristic ("open files are always good") at face value.
+
+**The multi-step "does this survive the opponent's real reply" habit (established two games
+ago) caught at least four separate illusory-capture traps this game, all with the same
+shape**: a snapshot immediately after MY capture shows a huge score
+(`Nc4-e5` "fork" at +208, `Rxd4` at +387, `Rxd4` again at +49, ...) because the tool is
+scoring the position *before* Black's forced recapture, not after. Every one of these was
+checked by directly applying Black's best/only reply (`chessdb apply-uci` + `chessdb
+legal-moves`) before committing, and three of the four turned out to be real traps (the
+first `Rxd4` walked into `fxe5`/`Rxd4` counter-recaptures worth -620 to -1546; the second
+`Rxd4` attempt walked into a rook fork on `Bd3`/`Nc4` worth -1919) — while the *third* `Rxd4`
+(move 29, after the knight had relocated to `d6` and physically blocked the d-file) was
+verified genuinely safe and played correctly. Same mechanical check, three different correct
+verdicts depending on the exact position — this is precisely why "check the specific
+position, don't apply a rule of thumb" matters even for a pattern that's bitten the same way
+repeatedly.
+
+**Where the deeper checking still had a real gap.** `fruit_analyze.sh`'s postmortem shows
+the single largest White-relative swing of the game (-283 → -642, ply 55) at move 28, where
+both `Nc4` and `Bd3` were simultaneously attacked (`27...Bb5`) and neither could be saved.
+Fruit's own suggested reply from that exact position was `Bf1` (a bishop retreat never
+included in this session's checked candidate list — only `Nd6`/`Ne3`/`Na5`/`Bc2`/`Be2`/`Bb1`/
+`Na3` were tried). Checked `Bf1` directly against `check_move.nu` after the fact: it scores
+*worse* (-1208) than the move actually played (`Nd6`, -1049) by this project's own static
+eval — another confirmed instance of the `Kd2`-vs-`Qxc2` gap from two games ago, where a real
+search and this project's static evaluator disagree at a genuinely hard position, and
+neither can fully resolve which is right without deeper search this project deliberately
+doesn't do. Recorded as another concrete data point for that same, already-documented
+boundary — not something to chase further in this pass.
+
+Verified: no code changes this entry (live-play + postmortem only). All specific claims
+above (the `Qe2`/`Qd3` knight-geometry check, the `d4`-pawn open-file blockage, all four
+illusory-capture verifications, and the `Bf1` comparison) were independently checked against
+`chessdb legal-moves`/`apply-uci`/`hugm-eval` before being written down, not asserted from
+memory.
+
+---
+
+## 2026-09-02 (continued): Eighth Fruit game — the score stripped from `check_move.nu` entirely, a real deviation reasoned out from a known trap, and an honest limit on what avoiding one pattern actually buys
+
+Eighth game against Fruit (White), with `final_score`/`final_score_white_relative` removed
+from `check_move.nu`'s output entirely (not just deprioritized) per direct user feedback:
+"the scores, the numbers are not reliable... they cloak real visibility and counter the
+skill of reasoning." This game replayed the seventh game's opening near-identically (both
+sides largely repeated their moves through move 25), which made it a clean natural
+experiment: same position, deliberately different decision at the one point a real
+improvement had been reasoned out.
+
+**The repeat validated three earlier findings cleanly**, using only structural facts, no
+score: `Qe2` over `Qd3` at move 8 (still never harassed by a knight all game), the `d4`-pawn
+blocking the `d`-file for `Rad1` at move 18 (still correctly avoided), and the same
+illusory-capture pattern from four separate `Rxd4`/knight-foray attempts, each re-verified
+against Black's actual best reply before committing rather than assumed from last time.
+
+**The one deliberate deviation, and an honest result.** At move 26 (retreating the e5
+knight under attack from `25...f6`), last game's `Nc4` led directly to `27...Bb5` forking
+both the knight and the bishop — the single most damaging tactical shape of that whole game.
+This time, checked every legal retreat square first and specifically verified (via
+`chessdb legal-moves`) that `Nf3` cannot be forked the same way, since `Bb5` doesn't reach
+`f3` the way it reaches `c4` — confirmed correct, and played `Nf3` instead of repeating
+`Nc4`. It didn't help. Black played `26...Nxf3` immediately, and the recapture (`27.gxf3`)
+opened a completely different problem: a bishop that later reached `h5` had a clean,
+empty diagonal straight to `d1` (`h5-g4-f3-e2-d1`), forcing the same "save the more valuable
+piece" trade-off game seven hit, just via an entirely different geometric route, ending in
+the same kind of decisive material loss (down two bishops and two pawns by move 30).
+Re-running the finished game through `fruit_analyze.sh` confirms this wasn't a wash — Fruit's
+own real search shows `26.Nf3` cost 335cp more than continuing with `26.Nc4` would have
+(ply 51: −228 → −563, the largest single swing of the game), and Fruit's own suggested reply
+to `25...f6` was `Nc4`, the exact move this session deliberately avoided. Checked both
+candidates directly against this project's own static tool at that position too — neither
+showed a red flag for the other, confirming the difference lives in consequences several
+moves deep that no single-position check (structural reasoning or static eval alike) can
+see.
+
+**Why this is worth keeping, not walking back.** The reasoning that produced `Nf3` was
+sound on its own terms — it correctly, verifiably closed the *specific* hole `Nc4` opened
+last time (confirmed: `Bb5` really cannot fork a knight on `f3`). What it couldn't do, and
+what nothing in this project's design does, is see that closing one specific hole doesn't
+guarantee the position doesn't have another one nearby that a real multi-ply search would
+find and a single-position (however carefully reasoned) check will not. This is the same
+`Kd2`-vs-`Qxc2` / `Bf1` boundary from the two entries above, now with a third confirmed
+instance, and with the added, more pointed data point that *this session's own reasoning*,
+not just the discarded numeric score, is equally subject to it. Reasoning from structured
+facts is still the right replacement for trusting an untested formula — it produces
+verifiable, checkable claims instead of a fake-precise number — but it is not a substitute
+for search, and shouldn't be oversold as one.
+
+Verified: no code changes this entry (live-play + postmortem only, following up on the
+`check_move.nu` scratch-tool edit already made this session). The `Nf3`-cannot-be-forked
+claim, the `Nc4` structural comparison, and the `fruit_analyze.sh` swing/bestmove numbers
+above were all checked directly before being written down.
+
+---
+
+## 2026-09-02 (continued): Ninth game — a queen-pawn opening with a real plan, a genuine positional/tactical find it produced, and a real misread under pressure at the end
+
+Ninth game against Fruit (White), direct user feedback after the eighth game: "your
+evaluation strategy is very defensive tactically and you are missing positional wins... try
+again with a queen pawn opening." Audited all eight prior games' move-selection pattern and
+found the actual failure mode wasn't (only) the score, addressed already this session — it
+was that "tactically safe" had quietly become the entire decision procedure. Filter
+candidates through `check_move.nu`, discard anything that hangs material, play whichever
+survivor looked like normal development — never actually comparing the survivors'
+*positional* consequences against each other, and never starting from an actual plan.
+Updated the `position-eval` skill with an explicit fix for this (name a plan before
+generating candidates; compare survivors against each other, not each one alone against
+"is this acceptable") before playing.
+
+**Opened 1.d4** for the first time this session (all eight prior games were 1.e4 into the
+same Scandinavian line). Black met it with a Nimzo-Indian (`1...Nf6 2.c4 e6 3.Nc3 Bb4`).
+Played the classical `4.Qc2` specifically so that if Black ever takes on c3, the queen
+recaptures instead of a pawn — no doubled pawns regardless of what Black does. Black did
+take (`6...Bxc3`), `7.Qxc3` kept a clean structure and the bishop pair, matching the plan
+exactly.
+
+**A real positional/tactical find this produced, not a coincidence.** Black's `10...g5` and
+`12...f6` seriously weakened their own king (still on g8 behind both pushed pawns) — a
+genuine long-term target identified and acted on with a coherent plan (`11.Be3`→`12.O-O-O`
+to get White's own king to safety on the opposite wing→`13.h4` directly challenging the
+overextension), not just "avoid losing material" move by move. Separately, at move 9
+(`9.cxd5`), verified via `chessdb legal-moves`/re-checking Black's actual best reply
+(`exd5`) that capturing on d5 opened the c-file for a genuine, survives-the-recapture fork
+on both black knights (`Qc2` already covered `e4` on the diagonal; capturing removed
+White's own blocking pawn on `c4` and revealed the file to `c6`) — a real structural
+consequence of the position, found by checking, not assumed from a raw fork-detector number
+(which as usual needed independent verification: the two capture moves that "executed" the
+fork, `Qxe4`/`Qxc6`, both actually hung the queen back to a defended pawn/piece the naive
+`Fork.see_cp` didn't price correctly — same known, documented `see_chain` unreliability as
+every previous game, caught the same way).
+
+**The position was already decisively worse by around move 19** (a queenside knight
+maneuver Black executed, `...Nd4`/`...Nf5`/`...Ng3` forking pieces repeatedly, was not fully
+parried — `fruit_analyze.sh` shows the swing from roughly even to around −250 across moves
+19–24) before the final, decisive error. **The actual last mistake was a misjudgment, not a
+missed signal.** At move 24, facing a genuine triple fork (`23...Ne2` hit `Bc1`/`Rg1`/`Qg3`
+at once) with every legal response flagged as costly, `check_move.nu`'s output for the move
+played (`24.Qh3`) explicitly showed `MOVER_FAVORED (opponent, despite count looking safe):
+Queen@h3 1v2 see_cp=800 consequence=Winning` — read, at the time, as a softer warning than a
+plain `HANGING` line, when in this specific case it meant exactly the same thing: the g4
+pawn (present the whole time, simply not weighted as seriously as a piece) captures the
+queen outright next move, `consequence: Winning` at `see_cp: 800` being about as unambiguous
+as a warning gets. Played it anyway, comparing it against equally-bad alternatives without
+registering that this one specific line was a forced, total queen loss rather than a
+survivable cost. `24...gxh3` won the queen for a pawn, ending the game.
+
+**What actually needs fixing, precisely stated:** not a tooling gap — `check_move.nu`
+printed the `MOVER_FAVORED` line in the same "MY PIECES AT RISK" section, at the same
+visual level, as `HANGING`. The gap was in *how the two lines got weighted* when scanning
+several bad options under time pressure: `HANGING` was reflexively treated as maximally
+severe, `MOVER_FAVORED ... Winning` was read as a softer, "worth a second look" caveat by
+habit, even though the field's own definition (a piece that "looks defended by count" but
+the mover still wins the exchange outright) makes it every bit as forcing as `HANGING` once
+`consequence: Winning` is attached. Read `attacker_count`/`defender_count` and
+`consequence` together, every time, rather than pattern-matching on which of the two labels
+a line starts with.
+
+Verified: no code changes this entry (live-play + postmortem only; the `position-eval`
+skill edit was made and verified in the previous turn, before this game). The `cxd5` fork's
+survival past `exd5`, both illusory-capture verifications (`Qxe4`/`Qxc6`), and the exact
+`gxh3` recapture claim were all checked directly against `chessdb legal-moves`/
+`hugm-eval` before being written down.
+
+---
+
+## 2026-09-02 (continued): `king_exposure` couldn't distinguish a bare king-file from thin flank shelter — traced to a real move in game nine, fixed at the source
+
+User pushback on the ninth-game postmortem above: "you were down significantly before that
+[the final blunder], positionally you allowed your king safety to erode with the rook
+attack... what you opened up was exploited better by fruit than you." Traced the claim
+precisely rather than taking it on faith: White's own c-pawn was traded away at move 9
+(`9.cxd5 exd5` — a real, independently-justified tactical point, it opened the fork on both
+black knights covered in the entry above), then three moves later `12.O-O-O` castled the
+king directly onto that now-completely-pawnless file. Checked `sensor_report.positional
+.king_exposure` on the position right after castling: **empty — no exposure signal fired at
+all**, at the exact moment White's king landed on a file a rook could walk straight down.
+It did, several moves later (`19...Rxe2`, `20...Rc2+`, `21...Rc3`), directly contributing to
+the collapse documented in the entry above (a second, independent problem from that game's
+final blunder, exactly as the user's pushback said).
+
+**Root cause, found in `extract_king_exposure` (`position.rs`):** `shelter_files` counts how
+many of the three files centered on the king (flank-left, king's own, flank-right) have *any*
+friendly pawn *anywhere* on them, then only fires the whole signal when fewer than 2 of the
+3 qualify. At the position in question, White had a pawn on `b2` (flank) and `d4` (flank,
+and two ranks back) — 2 of 3 — so the detector read "shelter present" even though the
+king's own file (`c`) was entirely bare. The metric can't distinguish "the file directly in
+front of the king is open" (a specific, well-known, materially worse danger — direct
+rook/queen access) from "a flank file happens to be thin," because it averages all three
+files into one undifferentiated count.
+
+**Fix:** added `king_file_open: bool` to `KingExposure` (`concept_types.rs`) — true whenever
+the king's own file has zero friendly pawns, checked and reported independently of
+`shelter_files`, and now also a standalone trigger for the whole detector firing (previously
+only `attacker_count > 0 || shelter_files < 2` could fire it; now
+`|| king_file_open` too, so this exact shape — flanks nominally intact, own file bare — can
+never again read as "no exposure"). New regression test,
+`fruit_game_nine_castling_onto_a_pawnless_king_file_read_as_zero_exposure`
+(`tests/known_games.rs`), anchored on the real position right after `12.O-O-O`, asserts
+`king_file_open: true` alongside the unchanged `shelter_files: 2` — pinning down precisely
+that this is the exact gap the old metric had, not a general sensitivity increase.
+
+**What this doesn't fix, deliberately left as a judgment call, not a tool responsibility:**
+the detector now reports the fact correctly, but *choosing not to castle onto a bare file in
+the first place* is a decision that has to happen before the move is played, informed by
+checking both candidate castling squares — a tool firing accurately on the position that
+already exists doesn't substitute for that proactive check. Added to the `position-eval`
+skill directly (`.claude/skills/position-eval/`) as an explicit step: check
+`king_exposure`/pawn structure on *both* castling candidates before choosing one, and treat
+`king_file_open` as a materially worse signal than a thin flank file.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean, full `cargo test`
+suite green (103 tests, the new king-file regression passing on the first run), STS smoke
+test passes, release build's plugin binary re-registered and round-tripped against the live
+nu 0.115.1 shell, confirming `king_file_open: true` now appears on the exact real position
+that used to read as clean.
+
+---
+
+## 2026-09-02 (continued): Tenth Fruit game — Réti opening, a real fork traced correctly, a `HANGING` read under-weighted, and a Fruit-search-confirmed collapse point
+
+Played White with the Réti (`1.Nf3`), intending `2.c4` against `1...d5`; Black played
+`1...Nc6` instead, so the game transposed into a general hypermodern setup (`c4`, `g3`,
+`Bg2`, `O-O`, `d3`, `Nc3`) rather than the actual gambit line. Full move list (UCI):
+`g1f3 b8c6 c2c4 g8f6 g2g3 e7e5 f1g2 f8c5 e1g1 d7d6 d2d3 e8g8 b1c3 c8g4 h2h3 g4e6 d1b3 a8b8
+c1e3 c5e3 f2e3 h7h6 d3d4 c6a5 b3b5 c7c6 b5a4 a5c4 a4b3 c4e3 b3a3 e3f1 a1f1 d8b6 f1d1 e5e4
+f3e1 d6d5 e1c2 b6c7 c2e3 c7g3 e3f1 g3g5 g1h1 g5h4 h1h2 f6g4 h2g1 g4f2 d1e1 f2h3 g2h3 e6h3`.
+Resigned after `27...Bxh3` at `-1375cp` material (roughly a rook and a piece down, no
+compensation, no mate threat but no realistic path back against an engine).
+
+**A real find, correctly verified (move 14):** `find_outnumbered` read the `c4` pawn as
+safe as a pawn (`2v1 consequence: Losing` for the attacker) — correct at the time. Once
+`14...Nxc4` actually happened, that was a *new* tactical fact, not the same one re-asked:
+Black's `Be6` bishop, on the same diagonal, now defended the knight and threatened the
+queen if White recaptured. `check_move.nu` on the candidate `Qxc4` correctly showed
+`HANGING: Queen@c4` with the `Be6` fork behind it; avoided it and retreated `15.Qb3`
+instead. Worth naming plainly: "is this square defended" and "is the piece that just moved
+onto this square defended" are different questions, and the second one only exists to ask
+*after* the capture happens, not before.
+
+**The real structural collapse, per this game's own Fruit-search postmortem
+(`fruit_analyze.sh`, White-relative eval), wasn't the final blunder — it was two moves
+already documented elsewhere in this file:** normalizing every ply's engine score to a
+consistent White-relative sign turns up two sharp jumps, not a gradual slide:
+
+- `29.Qb3 / 29...Nxe3` (the queen retreat off the `c4` attack, immediately followed by the
+  knight forking `Rf1`/`Bg2`): `-187cp → -381cp`, a ~194cp swing — the fork that actually
+  decided the game, not the earlier `Qxc4??` trap that was correctly avoided.
+- `41.Nce3 / 41...Qxg3` (Black's queen capturing the `g3` pawn, the exact king-file-erosion
+  pattern from the ninth game's postmortem above, this time on White's kingside instead of
+  queenside): `-382cp → -552cp`, a ~170cp swing.
+
+Everything after that (`-552` through `-857` by the game's end) is the engine converting an
+already-decisive advantage, not a sequence of fresh blunders — confirmed directly by the
+search, not assumed.
+
+**A judgment lesson, not a tool bug, at move 27:** `check_move.nu` on the candidate `Bxh3`
+(recapturing the knight that had just given check) printed both `HANGING: Bishop@h3` *and*
+`HANGING: Rook@e1` in the same "MY PIECES AT RISK" block, plus a `Qh4 -> Bh3, Re1` fork
+below it. Read this as "the rook falls to the fork regardless, so at least trade off the
+knight first" — correct reasoning about the rook (it was already lost: Black's own prior
+move vacated `f2`, opening the `h4–e1` diagonal directly onto it, independent of anything
+White plays), but the `HANGING: Bishop@h3` line wasn't *also* about that same fork — it
+meant Black's `Be6` bishop had a direct, immediate, unrelated recapture on `h3` on the same
+diagonal it had used at move 14. Fruit's actual reply (`27...Bxh3`) confirmed exactly that:
+a plain bishop trade, not the fork playing out. The move played was still correct (roughly
+equal to the alternative king moves, ~10cp worse by the postmortem, and it at least
+removed Black's active knight from the board) — but the *reasoning* that got there treated
+two independent "HANGING" lines as one connected threat instead of two separate ones. When
+`check_move.nu` lists 2+ of my own pieces as hanging in the same block, treat each as an
+independent claim requiring its own "why" before comparing candidates, not one shared
+story.
+
+Verified: no code changes this entry (live-play + `fruit_analyze.sh` postmortem +
+documentation only). Fork/outnumbered verifications at moves 14 and 27 were checked
+directly against `check_move.nu` and `chessdb legal-moves` before being written down; the
+two named collapse points were read directly off `fruit_analyze.sh`'s output (700ms
+movetime per ply), normalized to a consistent White-relative sign by hand rather than
+eyeballing the raw alternating-perspective numbers.
+
+---
+
+## 2026-09-02 (continued): single-move screening isn't calculation — built forcing-line tools, found a second fork in game ten's own critical position that live play missed
+
+Named directly: the reason ten straight games against Fruit have ended in decisive losses
+isn't primarily the score-reliance or stopping-at-safe patterns already fixed above —
+those were real, but the deeper gap is that `check_move.nu` only ever screens *one*
+candidate move at a time. It cannot tell you what a forcing sequence leads to two or three
+plies out, because the danger can be sitting quietly in a position beyond the one ply it
+checks. That's calculation, not move-screening, and nothing in the toolset did it.
+
+Built two new scratchpad tools around the same "structural facts, never a score" discipline
+as `check_move.nu`:
+
+- `forcing_moves.nu <history>` — lists every legal check and capture for the side to move
+  (tagged straight from `mobility_san`'s own `x`/`+`/`#` notation, no plugin logic added),
+  unranked. This is the actual branch list a human calculation starts from.
+- `calc_line.nu <history> "<candidate line>"` — applies a whole calculated variation move by
+  move and prints hanging pieces, forks, king exposure, and raw material (by piece count,
+  never a formula) at *every* ply, not just the last one, stopping cleanly if any move in
+  the line turns out illegal.
+
+**Validated directly against a real, already-documented position from this file:** ran
+`calc_line.nu` on the exact `14...Nxc4 15.Qb3 15...Nxe3` sequence from the tenth game's
+postmortem above. It reproduced the known `Nxe3` fork on `Rf1`/`Bg2` — but also surfaced a
+**second, simultaneous fork that live play never saw**: at that same position, `Be6` sits on
+the intersection of two open diagonals, hitting `Qb3` (`e6-d5-c4-b3`, all three squares
+empty) and the `h3` pawn (`e6-f5-g4-h3`, also clear) at once. Checked the geometry by hand
+against the resulting FEN
+(`1r1q1rk1/pp3pp1/2ppbn1p/4p3/3P4/1QN1nNPP/PP2P1B1/R4RK1 w - - 0 16`) rather than trusting
+the tool's own fork detector blind — both diagonals really are clear. The `see_cp=1130`
+attached to that fork is not being trusted as a number (still the known `see_chain`
+unreliability flagged earlier in this file); the geometric fact of the double attack is what
+was verified and is what's real. The position after move 15 was worse for White than the
+live-play entry above already documented, and the only reason it surfaced now is that the
+line was calculated as a whole instead of reacted to one ply at a time.
+
+**Folded into the `position-eval` skill directly** (`.claude/skills/position-eval/`) as a
+new required step for sharp/unclear positions: enumerate forcing branches with
+`forcing_moves.nu`, walk chosen lines with `calc_line.nu` to a quiet position, *then* apply
+the skill's static material/king-safety/structure/activity method to that resulting
+position. Calculation gets you to the position worth judging; it doesn't replace the
+judging, and the tools still never rank or score anything — every branching decision stays a
+reasoned judgment call, same as before.
+
+Verified: both scripts run cleanly against the live plugin (`chessdb apply-uci`,
+`chessdb legal-moves`, `chessdb hugm-eval --verbose true`, all already-shipped commands —
+no Rust changes this entry). `forcing_moves.nu` correctly reduced 37 legal moves at the
+pre-`14...Nxc4` position down to exactly the 4 real captures and 0 checks; `calc_line.nu`
+correctly detected and reported an illegal-move stop condition during script development
+before being fixed, confirming the guard works, not just the happy path.
+
+---
+
+## 2026-09-02 (continued): Eleventh Fruit game — resigned on move 12 after hanging a bishop, and the cause was a reading error, not a visibility gap
+
+User clarified the actual point of these games directly: developing tools *and* judgment
+for when a fact is genuinely invisible (needs a new tool) versus when it's visible but
+uncalculated (needs deeper, deliberate calculation) versus — this game's real lesson — when
+it's visible, already surfaced by an existing tool in plain language, and simply misread.
+Relocated the live-play tools out of the session scratchpad into the repo first
+(`nu_plugin_chessdb/scripts/play/`, see its `README.md`) since they'd been sitting in a
+session-tied `/tmp` path that wouldn't survive an actual restart, only a compaction.
+
+Played `1.e4`, Fruit answered with a Scandinavian (`1...d5`), transposing after `2.exd5
+Nf6 3.c4 c6 4.Nc3 cxd5 5.cxd5 Nxd5 6.Nxd5 Qxd5 7.Nf3 Nc6 8.d4 Bf5 9.Qb3` into a fully
+calculated, verified sequence: `9.Qb3` creates a mutual attack with Black's centralized
+queen along the `b3-c4-d5` diagonal, and `9...Nxd4??` was checked and confirmed (via
+`calc_line.nu`) to lose the queen outright to `10.Qxd5`, since nothing defends the queen
+once the knight moves away from the diagonal. Black correctly avoided that and traded,
+`9...Qxb3 10.axb3`, reaching a sound, level position — doubled White b-pawns as a real
+long-term factor, offset by an open a-file and a clear development lead.
+
+**The actual blunder, move 11:** `10...Be4` centralized Black's bishop, attacking `Nf3`
+(safely defended by `g2`). `check_move.nu` on the candidate `11.Bd3` printed
+`HANGING: Bishop@d3 value=330 safe_to_capture=true` — this was read as "an even trade,
+Black captures and I've lost nothing," by direct (and wrong) analogy to the `9.Qb3` mutual
+attack a few moves earlier, where the *same shape* of warning had resolved into a fair
+trade. It doesn't. The load-bearing difference: in the queen case, a **third piece** (`a2`
+pawn) independently defended `b3`, giving a real recapture after `Qxb3`. In the bishop
+case, nothing else White owned reached `d3` at all — checked by hand afterward: no rook,
+king, knight, or pawn attacks that square. `safe_to_capture=true` on a candidate's own
+resulting position already answers the only question that matters ("can this be captured
+with no recapture") directly and unconditionally; treating it as ambiguous by pattern-
+matching to a structurally different earlier position was the entire error. Fruit played
+`11...Bxd3`, and there was no recapture — confirmed directly (`chessdb apply-uci` replay +
+`hugm-eval`): `-958cp`, a clean bishop down, bishop pair now Black's, zero compensation
+(Black's king not exposed, nothing of White's touches the piece, it retreats next move
+uncontested). Cross-checked against `fruit_analyze.sh`'s own search: score sat near `-53`
+(White-relative) through move 10, then crashed to `-392` the instant `11.Bd3` was played —
+almost exactly one bishop's value — and Fruit's own suggested move at that exact ply was
+the safe `11.Be3`, never `Bd3`. Resigned; no realistic recovery path against real engine
+play from a clean, uncompensated piece deficit this early.
+
+**Explicitly not a tool problem.** `check_move.nu` produced the correct, unambiguous
+answer before the move was ever played — this is a genuine negative-control data point
+that the score-stripping and structural-fact discipline built up over the first ten games
+is sound; the failure mode this game exposed is a new, distinct one: overriding a plain,
+already-correct answer with a similarity-based shortcut instead of reading it as absolute.
+Fix is a reading rule, not a tool change: `safe_to_capture: true` on a candidate's own
+piece is a terminal veto by itself, full stop, regardless of whether the position
+resembles an earlier one that resolved differently — the resemblance itself is exactly
+what needs re-checking (specifically: is there an independent third defender of the
+landing square, not just symmetric mutual attack) before assuming the earlier case's
+resolution carries over.
+
+Verified: no code changes this entry (live play + `fruit_analyze.sh` postmortem +
+documentation only). The `9...Nxd4??` refutation and the `11.Bd3` blunder's lack of any
+recapture were both checked directly against `calc_line.nu`/`chessdb apply-uci` before
+being written down, not assumed from board-visualization alone — the second check is what
+caught the misread this entry describes, just one move after it happened live rather than
+during the live move itself.

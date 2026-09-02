@@ -264,6 +264,12 @@ pub struct MobilitySummary {
     pub side_to_move: String,
     pub legal_move_count: i64,
     pub mobility_san: Vec<String>,
+    /// Same legal moves, same order, in UCI form — needed by any caller that
+    /// wants to actually apply one via `chessdb apply-uci` (which only
+    /// accepts UCI), e.g. a breadth-first "what does the opponent have here"
+    /// visualizer that enumerates real replies without searching/ranking
+    /// them (FINDINGS.md, 2026-09-01).
+    pub mobility_uci: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -467,16 +473,21 @@ pub fn mobility_summary(fen_str: &str, span: Span) -> Result<MobilitySummary, La
     let pos = fen_to_chess(fen_str, span)?;
     let side_to_move = side_to_move_string(&pos);
 
-    let mobility_san = pos
-        .legal_moves()
+    let legal_moves = pos.legal_moves();
+    let mobility_san = legal_moves
         .iter()
         .map(|mv| San::from_move(&pos, *mv).to_string())
+        .collect::<Vec<_>>();
+    let mobility_uci = legal_moves
+        .iter()
+        .map(|mv| UciMove::from_move(*mv, shakmaty::CastlingMode::Standard).to_string())
         .collect::<Vec<_>>();
 
     Ok(MobilitySummary {
         side_to_move,
         legal_move_count: mobility_san.len() as i64,
         mobility_san,
+        mobility_uci,
     })
 }
 

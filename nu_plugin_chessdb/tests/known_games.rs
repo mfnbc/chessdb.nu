@@ -39,7 +39,7 @@
 //   (lichess.org/study/cpuqVg6h/u0Ppk2Ul.pgn, study by CPCurley), matching
 //   a chess.com blog's independently-quoted first 26 moves exactly.
 
-use nu_plugin_chessdb::eval::{analyze_fen, Consequence, Side};
+use nu_plugin_chessdb::eval::{analyze_fen, render_explanations, render_structured_explanations, Consequence, Side};
 use shakmaty::fen::Fen;
 use shakmaty::san::San;
 use shakmaty::{Chess, EnPassantMode, Position};
@@ -344,5 +344,74 @@ fn fruit_game_four_outnumbered_knight_was_mislabeled_safe_by_the_buggy_see_chain
     assert_eq!(knight.defender_count, 1);
     assert_eq!(knight.consequence, Consequence::Winning, "must read as dangerous for White (winning for the mover), got {knight:?}");
     assert_eq!(knight.see_cp, 220, "knight(320) - pawn(100) = 220, got {}", knight.see_cp);
+}
+
+#[test]
+fn fruit_game_six_mate_in_1_was_computed_but_never_surfaced_in_explanations() {
+    // From a sixth real session-logged game against Fruit: 17.Qa5 was
+    // checked before playing it via the session's check_move.nu scratch
+    // tool, which reads `hugm-eval --verbose true`'s `.explanations` field
+    // exclusively -- the same field `render_explanations` produces. That
+    // field said nothing about a mate threat. Black replied
+    // `17...Qxh2#` (queen defended by Bd6 down the long diagonal, king
+    // boxed in by its own f1 rook and f2 pawn) -- a real, forced mate that
+    // was already fully computed and sitting on
+    // `sensor_report.mate_in_1_exists: true` for this exact position,
+    // completely invisible in the one field actually being read.
+    // `extract_concepts` did turn `mate_in_1_exists` into a `Concept`
+    // (severity 1000, checked first) -- but that only ever reaches
+    // `gated_issues`, which is gated behind `--player-elo`, never passed by
+    // this session's live-play checking. Fixed by having both
+    // `render_explanations` and `render_structured_explanations` check
+    // `sensor.mate_in_1_exists` directly, first, ahead of every other
+    // phrase -- no `--player-elo` required. See FINDINGS.md's 2026-09-01
+    // entries.
+    let fen = "r3k2r/2p2ppp/p2bp3/Qp6/3P4/2P1B2q/P1P2P2/1R3RK1 b kq - 1 17";
+    let rec = analyze_fen(fen).expect("valid FEN");
+    assert!(rec.sensor_report.mate_in_1_exists, "sensor should detect the real Qxh2# mate-in-1");
+
+    let explanations = render_explanations(&rec);
+    assert!(
+        explanations.iter().any(|e| e.contains("mate in 1")),
+        "explanations (what check_move.nu actually reads) must mention the mate threat, got {explanations:?}"
+    );
+    assert!(
+        explanations[0].contains("mate in 1"),
+        "the mate warning must be first, ahead of every other phrase, got {explanations:?}"
+    );
+
+    let structured = render_structured_explanations(&rec);
+    assert!(
+        structured.iter().any(|v| v.get("kind").and_then(|k| k.as_str()) == Some("mate_in_1")),
+        "render_structured_explanations must carry the same warning, got {structured:?}"
+    );
+}
+
+#[test]
+fn fruit_game_nine_castling_onto_a_pawnless_king_file_read_as_zero_exposure() {
+    // From a ninth real session-logged game against Fruit: White's own
+    // c-pawn was traded away at move 9 (9.cxd5 exd5, a real, justified
+    // tactical point on its own -- it opened a genuine fork on both black
+    // knights). Three moves later, 12.O-O-O castled the king onto that
+    // exact file, now completely pawnless, while `shelter_files` still read
+    // 2 (b2 and d4 each count as "a pawn somewhere on an adjacent file",
+    // even though d4 is two ranks removed and b2 is a flank file) --
+    // king_exposure fired empty, reading as zero exposure, at the exact
+    // moment White's king landed on a file a rook could walk straight down.
+    // It did, several moves later, and the resulting attack was a real
+    // contributor to the loss (the other being a separate, later blunder;
+    // FINDINGS.md's 2026-09-02 entries cover both). Fixed by giving the
+    // king's own file a dedicated, stricter signal instead of averaging it
+    // into the 3-file flank tally: `king_file_open` fires whenever the
+    // king's own file has no friendly pawn on it at all, regardless of what
+    // the two flank files look like.
+    let fen = "r1bqr1k1/ppp2p1p/2n5/3p2p1/3Pn3/P3BN2/1PQ1PPPP/2KR1B1R b - - 3 12";
+    let rec = analyze_fen(fen).expect("valid FEN");
+    let ke = rec.sensor_report.positional.king_exposure
+        .as_ref()
+        .unwrap_or_else(|| panic!("king_exposure should fire once the king's own file has no pawn on it, got None"));
+    assert_eq!(ke.color, Side::White);
+    assert!(ke.king_file_open, "White's king is on c1 with no pawn anywhere on the c-file, got {ke:?}");
+    assert_eq!(ke.shelter_files, 2, "b2 and d4 each still count toward the 3-file flank tally -- this is exactly the case that tally alone can't distinguish from real shelter, got {ke:?}");
 }
 

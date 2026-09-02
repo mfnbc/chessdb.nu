@@ -437,6 +437,18 @@ pub struct KingExposure {
     pub color: Side,
     pub shelter_files: u8,
     pub attacker_count: u8,
+    /// True when the king's own file (not a flank file) has no friendly
+    /// pawn anywhere on it — a direct, open line for a rook/queen straight
+    /// at the king, and a materially different danger than a flank file
+    /// being open. `shelter_files` alone can't distinguish the two: 2 of 3
+    /// files having a pawn *somewhere* reads as "sheltered" even when the
+    /// file directly in front of the king is completely bare, because the
+    /// other two are flank files that matter far less. Caught the hard way
+    /// (FINDINGS.md, 2026-09-02): castling onto a king's own file already
+    /// voided of its pawn a few moves earlier read as zero exposure right
+    /// up until a rook walked straight down it — a real game lost partly to
+    /// this exact detector gap.
+    pub king_file_open: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
