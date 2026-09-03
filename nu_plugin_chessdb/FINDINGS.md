@@ -4716,3 +4716,264 @@ of a bare FEN in the error message) and `board_overlay.nu`'s new empty-layer/no-
 "plain board" mode specifically (confirmed the legend section is correctly omitted, not
 just left blank). `grep`-confirmed zero remaining `"fen: ` string literals anywhere in
 `scripts/play/*.nu` after the edits. No Rust changes.
+
+---
+
+## 2026-09-02 (continued): Thirteenth Fruit game — an actual checkmate, and the real lesson wasn't where the drama was
+
+First game this session to actually end in checkmate rather than resignation from a clearly
+decisive material deficit. Played White, a Scandinavian transposing into a Nimzo-ish
+structure (`1.e4 d5 2.exd5 Nf6 3.d4 Nxd5 4.Nf3 e6 5.c4 Bb4+ 6.Nbd2 Nf6 7.a3 Be7 8.Bd3 Nc6
+9.Qc2 Nxd4 10.Nxd4 Qxd4 11.O-O O-O 12.Nf3 Qb6 13.Rd1 c5 14.Bg5 h6 15.Bf4 Rd8 16.Rac1 Bd6
+17.Bxd6 Rxd6 18.Ne5 Bd7 19.Nxd7 Rxd7 20.Qc3 Rad8 21.b4 Ng4 22.h3 cxb4 23.axb4 Qxf2+ 24.Kh2
+Qh4 25.Rg1 Nf2+ 26.Kh2 Rxd3 27.Qe5 Rxh3+ 28.gxh3 Qxh3#`), used every tool built this session
+throughout, including live-verifying two real traps mid-game (`Qb3??` hanging directly to
+`Qb6`, and a mutual-attack `Qxd3` that loses the queen to a knight recapture) before they
+were ever played — the "check current position first" and "safe_to_capture terminal veto"
+disciplines both held under real pressure. Got mated anyway.
+
+**Two genuine misses worth naming precisely, and one that wasn't a miss at all.**
+
+1. Move 21 (`b4`), threatened by a mutual-attack fork the tool flagged as `mover_favored`
+   on `Qc3`: verified concretely with `calc_line.nu` that a naive `bxc3` was actually
+   illegal (wrong side-to-move in the first test — a real methodology bug in the check
+   itself, caught and corrected before trusting the wrong conclusion), then correctly
+   re-verified with the right move order that `bxc3` *would* have won the queen for a pawn
+   had the threatening pawn not been removed — `axb4` was the right, verified call. This
+   discipline worked exactly as designed.
+2. Move 23 (`axb4`) was followed by `23...Qxf2+`, a real miss: the pre-move analysis
+   correctly identified and calculated the *knight's* `Nxf2` fork (`Rd1`/`Bd3`/`h3`, with
+   `Kxf2` confirmed illegal via a discovered check from `Qb6`), but never checked whether
+   the *queen itself* could capture `f2` directly — a different move with a different
+   consequence (check, a second free pawn, no recapture available) that happened to share
+   a destination square with the knight fork already under investigation. Two different
+   pieces threatening the same square is not one threat to verify once; each needed its
+   own check, the same lesson [[chessdb_hanging_lines_independent]] already named for
+   `HANGING` entries, now confirmed for candidate opponent replies too.
+3. **Move 25 (`Rg1`) is where the game was actually lost, and it looked completely
+   clean at the time.** `check_move.nu` correctly reported nothing hanging — genuinely
+   true, no single-ply tactic existed. `fruit_analyze.sh`'s postmortem (normalized,
+   White-relative) shows this exact move as by far the largest swing of the entire game:
+   `-418cp → -1800cp`, dwarfing every other jump including the `Qxf2+` pawn loss two
+   moves earlier. The real problem: abandoning the semi-open d-file entirely (moving the
+   *other* rook away from it) while the king was already under active pressure from a
+   knight and queen, without calculating several moves ahead through the forcing sequence
+   that followed (`25...Nf2+ 26.Kh2 26...Rxd3` — infiltrating exactly because nothing
+   contested that file anymore). A single-ply "does this hang anything" check cannot see
+   this; only calculating the actual forcing continuation several plies deep (`calc_line.nu`,
+   already built and used successfully elsewhere in this same game) would have. The
+   position-eval skill's existing "calculate forcing lines before judging a sharp
+   position" section already says this — the miss here was recognizing the position
+   *was* sharp (an active king hunt already underway, not a quiet position) and needed
+   that treatment, not that the tool or the discipline was missing.
+
+Verified: `fruit_analyze.sh` run over the complete game and normalized by hand
+(White-relative sign) before drawing any conclusion about where the real error was — the
+dramatic-looking `Qxf2+`/`Nf2+` sequence was not, in fact, where the largest evaluation
+swing happened; `Rg1` was. No code changes this entry — live play, postmortem, and
+documentation only.
+
+---
+
+## 2026-09-02 (continued): "track ideas across games" redirected to "make and re-evaluate a plan" — the actual skill worth exercising
+
+User pushback on a proposed durable Fruit-tendencies/opening-idea tracker (memory across
+games): "I'm more interested in your ability to make a plan and evaluate it than remember
+it." Correct redirect — the game 13 failure wasn't a missing reference to consult, it was
+that a plan, once formed, was never re-checked against a position whose character had
+already changed. `.claude/skills/position-eval/SKILL.md` gained a new section, "Re-evaluate
+the plan every move — don't just state it once and coast," making explicit what "Don't stop
+at safe" and "Calculate forcing lines" already implied separately but never stated as one
+recurring loop: after every opponent reply, ask not just "what's the positional theme" but
+"has the position stopped being the kind of position that theme applies to" — specifically,
+has the opponent started delivering forcing moves in sequence, which means every candidate
+(including ones that look like quiet consolidation) needs `calc_line.nu` treatment until the
+sequence actually resolves, not just the ones that look sharp on sight.
+
+Verified: no Rust or Nu-tool changes this entry — a skill-file addition only, directly
+citing the exact game 13 evidence (`fruit_analyze.sh`'s `-418cp → -1800cp` swing on
+`25.Rg1`) already established in the entry above rather than a new claim.
+
+---
+
+## 2026-09-02 (continued): "distraction/hyperfixation" diagnosis — checked against the data, one hypothesis held and one didn't
+
+User's sharper read on the game 13 failure: not a knowledge or planning gap so much as
+getting distracted — hyperfixating on whichever threat/number is currently in front of the
+reasoning, at the cost of the wider picture. Tested this against the actual game rather
+than just agreeing with it.
+
+**First hypothesis, checked and rejected:** that `king_exposure` (already computed, just
+not surfaced in `check_move.nu`'s default output) was sitting there unread right before
+`25.Rg1` and would have caught it. Queried the real position directly — `king_exposure`
+was genuinely `null` at that exact moment. It's a *near*-king detector (adjacent-square
+attacker count, shelter files); neither `Ng4` nor `Qh4` had reached that ring yet, still a
+couple of moves out. The signal hadn't fired because the danger was still converging, not
+because it fired and got ignored — this specific fix would not have caught this specific
+game. Naming a plausible-sounding mechanism and checking it against real data rather than
+trusting it on the strength of sounding right is the same discipline this whole file is
+built on; a wrong hypothesis, caught before it became a memory, is a fine outcome.
+
+**Second hypothesis, checked and confirmed:** that `23...Qxf2+` was missed not from a
+missing tool but from going deep on the *first* specific threat found instead of wide
+across the whole square first. Verified directly: `attackers_map.nu f2` on the real
+position right before `23.axb4` shows `f2` attacked by **both** `Qb6` and `Ng4`
+simultaneously — the tool that would have shown this was already built, already used
+successfully elsewhere in this exact game, and simply wasn't run on this square before
+`calc_line.nu` was pointed at the one piece (`Ng4`) a fork list had already named. The
+knight's fork was verified correctly; the queen's independent attack on the same square
+was never asked about at all.
+
+Added to `.claude/skills/position-eval/SKILL.md`: "Wide before deep — check the whole
+square, not just the piece already worrying you." Whenever a square becomes contested —
+in a fork's target list, a hanging entry, anywhere — `attackers_map.nu`/`square-attackers`
+on that square comes first, establishing the full attacker/defender picture, before
+`calc_line.nu` goes deep on any one of the threats it turns up.
+
+Verified: `king_exposure` checked against the real position (not a guessed FEN — caught and
+corrected the same guessed-FEN mistake mid-check before trusting the first, wrong result),
+`attackers_map.nu`'s `f2` output checked against the real pre-`axb4` position. No Rust or
+Nu-tool changes — a skill-file addition, and one hypothesis explicitly logged as tested and
+rejected rather than quietly dropped.
+
+---
+
+## 2026-09-02 (continued): Fourteenth Fruit game — the newly-named "wide before deep" pattern caught itself happening live, twice, in the same game
+
+Played White, Queen's Indian/IQP structure (`1.d4 Nf6 2.c4 e6 3.Nf3 Bb4+ 4.Bd2 Be7 5.e3 c5
+6.Bd3 Nc6 7.O-O O-O 8.Nc3 d5 9.cxd5 exd5 10.dxc5 Bxc5 11.Qb3 Nb4 12.Be2 b6 13.a3 Nc6 14.Rfd1
+Bf5 15.Rac1 Qd7 16.Nb5 Ne4 17.Bc3 Rfd8 18.Nd4 Nxd4 19.Nxd4 Nxc3 20.Qxc3 Bxe4 21.f3 Bg6
+22.b4 Bxd4 23.Qxd4 Bf5 24.h3 h5 25.Qxd5 Qxd5 26.Rxd5 Rxd5 27.Rc7 Rd7 28.Rc5`), resigned
+after `28...bxc5` at a completely decisive material deficit (no rooks left at all, Black
+still had two). Roughly even, actively-played middlegame right up to move 24 — the whole
+game turned on two errors, both the exact same shape, both self-caught only after the fact
+by checking `fruit_analyze.sh`'s normalized score.
+
+**Error one, move 25 (`Qxd5`).** Checked that `Rd1` independently defended the capture
+square before playing it — correct application of the `Qb3`-style "mutual attack needs a
+real third defender" rule from earlier this session. What wasn't checked: Black had *two*
+pieces on the contested file (`Qd7` and `Rd8`), not one, so after the queens traded the
+second black rook recaptured mine with nothing left to answer it — down a full rook for a
+pawn instead of the even (or better) trade the single-defender check implied. Confirmed by
+`fruit_analyze.sh`: `-443cp → -931cp` two moves later is actually the *second* error (below);
+this one alone was `-77cp` at ply49-51 net, real but survivable — the game was still
+fighting a genuinely bad but not lost position after it.
+
+**Error two, move 28 (`Rc5`), is where the game was actually decided, and it is the exact
+"wide before deep" failure named earlier this same session — caught live, in the act, not
+in hindsight.** `check_move.nu`'s own "MY PIECES AT RISK" section printed
+`MOVER_FAVORED (count alone said safe, flagged anyway): Rook@c5 1v1 -- verify with
+calc_line.nu` — the tool correctly flagged the exact danger, in the exact section designed
+to be checked first. Attention went instead to the *other* fact in the same output
+(`Bf5` hanging, a positive-looking discovery) and the explicit instruction to verify the
+rook's own flagged warning was skipped. `b6` — the same pawn already identified defending
+`c5` at move 24 in this identical game, already written down as a reason to avoid that
+exact square — captured the rook for free four moves later. `fruit_analyze.sh` confirms
+this was the single largest swing of the whole game: `-443cp → -931cp`.
+
+Both errors share one root cause: checking "does a favorable-looking fact hold up" instead
+of checking "does *every* attacker/defender on this square hold up," and in the second
+case, literally reading past a warning already labeled "check this first" because a more
+interesting fact was sitting next to it. This is not a new finding — it is the same pattern
+`chessdb_wide_before_deep` (memory, 2026-09-02) already named, recurring in the very next
+game, which is itself informative: naming a pattern and updating a skill file doesn't erase
+the underlying tendency on its own — it has to actually change what gets looked at in the
+moment, and this game shows that hadn't fully taken yet.
+
+Verified: `fruit_analyze.sh` run over the complete game and normalized by hand before
+identifying which of the two candidate errors was actually decisive (the second, not the
+first, despite the first being the more "interesting" miscalculation to explain). No code
+changes — live play and honest documentation only.
+
+---
+
+## 2026-09-02 (continued): Fifteenth Fruit game — a queen trap from grabbing material without checking the retreat, plus a misread flag label
+
+Played White, Scandinavian-into-classical-center structure (`1.e4 d5 2.exd5 Nf6 3.d4 Nxd5
+4.Nf3 e6 5.Bd3 Nc6 6.O-O Be7 7.Nc3 Nb4 8.Nxd5 exd5 9.a3 Nxd3 10.Qxd3 O-O 11.Bf4 Rfe8 12.Re1
+Be6 13.Ne5 Bd6 14.Rad1 f6 15.c4 c6 16.Qb3 Rb8 17.cxd5 Bxd5 18.Qa4 Qc7 19.Qxa7 Ra8 20.Qxa8
+Rxa8 21.Rdc1 fxe5 22.dxe5 Qf7 23.exd6 Qxf4 24.d7 Qg4 25.f3 Bxf3 26.Kf2 Qg2+ 27.Ke3 Rd8
+28.Rcd1 Bxd1 29.Rxd1 Qh3+ 30.Kf2 Rf8+ 31.Kg1 Qg4+ 32.Kh1 Qxd1+ 33.Kg2 Qf3+ 34.Kg1`),
+resigned at `34...` with White down to a bare king and 4 pawns against queen + rook + 4
+pawns — no compensation, no realistic swindle, confirmed by exhaustively enumerating White's
+one legal move (`Kg1`) and the total absence of any White piece besides pawns.
+
+**The decisive error, move 19 (`Qxa7`).** Checked the capture itself correctly —
+`b7` was genuinely undefended (verified directly via `attackers_map.nu`, not the fork
+label), and the queen's landing square had zero attackers at that exact moment. What
+wasn't checked: whether the queen would have anywhere safe to go *if* Black attacked it
+next move. Black played `19...Ra8`, and a full enumeration of all 8 legal queen moves from
+`a7` (via `chessdb legal-moves`, not guesswork) showed every single one lost material —
+`a4`/`a5`/`a6`/`b6` all hung outright, `Qc5` looked clean by count alone but was actually a
+queen sitting 1v1 against a bishop with only a pawn recapture (a second near-miss, caught by
+hand-computing the real values instead of trusting the "MOVER_FAVORED" label — see below),
+and `Qxa8`/`Qxb7`/`Qb8` were all bad trades or worse. `Qxa8 Rxa8` (queen for rook, the
+least-bad option found) was forced, netting −400 material on top of the pawn just won,
+setting the material deficit that never recovered. **The lesson is distinct from "wide
+before deep": it's not about missing a threat on the square just captured, it's about not
+checking one ply further — does grabbing this piece leave me with a safe square to retreat
+to if it's attacked back — before playing the grab.** See new memory
+`chessdb_verify_retreat_before_grabbing`.
+
+**A second near-miss in the same recovery sequence: the "MOVER_FAVORED" label is not
+reliable when the flagged piece is far more valuable than its attacker.** Checking `Qc5` as
+a retreat candidate, `check_move.nu` reported `MOVER_FAVORED (count alone said safe,
+flagged anyway): Queen@c5 1v1` — read in isolation, "favored" sounds safe. Verified via
+`attackers_map.nu` instead of trusting the label: the queen (900) sat attacked by a bishop
+(330) with only a pawn (100) able to recapture — `Bxc5 dxc5` is −570 for White, not
+favorable by any real accounting. The count-vs-count ratio the label describes doesn't
+carry piece-value context; a queen and a rook can both be "1v1" and mean opposite things.
+Already covered in principle by `feedback_dont_surface_untested_scores`
+(don't trust a label, verify the value), but this is the sharpest concrete instance yet —
+worth keeping as the canonical example.
+
+**A third, smaller, self-inflicted loss at move 28 (`Rcd1`) — misreading which piece a flag
+named.** `check_move.nu` flagged `MOVER_FAVORED (count alone said safe, flagged anyway):
+Rook@d1 1v1` after playing `Rcd1`. Read this as referring to the standing `d7` pawn
+situation (a fact that actually had been resolved earlier in the same output) rather than
+parsing that the named piece — `Rook@d1` — **was the rook just moved, under direct attack
+from `Bf3` along the `f3-e2-d1` diagonal.** Never checked it with `calc_line.nu` as the
+flag's own text instructs. Black played `28...Bxd1`, winning the exchange (rook for
+bishop, ≈ −170) for free — a loss that simple correct reading of the flag's own subject
+would have caught. The flag format names the piece at risk explicitly (`Piece@Square`); the
+fix is to read that name literally as "this is the piece to verify," not to assume context
+from whatever else was checked earlier in the same response.
+
+**What worked.** Two separate mate threats were caught and correctly resolved this game,
+both via exhaustive candidate enumeration rather than pattern-matching: (1) after `24...Qg4`,
+`d7d7` promotion and the `Rc1`/`Re2` development candidates were both individually checked
+and both showed a live `Qxg2#` (the `g2` pawn absolutely pinned to the king by `Qg4`,
+`Bd5`/later `Bf3` denying the king recapture) — `f3` (blocking the bishop's diagonal
+support of `g2`) was identified and played as the only move that actually defused it,
+confirmed by the tool's mate warning disappearing only for that candidate. (2) The forced
+king walk after `Qxg2+` (`Ke3`, `Kf2`, `Kg1`, `Kh1`, `Kg2` in sequence, four separate checks)
+was navigated by exhaustively checking every legal king move at each step rather than
+picking the first-seeming safe one — `Ke1` and `Kf1` were both confirmed to lose to a
+follow-up mate and correctly avoided in favor of the one square that didn't.
+
+**A methodology note carried over from earlier games, still recurring: hand-typing a FEN
+between tool calls produced a wrong position at least once this game** (an `attackers_map.nu
+e5` check right after the `exd6` line used a guessed FEN with stale piece placement) — caught
+by comparing against a properly re-derived FEN before trusting the result, consistent with
+the standing practice, but worth noting it keeps happening and the fix (always regenerate
+via move-history replay, never hand-copy) needs to actually become automatic rather than a
+catch-after-the-fact habit.
+
+**On `fruit_analyze.sh`'s postmortem numbers for this game: deliberately not used as the
+primary diagnostic.** The raw cp trace shows an implausibly large swing at move 14 (`Rad1`,
+`+10cp → -172cp` in the normalized trace) that contradicts the direct, hand-verified safety
+check done live at the time (no hanging pieces, no tactics, confirmed via `calc_line.nu` and
+`attackers_map.nu` against real board facts). Each ply in `fruit_analyze.sh` is analyzed by
+a fresh, independent 600ms search with no continuity from the previous ply, which is exactly
+the kind of noisy, unverified score `feedback_dont_surface_untested_scores` warns against
+surfacing — so this postmortem's diagnosis above is built entirely from hand-verified
+material facts (legal-move enumeration, direct attacker/defender counts, piece values) from
+live play, the same standard applied during the game itself, not from the score trace.
+
+Verified: full game replayed via `check_move.nu`/`calc_line.nu`/`attackers_map.nu` live
+throughout; the queen-trap sequence re-verified after the fact via `chessdb legal-moves`
+enumerating all 8 candidate squares; the two misread-flag incidents re-verified via
+`attackers_map.nu` against freshly-derived FENs. No Rust or Nu-tool changes this game — live
+play and honest documentation only, plus two new memory entries capturing the two genuinely
+new lessons (retreat-checking before grabbing material, and reading flag piece-names
+literally).

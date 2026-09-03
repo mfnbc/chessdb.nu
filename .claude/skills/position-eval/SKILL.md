@@ -212,3 +212,68 @@ reroute, a knight that wants an outpost), or a weak square/color complex to occu
 A concrete plan generates and ranks candidates on its own; without one, move selection
 degrades back into "pick whatever doesn't lose material," which is the exact failure this
 section exists to name.
+
+## Re-evaluate the plan every move — don't just state it once and coast
+
+Game 13 (2026-09-02, FINDINGS.md) got checkmated after playing every individual move
+cleanly by `check_move.nu`'s own standard. The actual failure wasn't a missing tactic on
+any one move — it was having no standing plan to check moves *against*, so nothing ever
+prompted noticing that the position's whole character had changed. Consolidating with
+`25.Rg1` (abandoning the only file contesting a rook, while the king was already under a
+coordinated knight+queen attack) looked like ordinary, safe housekeeping in isolation. It
+was the single largest evaluation swing of the entire game (`fruit_analyze.sh`,
+`-418cp → -1800cp`) — invisible to a single-ply safety check, and invisible to a plan that
+was never re-examined after the position turned sharp.
+
+**The fix: after every opponent reply, before picking a candidate, explicitly ask two
+questions, not just one.** (1) The usual: what does structural analysis say is the theme
+here (section 2 above)? (2) The one that was missing: *has the position's character
+itself changed since the plan was last stated* — specifically, has the opponent started
+delivering forcing moves (checks, threats requiring an immediate response) in sequence,
+rather than one isolated tactic? If so, the standing positional plan is no longer the
+right frame at all — the position needs
+[forcing-line calculation](#calculate-forcing-lines-before-judging-a-sharp-position-dont-react-one-move-at-a-time)
+applied to *every* candidate under consideration, including ones that look like quiet
+consolidation, until the forcing sequence actually resolves into a genuinely quiet
+position again. A plan formed for a quiet position doesn't automatically stay valid once
+the position stops being quiet — that transition has to be noticed on purpose, every
+move, not assumed away because the plan already existed.
+
+## Wide before deep — check the whole square, not just the piece already worrying you
+
+Game 13's `23...Qxf2+` (FINDINGS.md, 2026-09-02) wasn't a missing-tool problem, and it
+wasn't really a missing-calculation problem either — `calc_line.nu` correctly verified the
+*knight's* `Nxf2` fork before that move was played. The actual failure: `f2` was attacked
+by *two* black pieces at once (`Qb6` and `Ng4`), `attackers_map.nu`/`square-attackers`
+would have shown both side by side in one call, and it was never run — attention went
+straight from "a fork was flagged" into verifying that one specific piece's threat, never
+back out to the more basic question of what, in total, attacks the square in play. This is
+the general failure pattern behind more than one incident this session (also see the
+`Bd3`/`Bxh3` "HANGING lines can be independent facts" findings): getting pulled deep into
+the first specific threat presented, instead of surveying the square/piece widely first
+and only then going deep on whichever of the (possibly several) real threats it turns up.
+
+**The fix: whenever a square becomes contested — named in a fork's target list, a hanging
+entry, or anywhere else — run `attackers_map.nu`/`square-attackers` on *that square*
+first, before calculating any single piece's specific line.** Not "does the piece I'm
+already worried about actually threaten this" — "what, in total, attacks or defends this
+square, from every piece on the board." Only once that full picture exists does it make
+sense to calculate any one of the threats it reveals in depth with `calc_line.nu`. Going
+deep before going wide can verify a real threat correctly and still miss a second, larger
+one sitting on the exact same square.
+
+**This recurred the very next game (Game 14, 2026-09-02), in a sharper form worth naming
+specifically: `check_move.nu`'s "MY PIECES AT RISK" section had *already* printed the
+exact warning needed — `MOVER_FAVORED ... Rook@c5 ... verify with calc_line.nu` — and it
+was still skipped, because a different, more interesting-looking fact (an enemy bishop
+hanging) sat in the same output and pulled attention there instead.** That section is
+labeled "check this first" and ordered first for exactly this reason; reading past a
+warning already surfaced about one of *my own* pieces because something more exciting is
+sitting nearby is the same distraction pattern as not running the wide check at all — it's
+actually worse, since the tool had already done the wide-checking work and named the exact
+danger. **Rule, not just for new squares: any `HANGING`/`OUTNUMBERED`/`MOVER_FAVORED`
+entry on my own piece in "MY PIECES AT RISK" gets resolved — via `calc_line.nu`, as the
+line itself says — before reading anything else in that output, full stop, regardless of
+what else the output also contains.** A skill section being written down once does not
+make the underlying tendency stop on its own; it has to actually change which line gets
+read first, every time, including the next time it's tempting not to.
