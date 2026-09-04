@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 use nu_protocol::{LabeledError, Span};
 use pgn_reader::{RawTag, Reader, SanPlus, Skip, Visitor};
 use shakmaty::{
+    attacks,
     fen::Fen,
     san::San,
     uci::UciMove,
@@ -279,44 +280,6 @@ pub struct PieceOnSquare {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SquareControl {
-    pub square: String,
-    /// None if the square is empty — there's nothing to compute control
-    /// from, geometric attack generation always starts from an occupied
-    /// square.
-    pub piece: Option<PieceOnSquare>,
-    /// Every square this one piece geometrically controls — occupied-aware
-    /// for sliding pieces (a piece behind a blocker doesn't count), but
-    /// deliberately independent of whose turn it is, check, and pins. This
-    /// is raw board control ("what does this piece see"), not legal
-    /// mobility ("what can this piece actually play right now") — the two
-    /// differ whenever the piece is pinned or it isn't its side's move.
-    /// Includes squares held by the piece's own side (what it defends) and
-    /// by the opponent (what it attacks) alike — the caller distinguishes
-    /// those by cross-referencing the board itself.
-    pub controls: Vec<String>,
-    /// True for a light square (a1, h8, ...), false for dark — a genuine
-    /// geometric fact (bishop color-complex reasoning: a light-squared
-    /// bishop can never contest a dark square) present regardless of
-    /// whether the square is occupied.
-    pub is_light: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SquareAttackers {
-    pub square: String,
-    /// Every white/black piece (of either side) that attacks this square —
-    /// the reverse question from `SquareControl::controls` ("what attacks
-    /// this square" vs. "what does the piece on this square see"), and the
-    /// more directly useful one for "is it safe to move a piece here":
-    /// occupancy-aware, turn-independent, works on an empty square just as
-    /// well as an occupied one (`Board::attacks_to` takes the target square
-    /// and an explicit attacking color, not a piece that has to be there).
-    pub attacked_by_white: Vec<String>,
-    pub attacked_by_black: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CheckerSummary {
     pub side_to_move: String,
     pub is_check: bool,
@@ -518,9 +481,14 @@ pub fn mobility_summary(fen_str: &str, span: Span) -> Result<MobilitySummary, La
     let side_to_move = side_to_move_string(&pos);
 
     let legal_moves = pos.legal_moves();
+    // `San::from_move` deliberately omits the +/# suffix; `SanPlus::from_move`
+    // plays the move on a clone to compute it. A bare `San` here silently
+    // made every forcing_moves.nu "CHECKS"/"CHECKMATE AVAILABLE" query return
+    // empty forever (2026-09-03, found while cross-verifying the nuon
+    // migration against a known Fool's Mate position — see FINDINGS.md).
     let mobility_san = legal_moves
         .iter()
-        .map(|mv| San::from_move(&pos, *mv).to_string())
+        .map(|mv| shakmaty::san::SanPlus::from_move(pos.clone(), *mv).to_string())
         .collect::<Vec<_>>();
     let mobility_uci = legal_moves
         .iter()
@@ -535,6 +503,30 @@ pub fn mobility_summary(fen_str: &str, span: Span) -> Result<MobilitySummary, La
     })
 }
 
+#[cfg(test)]
+mod mobility_summary_tests {
+    use super::*;
+
+    #[test]
+    fn checking_and_mating_moves_carry_their_san_suffix() {
+        // Fool's Mate: 1.f4 e5 2.g4 Qh4# -- a bare `San::from_move` (the
+        // bug this test guards against) renders this "Qh4" with no "#",
+        // which silently made forcing_moves.nu's whole CHECKS/CHECKMATE
+        // detection return empty forever (found 2026-09-03 while
+        // cross-verifying its nuon-migration output against this exact
+        // known position).
+        let fen = "rnbqkbnr/pppp1ppp/8/4p3/5PP1/8/PPPPP2P/RNBQKBNR b KQkq - 0 2";
+        let result = mobility_summary(fen, Span::test_data()).expect("valid fen");
+        assert!(result.mobility_san.contains(&"Qh4#".to_string()), "{:?}", result.mobility_san);
+
+        // A non-mating check also needs its suffix: 1.e4 d6 2.Bb5+ (the
+        // d-pawn move vacates d7, opening the whole b5-e8 diagonal).
+        let fen2 = "rnbqkbnr/ppp1pppp/3p4/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2";
+        let result2 = mobility_summary(fen2, Span::test_data()).expect("valid fen");
+        assert!(result2.mobility_san.contains(&"Bb5+".to_string()), "{:?}", result2.mobility_san);
+    }
+}
+
 fn role_name(role: Role) -> &'static str {
     match role {
         Role::Pawn => "Pawn",
@@ -546,65 +538,284 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-/// Every square one specific piece geometrically controls, board-occupancy
-/// aware — the primitive behind a "what does this piece actually see"
-/// spatial view, so that question is answered by the same tested move-
-/// generation the rest of this crate relies on rather than by re-deriving
-/// file/rank/diagonal offsets by hand at the call site (the exact class of
-/// arithmetic slip that hung a bishop in live play, FINDINGS.md,
-/// 2026-09-02 — "reasoning based on visibility" instead of mental
-/// geometry, per the user's own framing of that request).
-pub fn square_control(fen_str: &str, square_str: &str, span: Span) -> Result<SquareControl, LabeledError> {
-    let pos = fen_to_chess(fen_str, span)?;
-    let sq: Square = square_str.parse().map_err(|e| {
-        LabeledError::new(format!("Invalid square '{square_str}': {e}"))
-            .with_label("expected algebraic notation, e.g. 'e4'", span)
-    })?;
+// ===========================================================================
+// Leaf layer (2026-09-03): a close-to-1:1 translation of shakmaty's own
+// geometry/board-state functions into nuon, replacing rust-side composition
+// (square_control/square_attackers/square_swap_list/board_probe above) with
+// nushell-side composition built from these leaves. Explicit user direction:
+// "basically translating [shakmaty's] output to nuon, and accepting their
+// output as nuon ... instead of a skill asking the plugin for the right
+// questions, a tree of reports [is] compiled ... in nushell." See
+// `chessdb_shakmaty_1to1` memory / FINDINGS.md for the full rationale.
+//
+// `occupied` is always an explicit input here, exactly matching shakmaty's
+// own function signatures — never implicitly "the real board's current
+// occupancy." That's what lets a caller do square_swap_list's recursive
+// x-ray removal in pure nu: call geom-attacks/board-pieces with the full
+// occupancy, subtract squares with an ordinary `where` filter, call again.
+// ===========================================================================
 
-    let board = pos.board();
-    let piece = board.piece_at(sq).map(|p| PieceOnSquare {
-        role: role_name(p.role).to_string(),
-        color: match p.color {
-            Color::White => "white",
-            Color::Black => "black",
-        }
-        .to_string(),
-    });
-    let controls = board
-        .attacks_from(sq)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    Ok(SquareControl { square: square_str.to_string(), piece, controls, is_light: sq.is_light() })
+fn parse_square(square_str: &str, span: Span) -> Result<Square, LabeledError> {
+    square_str
+        .parse()
+        .map_err(|e| LabeledError::new(format!("Invalid square '{square_str}': {e}")).with_label("expected algebraic notation, e.g. 'e4'", span))
 }
 
-/// Every piece (either side) that attacks a given square — the reverse of
-/// `square_control`'s "what does this piece see." Answers "is it safe to
-/// move a piece here" directly, without needing a piece to already be on
-/// the target square: `Board::attacks_to` takes the target and an explicit
-/// attacking color, occupancy-aware, turn-independent.
-pub fn square_attackers(fen_str: &str, square_str: &str, span: Span) -> Result<SquareAttackers, LabeledError> {
+fn parse_color(color_str: &str, span: Span) -> Result<Color, LabeledError> {
+    match color_str.to_ascii_lowercase().as_str() {
+        "white" => Ok(Color::White),
+        "black" => Ok(Color::Black),
+        _ => Err(LabeledError::new(format!("Invalid color '{color_str}'")).with_label("expected 'white' or 'black'", span)),
+    }
+}
+
+fn parse_role(role_str: &str, span: Span) -> Result<Role, LabeledError> {
+    match role_str.to_ascii_lowercase().as_str() {
+        "pawn" => Ok(Role::Pawn),
+        "knight" => Ok(Role::Knight),
+        "bishop" => Ok(Role::Bishop),
+        "rook" => Ok(Role::Rook),
+        "queen" => Ok(Role::Queen),
+        "king" => Ok(Role::King),
+        _ => Err(LabeledError::new(format!("Invalid role '{role_str}'")).with_label("expected pawn/knight/bishop/rook/queen/king", span)),
+    }
+}
+
+fn parse_squares_to_bitboard(squares: &[String], span: Span) -> Result<Bitboard, LabeledError> {
+    squares.iter().map(|s| parse_square(s, span)).collect::<Result<Bitboard, _>>()
+}
+
+fn color_name(color: Color) -> String {
+    match color {
+        Color::White => "white",
+        Color::Black => "black",
+    }
+    .to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GeomAttacksResult {
+    pub square: String,
+    pub color: String,
+    pub role: String,
+    pub occupied: Vec<String>,
+    pub squares: Vec<String>,
+}
+
+/// `attacks::attacks(square, piece, occupied)` — pure geometry, no board or
+/// position involved at all. One dispatcher for every role (shakmaty's own
+/// design, not a chessdb composition): pawn/knight/king ignore `occupied`
+/// entirely, bishop/rook/queen use it for blocking. `occupied` is required
+/// (pass `[]` for a piece with nothing blocking it, e.g. a lone bishop).
+pub fn geom_attacks(square_str: &str, color_str: &str, role_str: &str, occupied_squares: &[String], span: Span) -> Result<GeomAttacksResult, LabeledError> {
+    let sq = parse_square(square_str, span)?;
+    let color = parse_color(color_str, span)?;
+    let role = parse_role(role_str, span)?;
+    let occupied = parse_squares_to_bitboard(occupied_squares, span)?;
+    let result = attacks::attacks(sq, Piece { color, role }, occupied);
+    Ok(GeomAttacksResult {
+        square: square_str.to_string(),
+        color: color_str.to_string(),
+        role: role_str.to_string(),
+        occupied: occupied_squares.to_vec(),
+        squares: result.into_iter().map(|s| s.to_string()).collect(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GeomRayResult {
+    pub a: String,
+    pub b: String,
+    pub squares: Vec<String>,
+}
+
+/// `attacks::ray(a, b)` — every square on the rank/file/diagonal through
+/// both `a` and `b` (the whole line, both directions, `a`/`b` included), or
+/// empty if they don't share one. No board needed.
+pub fn geom_ray(a_str: &str, b_str: &str, span: Span) -> Result<GeomRayResult, LabeledError> {
+    let a = parse_square(a_str, span)?;
+    let b = parse_square(b_str, span)?;
+    let result = attacks::ray(a, b);
+    Ok(GeomRayResult { a: a_str.to_string(), b: b_str.to_string(), squares: result.into_iter().map(|s| s.to_string()).collect() })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GeomBetweenResult {
+    pub a: String,
+    pub b: String,
+    pub squares: Vec<String>,
+}
+
+/// `attacks::between(a, b)` — squares strictly between `a` and `b` on a
+/// shared rank/file/diagonal (`a`/`b` excluded), empty if not aligned or
+/// adjacent. No board needed.
+pub fn geom_between(a_str: &str, b_str: &str, span: Span) -> Result<GeomBetweenResult, LabeledError> {
+    let a = parse_square(a_str, span)?;
+    let b = parse_square(b_str, span)?;
+    let result = attacks::between(a, b);
+    Ok(GeomBetweenResult { a: a_str.to_string(), b: b_str.to_string(), squares: result.into_iter().map(|s| s.to_string()).collect() })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GeomAlignedResult {
+    pub a: String,
+    pub b: String,
+    pub c: String,
+    pub aligned: bool,
+}
+
+/// `attacks::aligned(a, b, c)` — true if all three squares share a
+/// rank/file/diagonal. No board needed.
+pub fn geom_aligned(a_str: &str, b_str: &str, c_str: &str, span: Span) -> Result<GeomAlignedResult, LabeledError> {
+    let a = parse_square(a_str, span)?;
+    let b = parse_square(b_str, span)?;
+    let c = parse_square(c_str, span)?;
+    Ok(GeomAlignedResult { a: a_str.to_string(), b: b_str.to_string(), c: c_str.to_string(), aligned: attacks::aligned(a, b, c) })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BoardPiecesResult {
+    pub color: Option<String>,
+    pub role: Option<String>,
+    pub squares: Vec<String>,
+}
+
+/// `Board::occupied`/`by_color`/`by_role`/`by_piece` — the board's own
+/// piece-placement bitboards, filtered by whichever of `color`/`role` is
+/// given (neither -> every occupied square, both -> exactly `by_piece`).
+pub fn board_pieces(fen_str: &str, color_str: Option<&str>, role_str: Option<&str>, span: Span) -> Result<BoardPiecesResult, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
-    let sq: Square = square_str.parse().map_err(|e| {
-        LabeledError::new(format!("Invalid square '{square_str}': {e}"))
-            .with_label("expected algebraic notation, e.g. 'e4'", span)
-    })?;
-
     let board = pos.board();
-    let occupied = board.occupied();
-    let attacked_by_white = board
-        .attacks_to(sq, Color::White, occupied)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let attacked_by_black = board
-        .attacks_to(sq, Color::Black, occupied)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let color = color_str.map(|c| parse_color(c, span)).transpose()?;
+    let role = role_str.map(|r| parse_role(r, span)).transpose()?;
 
-    Ok(SquareAttackers { square: square_str.to_string(), attacked_by_white, attacked_by_black })
+    let bb = match (color, role) {
+        (Some(c), Some(r)) => board.by_piece(Piece { color: c, role: r }),
+        (Some(c), None) => board.by_color(c),
+        (None, Some(r)) => board.by_role(r),
+        (None, None) => board.occupied(),
+    };
+
+    Ok(BoardPiecesResult {
+        color: color_str.map(|s| s.to_string()),
+        role: role_str.map(|s| s.to_string()),
+        squares: bb.into_iter().map(|s| s.to_string()).collect(),
+    })
+}
+
+/// `Board::piece_at` — the single piece on one square, or `None` if empty.
+pub fn board_piece_at(fen_str: &str, square_str: &str, span: Span) -> Result<Option<PieceOnSquare>, LabeledError> {
+    let pos = fen_to_chess(fen_str, span)?;
+    let sq = parse_square(square_str, span)?;
+    Ok(pos.board().piece_at(sq).map(|p| PieceOnSquare { role: role_name(p.role).to_string(), color: color_name(p.color) }))
+}
+
+/// `Square::is_light` — a pure geometric fact about the square itself, no
+/// board or position dependency at all (bishop color-complex reasoning:
+/// a light-squared bishop can never contest a dark square).
+pub fn square_is_light(square_str: &str, span: Span) -> Result<bool, LabeledError> {
+    Ok(parse_square(square_str, span)?.is_light())
+}
+
+#[cfg(test)]
+mod leaf_layer_tests {
+    use super::*;
+
+    const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+    #[test]
+    fn geom_attacks_knight_matches_the_independently_established_square_control_fact() {
+        // Cross-checked against square_control_tests::
+        // knight_in_the_corner_controls_exactly_its_three_reachable_squares
+        // (an older, pre-existing test) rather than trusting this new
+        // function's own idea of the right answer. Occupied is irrelevant
+        // to a knight, passed empty on purpose.
+        let result = geom_attacks("b1", "white", "knight", &[], Span::test_data()).expect("valid input");
+        let mut squares = result.squares.clone();
+        squares.sort();
+        assert_eq!(squares, vec!["a3".to_string(), "c3".to_string(), "d2".to_string()]);
+    }
+
+    #[test]
+    fn geom_attacks_rook_on_an_open_board_covers_the_whole_rank_and_file() {
+        // A rook with nothing on the board but itself: well-known chess
+        // geometry, not something derived from this crate's own code — 7
+        // squares along the file + 7 along the rank = 14.
+        let result = geom_attacks("d4", "white", "rook", &[], Span::test_data()).expect("valid input");
+        assert_eq!(result.squares.len(), 14);
+        assert!(result.squares.contains(&"d8".to_string()));
+        assert!(result.squares.contains(&"a4".to_string()));
+        assert!(result.squares.contains(&"h4".to_string()));
+        assert!(result.squares.contains(&"d1".to_string()));
+    }
+
+    #[test]
+    fn geom_attacks_rook_stops_at_the_given_occupied_blocker() {
+        let open = geom_attacks("d1", "white", "rook", &[], Span::test_data()).expect("valid input");
+        assert!(open.squares.contains(&"d8".to_string()));
+        let blocked = geom_attacks("d1", "white", "rook", &["d4".to_string()], Span::test_data()).expect("valid input");
+        assert!(blocked.squares.contains(&"d4".to_string()), "the blocker square itself is still reachable/capturable");
+        assert!(!blocked.squares.contains(&"d5".to_string()), "nothing past the blocker");
+        assert!(!blocked.squares.contains(&"d8".to_string()));
+    }
+
+    #[test]
+    fn geom_ray_and_between_match_shakmatys_own_doc_examples() {
+        // Sourced directly from shakmaty::attacks::between's own doc
+        // comment (Square::B1 to Square::B7 -> b2..b6), not invented here.
+        let between = geom_between("b1", "b7", Span::test_data()).expect("valid input");
+        let mut squares = between.squares.clone();
+        squares.sort();
+        assert_eq!(squares, vec!["b2", "b3", "b4", "b5", "b6"].into_iter().map(str::to_string).collect::<Vec<_>>());
+
+        // A ray includes both endpoints and extends the full line both ways.
+        let ray = geom_ray("b1", "b7", Span::test_data()).expect("valid input");
+        assert!(ray.squares.contains(&"b1".to_string()));
+        assert!(ray.squares.contains(&"b8".to_string()), "ray extends past b7 to the board edge");
+    }
+
+    #[test]
+    fn geom_aligned_matches_shakmatys_own_doc_example() {
+        // shakmaty::attacks::aligned's own doc comment: A1, B2, C3 are aligned.
+        let result = geom_aligned("a1", "b2", "c3", Span::test_data()).expect("valid input");
+        assert!(result.aligned);
+        let not_aligned = geom_aligned("a1", "b2", "d3", Span::test_data()).expect("valid input");
+        assert!(!not_aligned.aligned);
+    }
+
+    #[test]
+    fn board_pieces_filters_match_known_start_position_placement() {
+        let knights = board_pieces(STARTPOS, Some("white"), Some("knight"), Span::test_data()).expect("valid input");
+        let mut squares = knights.squares.clone();
+        squares.sort();
+        assert_eq!(squares, vec!["b1".to_string(), "g1".to_string()]);
+
+        let all_white = board_pieces(STARTPOS, Some("white"), None, Span::test_data()).expect("valid input");
+        assert_eq!(all_white.squares.len(), 16);
+
+        let all_occupied = board_pieces(STARTPOS, None, None, Span::test_data()).expect("valid input");
+        assert_eq!(all_occupied.squares.len(), 32);
+    }
+
+    #[test]
+    fn board_piece_at_matches_the_independently_established_square_control_fact() {
+        // Cross-checked against square_control_tests::sliding_piece_control_stops_at_the_first_blocker.
+        let result = board_piece_at(STARTPOS, "c1", Span::test_data()).expect("valid input");
+        let piece = result.expect("c1 is occupied in the start position");
+        assert_eq!(piece.role, "Bishop");
+        assert_eq!(piece.color, "white");
+
+        let empty = board_piece_at(STARTPOS, "e4", Span::test_data()).expect("valid input");
+        assert!(empty.is_none());
+    }
+
+    #[test]
+    fn square_is_light_matches_shakmatys_own_doc_verified_convention() {
+        // Same fact square_control_tests::control_reports_square_color
+        // already established: b1 light, c1 dark.
+        assert!(square_is_light("b1", Span::test_data()).expect("valid square"));
+        assert!(!square_is_light("c1", Span::test_data()).expect("valid square"));
+    }
 }
 
 pub fn checker_summary(fen_str: &str, span: Span) -> Result<CheckerSummary, LabeledError> {
@@ -739,104 +950,3 @@ pub fn canonicalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledErro
     Ok(Fen::from_position(&canonical_pos, EnPassantMode::Legal).to_string())
 }
 
-#[cfg(test)]
-mod square_control_tests {
-    use super::*;
-
-    const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-
-    #[test]
-    fn empty_square_has_no_piece_and_no_control() {
-        let result = square_control(STARTPOS, "e4", Span::test_data()).expect("valid square");
-        assert!(result.piece.is_none());
-        assert!(result.controls.is_empty());
-    }
-
-    #[test]
-    fn knight_in_the_corner_controls_exactly_its_three_reachable_squares() {
-        // Nb1 in the start position: only 3 of a knight's usual 8
-        // destinations fit on the board from here, and all 3 are its own
-        // side's pawns/empty squares — control includes defended own
-        // pieces, not just enemy-facing attacks (see the field doc comment
-        // on SquareControl::controls).
-        let result = square_control(STARTPOS, "b1", Span::test_data()).expect("valid square");
-        let piece = result.piece.expect("b1 is occupied in the start position");
-        assert_eq!(piece.role, "Knight");
-        assert_eq!(piece.color, "white");
-        let mut controls = result.controls.clone();
-        controls.sort();
-        assert_eq!(controls, vec!["a3".to_string(), "c3".to_string(), "d2".to_string()]);
-    }
-
-    #[test]
-    fn sliding_piece_control_stops_at_the_first_blocker() {
-        // Bc1 in the start position is boxed in by its own pawns on b2 and
-        // d2 — it controls exactly those two squares (where it stops) and
-        // nothing past them, the blocker-awareness a hand-rolled diagonal
-        // check would need to get right on its own.
-        let result = square_control(STARTPOS, "c1", Span::test_data()).expect("valid square");
-        let piece = result.piece.expect("c1 is occupied in the start position");
-        assert_eq!(piece.role, "Bishop");
-        let mut controls = result.controls.clone();
-        controls.sort();
-        assert_eq!(controls, vec!["b2".to_string(), "d2".to_string()]);
-    }
-
-    #[test]
-    fn invalid_square_is_a_labeled_error_not_a_panic() {
-        let result = square_control(STARTPOS, "z9", Span::test_data());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn control_reports_square_color() {
-        // b1 is a light square, c1 is dark (shakmaty's own convention,
-        // doc-verified against Square::D1.is_light()/E1.is_dark()) — spot
-        // check both so the field isn't accidentally inverted.
-        assert!(square_control(STARTPOS, "b1", Span::test_data()).expect("valid square").is_light);
-        assert!(!square_control(STARTPOS, "c1", Span::test_data()).expect("valid square").is_light);
-    }
-}
-
-#[cfg(test)]
-mod square_attackers_tests {
-    use super::*;
-
-    const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-
-    #[test]
-    fn empty_square_attacked_by_neither_side() {
-        let result = square_attackers(STARTPOS, "e4", Span::test_data()).expect("valid square");
-        assert!(result.attacked_by_white.is_empty());
-        assert!(result.attacked_by_black.is_empty());
-    }
-
-    #[test]
-    fn square_attacked_by_exactly_one_side() {
-        // c3 is reachable by White's Nb1 (b1->c3) and the b2/d2 pawns
-        // (diagonal capture squares) but nothing Black owns reaches it yet
-        // in the start position.
-        let result = square_attackers(STARTPOS, "c3", Span::test_data()).expect("valid square");
-        let mut white = result.attacked_by_white.clone();
-        white.sort();
-        assert_eq!(white, vec!["b1".to_string(), "b2".to_string(), "d2".to_string()]);
-        assert!(result.attacked_by_black.is_empty());
-    }
-
-    #[test]
-    fn square_attacked_by_both_sides() {
-        // White knight a1 and Black knight a3 both reach c2 — the exact
-        // question `square_control` alone can't answer (it only reports
-        // what a piece already sitting on the target square would see).
-        let fen = "4k3/8/8/8/8/n7/8/N3K3 w - - 0 1";
-        let result = square_attackers(fen, "c2", Span::test_data()).expect("valid square");
-        assert_eq!(result.attacked_by_white, vec!["a1".to_string()]);
-        assert_eq!(result.attacked_by_black, vec!["a3".to_string()]);
-    }
-
-    #[test]
-    fn invalid_square_is_a_labeled_error_not_a_panic() {
-        let result = square_attackers(STARTPOS, "z9", Span::test_data());
-        assert!(result.is_err());
-    }
-}

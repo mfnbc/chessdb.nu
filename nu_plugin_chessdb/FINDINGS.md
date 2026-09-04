@@ -4977,3 +4977,435 @@ enumerating all 8 candidate squares; the two misread-flag incidents re-verified 
 play and honest documentation only, plus two new memory entries capturing the two genuinely
 new lessons (retreat-checking before grabbing material, and reading flag piece-names
 literally).
+
+---
+
+## 2026-09-03: Sixteenth Fruit game — "over-defended" isn't safe when the attacker is cheaper than the target, twice in one game
+
+Played Black for the first time this session (all fifteen prior games were White). Réti/QGD
+structure: `1.Nf3 d5 2.Nc3 Nf6 3.e3 Bf5 4.Bb5+ c6 5.Be2 e6 6.Nh4 Bg6 7.O-O Bd6 8.f4 Nbd7
+9.Nxg6 hxg6 10.d4 O-O 11.Bd2 Qc7 12.Bd3 Rae8 13.Qf3 e5 14.fxe5 Bxe5 15.dxe5 Nxe5 16.Qg3 Nh5
+17.Qh4 Nxd3 18.cxd3 Qb6 19.Na4 Qc7 20.Bb4 a6 21.Rf3 b5 22.Bxf8 Rxf8 23.Nc5 Qb6 24.Qe7 Nf6
+25.Rxf6 gxf6 26.Qxf8+ Kxf8 27.Nd7+ Kg8 28.Nxb6 Kg7 29.Rc1 b4 30.d4 a5 31.Rxc6`, resigned after
+`31.Rxc6` left White up a clean rook and knight (R+N+6P vs bare K+6P) with zero compensation
+— confirmed by `material.nu`, not estimated.
+
+**The decisive, twice-repeated error: reading "more defenders than attackers" as safe
+without checking whether the single attacker is cheaper than the piece it's attacking.**
+Moves 1–13 were clean, level, ordinary development — no tactics, no errors, matching the
+pattern the user asked about (games consistently stay even through the opening). The first
+real damage came at move 14. `14...Bxe5` recaptured a pawn, and `check_move.nu` flagged the
+resulting bishop `MOVER_FAVORED (count alone said safe, flagged anyway): Bishop@e5 1v3` —
+read as safe because three black pieces "defended" e5 against one white attacker. The one
+attacker was White's `d4` pawn. A pawn (100) capturing a bishop (330) nets the attacker +230
+*the instant it captures* — the three defenders only ever get to recapture the *pawn's*
+value back, they cannot undo the fact that a cheap piece just ate an expensive one. `15.dxe5`
+did exactly that: bishop lost for a pawn, no recapture chain fixes it. The identical shape
+recurred at move 22: `Rf8` sat `MOVER_FAVORED ... 1v2` (defended by rook + king against one
+bishop), read as safe by the same flawed count-only logic. `22.Bxf8` won the exchange (rook
+for bishop, ~+170 for White) outright, and `Kxf8`'s recapture only ever recovers the
+*bishop's* value, not the rook's. Two losses from the same unrecognized gap, in one game,
+without the pattern being noticed as the same mistake the second time it happened.
+
+**Why this is distinct from the existing "don't trust the label" memories.** Game 15's
+Qc5/Rd1 incidents (`feedback_dont_surface_untested_scores`) were about misreading *which*
+piece a flag named, or trusting a `consequence`/`see_cp` verdict outright. Here the count was
+read correctly and the right piece was identified both times — the error is that "defenders
+≥ attackers" was treated as sufficient by itself, when it structurally cannot be: defender
+count only determines what happens if an exchange continues *past* the first capture: it
+says nothing about whether that first capture already favors the attacker. Whenever a single
+attacker is worth less than the piece it threatens (a pawn vs. a bishop; a minor piece vs. a
+rook — the textbook "winning the exchange" shape), the position is not safe regardless of
+how many pieces queue up behind it. New memory: `chessdb_defender_count_vs_attacker_value`.
+
+**What worked, extensively, in the second half of the game — the same value-checking
+discipline, applied correctly, over and over.** Once behind, calculation was noticeably more
+careful: `24...Nf6` was flagged `OUTNUMBERED 2v1` (queen + rook vs. one pawn defender) and
+verified rather than either blindly trusted or blindly avoided — hand-tracing the actual
+capture chain showed the pawn recapture would win back *whichever* higher-value piece
+initiated (queen or rook), so the "outnumbered" square was actually excellent for Black, the
+mirror image of the move-14/22 mistake applied correctly this time. Real traps were caught
+and avoided before being played: `Qxb2` and `Qb4` both looked like they won a pawn or
+centralized safely but were refuted by `Na4` covering the landing square or `Qh4` raking the
+rank (`attackers_map.nu`, checked before playing, not after); `24...Re8` looked like it
+attacked White's queen but actually just hung the rook to the adjacent queen with check
+(adjacency doesn't grant the mover priority — it was White's move next); `Ng4`/`Nf4` were
+each independently checked and each independently found to hang to direct rank/file
+attackers and correctly discarded, twice, in different positions.
+
+**A three-move sequence around moves 25–27 that looks like a Black blunder in the PGN but
+wasn't one.** `25.Rxf6` and `26.Qxf8+` were both *White* giving up material by the same
+exchange-value logic documented above (rook for knight, then queen for rook) — real engine
+inaccuracies at Fruit's 1000ms search depth, not points scored by Black's play, and reading
+them as anything else would repeat exactly the "don't trust an unverified score" mistake in
+reverse (crediting a result without checking whether it was earned). Both recaptures
+(`25...gxf6`, `26...Kxf8`) were forced/correct regardless — declining either was strictly
+worse (verified via `chessdb legal-moves`, which showed only two legal replies to the
+`Qxf8+` check). The `27.Nd7+` fork that followed (hitting the king and, simultaneously, the
+undefended queen on `b6`) was a genuine tactic and not a preventable error: both legal king
+moves left the queen equally lost, confirmed directly rather than assumed, and accepting the
+queen at move 26 was still correct despite the follow-up because declining it
+(`26...Kh7`) was strictly worse by a wide margin. Sometimes the best available sequence still
+loses material to a shot several moves down the forcing line, and calculating that honestly
+(rather than assuming any loss must trace to an earlier mistake) is itself part of the
+discipline.
+
+**Resignation.** After `31.Rxc6`, material was White: 6P+1N+1R, Black: 6P only — an exact
+rook-and-knight deficit with pawns level and zero pieces left on the board for Black. No
+fortress or pawn-race consideration offsets a whole rook and knight against a lone king;
+presented via `AskUserQuestion` per the established protocol (Game 15) rather than deciding
+unilaterally, and the user selected resignation.
+
+**On whether this session's games justify splitting `position-eval` into
+opening/middlegame/endgame-specific skills (explicit user question this session).** Declined
+— see the reasoning recorded in this session's response, not repeated here in full: openings
+across all games in this project (including this one) have been consistently clean with zero
+recorded errors, so there is no evidence of an opening-specific gap to fill. The "stays even
+until the late middlegame" pattern the user observed is better explained by *when* real
+tactical exchanges start happening (naturally not during simple development) than by any
+missing phase-specific strategic knowledge — every recorded loss, across all six-plus
+documented games, has been a tactical-verification failure (misread label, missed retreat
+check, and now this game's defender-count-vs-attacker-value gap), not a positional or
+strategic one. The fix each time has been sharpening the *existing* verification discipline,
+not adding phase-specific content — this game's new memory continues that pattern rather
+than breaking from it.
+
+Verified: full game replayed live via `check_move.nu`/`attackers_map.nu`/`calc_line.nu`;
+both decisive exchanges (moves 14 and 22) re-derived from fresh FENs and confirmed via
+`attackers_map.nu`'s direct attacker/defender lists, not assumed from the flag text; the
+`Nd7+` fork's inevitability confirmed via `chessdb legal-moves` showing only two legal
+replies to the prior check, both losing the queen equally. No Rust or Nu-tool changes — live
+play, honest documentation, and one new memory entry.
+
+---
+
+## 2026-09-03: `chessdb square-swap-list` (a real x-ray-aware sensor report), the nuon-everything migration, and a real bug found doing it
+
+Two related pieces of work from the same session as game 16, both prompted by direct user
+requests rather than in-game incidents.
+
+**1. `chessdb square-swap-list` — the raw exchange picture game 16 needed and didn't have.**
+Requested as a compact ply-indexed notation for "what attacks/defends this square, including
+x-ray reveals" (user's own sketch: `0ply q 1ply NbPQ 2ply B` — a queen threatened by a
+knight, pawn, and queen, defended by a bishop, with a second bishop revealed as an x-ray).
+Implemented as a new Rust primitive rather than a Nu script, per this crate's own
+architectural principle (`chessdb defers to shakmaty` — computing x-ray reveals means
+removing pieces from occupancy and re-querying `Board::attacks_to`, exactly the class of
+computation that belongs on the Rust side, not hand-rolled FEN surgery in Nu):
+
+- `core::square_swap_list` recursively removes each ply's attackers' origin squares from
+  the board's occupancy bitboard and re-queries `Board::attacks_to` for both colors until no
+  new attacker appears — each new ply is exactly the set of pieces whose line to the square
+  was blocked by a piece that has now been "used" in an earlier ply. Notation case is
+  mover-relative (uppercase = the position's side-to-move's own pieces, lowercase = the
+  opponent's — per the existing `chessdb_mover_not_color` convention, real color is kept
+  alongside on every entry, never replaced by the mover-relative label), sorted ascending
+  by standard piece value within each ply.
+- New Rust unit tests (`square_swap_list_tests`) — the x-ray one in particular was
+  cross-verified against a *different*, older, already-trusted command
+  (`chessdb square-attackers`) on the same FEN with the blocking rook manually deleted from
+  the FEN string, rather than trusting the new function's own output as its own proof, after
+  the user directly asked whether the tests were "handing the answer rather than testing for
+  it." (Verified: `square-attackers` on the full-occupancy FEN returns exactly `[e3]`
+  attacking the target; on the same FEN with `e3`'s rook removed, exactly `[e1]` — matching
+  the new function's `1ply`/`2ply` split precisely, independent of the new code.)
+- `nu_plugin_chessdb/scripts/play/square_swap_list.nu` wraps it, built nuon-native from the
+  start (see below) rather than needing its own migration.
+
+**2. The nuon-everything migration.** Explicit user direction: "I would appreciate being
+spoken to in nuon... I did mean specifically the tools both input and output." Every script
+in `scripts/play/` (`check_move.nu`, `check_move_2ply.nu`, `calc_line.nu`,
+`attackers_map.nu`, `control_map.nu`, `control_overlap.nu`, `forcing_moves.nu`,
+`material.nu`, `board_overlay.nu`) converted: move-history input is now a nuon list literal
+parsed with `from nuon` (never a hand-joined space string, and never a raw FEN positional
+argument, which three of these scripts — `attackers_map.nu`/`control_map.nu`/
+`control_overlap.nu` — had required until now, the exact hand-typed-FEN risk this whole
+tool set otherwise avoids); output is one nuon record per call (`| to nuon --indent 2`, no
+`print`, no ascii art. `board_overlay.nu`'s bracket-legend grid — built 2026-09-02
+specifically to avoid hand-parsing a FEN, and protected by its own standing memory — was the
+one real design fork this required: an ascii grid can't itself be a nuon value, only wrap
+one. Resolved by explicit user choice ("structured record only") — the grid is gone, the
+underlying goal isn't: `board_overlay.nu` is now two pure functions, `fen-to-board` (occupied
+squares as `square -> {color, role}`, real board color) and `history-to-fen` (the shared
+move-replay loop every script used to hand-duplicate). Full rationale and the "don't dump the
+whole board on every call" corollary (a narrowly-scoped script like `control_map.nu`
+shouldn't return all 32 pieces just because they're available — noise, not signal) recorded
+in `chessdb_nuon_everything` (new memory, supersedes `chessdb_board_overlay_convention`).
+
+Nu detail worth keeping: a script invoked directly from an OS shell (`nu script.nu <args>`)
+cannot bind a `list<string>`-typed positional parameter from argv — Nu's script-CLI parser
+rejects `nu script.nu '[a b c]'` even though the identical text parses cleanly through
+`from nuon`. Every script's move-history parameter therefore stays `moves: string` at the
+signature boundary and is parsed explicitly (`$moves | from nuon`) in the body — not a design
+choice, a confirmed Nu limitation.
+
+**3. A real, previously-hidden bug found doing the migration, not incidental to it.**
+Cross-verifying `forcing_moves.nu`'s new nuon output against a known Fool's Mate position
+(`1.f4 e5 2.g4 Qh4#`, replayed via `history-to-fen`, never hand-typed) showed
+`checkmate_available` coming back empty when it should have named `Qh4#`. Root cause:
+`core::mobility_summary` built `mobility_san` with `San::from_move`, which deliberately omits
+the `+`/`#` check/checkmate suffix; `SanPlus::from_move` (shakmaty) computes it correctly by
+playing a clone of the position and checking the result. This means `forcing_moves.nu`'s
+entire CHECKS list and CHECKMATE-AVAILABLE detection — both implemented as string-matching
+that suffix, and explicitly named in the position-eval skill's "calculate forcing lines"
+section as the tool to reach for — had silently returned empty for the tool's entire
+history, across every game this session and (as far as this entry can tell) before it too.
+Capture (`x`) annotation was unaffected, only the check/mate suffix was missing. Fixed at the
+source (one-line call swap, `pos.clone()` since `SanPlus::from_move` consumes its position
+argument); a fully-qualified `shakmaty::san::SanPlus` path was needed at the call site since
+`pgn_reader` already exports an unrelated type of the same name, already imported in this
+file for PGN parsing. Regression-tested against both a mating position (the Fool's Mate
+above) and a non-mating check (`1.e4 d6 2.Bb5+` — chosen over the more "obvious" `1.e4 e6
+2.Bb5` specifically because that one is *not* actually check, the d7 pawn still blocks the
+diagonal; caught by testing rather than assumed, a small real instance of the same
+hand-verification discipline this file exists to document). While writing this test, a
+first draft hand-typed a FEN with a fabricated en passant square that didn't correspond to
+any real capturing pawn — caught before committing by re-deriving the FEN via
+`history-to-fen` and diffing against the hand-typed guess, the exact recurring risk class
+`chessdb_defers_to_shakmaty`/this file's own history keeps naming, this time inside test
+code rather than live play.
+
+**Lesson for future tooling changes, stated explicitly because it generalizes:** a
+structural rewrite of a tool's I/O shape (nuon-ification, or any other refactor) is a real
+opportunity to cross-check the tool's underlying facts against independently-known
+positions — it should not be treated as a pure format port that assumes the old behavior was
+already correct. The check/mate suffix bug would not have been found by a mechanical
+find-and-replace migration; it was found specifically because verifying the *new* output
+against a known chess fact was already the standing discipline for every change in this file.
+
+Verified: `cargo check --all-targets` / `cargo clippy --all-targets` / `cargo test` clean
+throughout (35 tests passing, up from 30: 5 new `square_swap_list_tests`, 1 new
+`mobility_summary_tests`); release plugin rebuilt and re-registered; every converted script
+smoke-tested against a known fact (`material.nu` against this exact game's recorded material
+at move 9; `attackers_map.nu`/`square_swap_list.nu`/`control_map.nu` against the pre-existing
+Rust unit tests' own known positions; `calc_line.nu`/`forcing_moves.nu` against the Fool's
+Mate mate-in-1). New memory: `chessdb_nuon_everything` (supersedes
+`chessdb_board_overlay_convention`, which is kept, marked superseded, for its historical
+reasoning).
+
+---
+
+## 2026-09-03 (continued): `chessdb board-probe` — one comprehensive shakmaty-backed nuon report, and where highlighting actually belongs
+
+Follow-up to the nuon migration above, same session. User asked to design a standardized
+"highlight" vocabulary/marker scheme so ascii/bitboard/FEN output could consistently show
+meanings like attacker/defender/hanging/pinned. Working through two rounds of that design
+(a candidate 24+-role vocabulary drawn from every square-bearing fact this crate already
+produces; a wire-shape question of grouped-by-role vs. grouped-by-square) surfaced a
+sharper distinction the user named directly: **nuon doesn't need a highlight scheme at
+all.** It can label squares/pieces with explicit role fields, grouped however is clearest
+for a given report, because it's already fully expressive structured data — no encoding
+scheme is needed to attach meaning to it. A highlight *scheme* (brackets, single-character
+markers, a fixed grammar) is only a real problem for formats that genuinely can't carry an
+extra labeled field: ascii (a fixed character grid), a bitboard (fixed 64 bits), a FEN
+(fixed grammar) — those have to compress meaning *into* the representation itself instead
+of alongside it.
+
+**Resolution:** chessdb's job stops at producing the full, honest nuon report. Rendering,
+filtering, or any highlight/marker scheme for a constrained format is explicitly a
+separate, downstream client's responsibility — not something to build into this crate.
+Given that, the user's actual next ask was direct: "use shakmaty to probe the board of all
+information and then compile that into a single nuon."
+
+**`core::board_probe`** composes the already-parsed `Chess`/`Board` once (not by
+re-calling `square_control`/`square_attackers`/`fen_info`/`checker_summary`/
+`mobility_summary`, each of which would reparse the FEN) into one record:
+- All 64 squares (`Square::ALL`), each with `occupant` (`Option<PieceOnSquare>`),
+  `is_light`, `controls` (`Board::attacks_from`, empty on an empty square), and
+  `attacked_by_white`/`attacked_by_black` (`Board::attacks_to`, both colors, occupied or
+  not — the same primitive `square_attackers` already uses, just for all 64 squares in one
+  pass instead of one square per call).
+- Position-level state: side to move, castling rights, en passant square, halfmove/
+  fullmove counters, check/checkmate/stalemate/insufficient-material, `checkers` (square
+  list), full legal move list in both SAN and UCI (`SanPlus::from_move`, the same fix from
+  the entry above, so this was correct from the moment it was written rather than
+  inheriting the missing-suffix bug).
+- Raw material counts per color (`Board::by_piece(Piece{color,role}).count()`) — computed
+  directly, deliberately *not* routed through `hugm-eval`/`SensorReport`, so a comprehensive
+  probe never has to pull in any tuned-formula field alongside the facts that are actually
+  wanted, matching `chessdb_material_nu`'s standing "raw counts, never a computed sum" rule.
+
+Deliberately excludes `square_swap_list`'s recursive x-ray plies — computing that for all
+64 squares by default would be the expensive operation repeated 64 times when almost all
+of them aren't contested; stays a targeted, one-square-at-a-time call.
+
+New Rust unit tests (`board_probe_tests`) cross-verify against facts already established by
+*older* tests rather than trusting the new function's own output — `c3`'s attackers
+against `square_attackers_tests::square_attacked_by_exactly_one_side`, `c1`'s bishop
+control against `square_control_tests::sliding_piece_control_stops_at_the_first_blocker`,
+and a Fool's-Mate-position checkmate check whose FEN was derived through the actual
+move-application chain (`history-to-fen`), not hand-typed, continuing the same discipline
+from the `SanPlus` bug entry above.
+
+`scripts/play/board_probe.nu` wraps it, nuon-native from the start (move-history nuon
+string in via `from nuon`, one `chessdb board-probe | to nuon --indent 2` record out).
+Live-smoke-tested against a real Ruy Lopez position (`e4 e5 Nf3 Nc6 Bb5`): 64 squares
+present, `b5`'s bishop occupant and 7-square control list correct, material counts correct.
+
+Verified: `cargo check --all-targets` / `cargo clippy --all-targets` (one
+`bool_assert_comparison` lint fixed) / `cargo test` clean (70 lib tests, up from 66 — 4 new
+`board_probe_tests`); release plugin rebuilt and re-registered. New memory:
+`chessdb_board_probe` (the design-conversation resolution — nuon needs no highlight
+scheme, chessdb never renders/filters, that's a separate client's job — plus when to reach
+for this vs. the narrower single-square scripts).
+
+---
+
+## 2026-09-03 (continued): the shakmaty-1:1 architecture — four rust-composed commands built earlier the same day, removed the same day, replaced by leaf commands + nu composition
+
+Explicit user direction, arriving directly on the heels of the `board-probe` work above:
+"I want the chess db plugin to be a 1-1 mapping of shakmaty functions, basically
+translating their output to nuon, and accepting their output as nuon ... instead of a skill
+asking the plugin for the right questions, a tree of reports [is] compiled as a graph ...
+in nushell." Confirmed explicitly a turn later: "let native shakmaty rule and we are just
+building layers of visualization, nushell nuon first and the ai agent will live on that
+level, but a client can take the information and build a board with highlights and filters
+based on report specifics."
+
+**What this meant concretely, worked out through a short design exchange:** `Board::attacks_to`
+already takes `occupied` as an explicit shakmaty parameter, not something derived
+internally — so exposing it 1:1 means occupancy becomes a caller-supplied bitboard, which
+is exactly what lets nushell perform `square_swap_list`'s recursive x-ray removal itself
+(call the leaf with the full occupancy, subtract squares with an ordinary `where` filter,
+call again) with no rust loop at all. Reading further into shakmaty found `attacks::attacks
+(square, piece, occupied)` — one dispatcher covering every role, plus `ray`/`between`/
+`aligned` — pure geometry, no board or position, lower-level and more general than
+`Board::attacks_from`/`attacks_to` (themselves just this dispatcher combined with the
+board's own piece-placement bitmaps). That settled the leaf boundary: expose
+`attacks::attacks`/`ray`/`between`/`aligned` and `Board::occupied`/`by_color`/`by_role`/
+`by_piece`/`piece_at`/`Square::is_light` as individually thin commands
+(`geom-attacks`/`geom-ray`/`geom-between`/`geom-aligned`/`board-pieces`/`board-piece-at`/
+`square-is-light`), and compose everything above that — `attacks_to`, `attacks_from`, the
+swap-list recursion, the whole-board probe — in nushell instead of rust.
+`fen-info`/`checker-summary`/`legal-moves`/`apply-uci`/`is-legal`/`canonicalize-fen`/
+`attack-summary` were explicitly scoped OUT of this decomposition (flagged, not silently
+decided): each is already close to 1:1 or is a genuine whole-board primitive, not the
+per-square geometric composition this principle targets.
+
+**The fork this forced, and the resolution: deprecate-and-remove, not deprecate-and-keep.**
+The same session had built four rust-composed commands earlier the same day —
+`square-control`, `square-attackers`, `square-swap-list`, `board-probe` — each of which
+loops/composes shakmaty primitives internally in Rust. Explicit user choice: remove all
+four, not keep them as convenience shortcuts alongside the new leaf layer. One candidate
+exception was raised (keep `square-swap-list` specifically, since its recursive-removal
+algorithm seemed like it might need to live where the `Bitboard` type lives) and explicitly
+declined by the user: "bitboard is great for shakmaty, and that can be used for all
+shakmaty things, keep the bitboard at all levels and let the client translate into FEN,
+PGN, ascii-board, etc." — confirming the recursion itself belongs in nushell too, once
+occupancy is just a plain square list.
+
+**Verification, not blind deletion — matching this crate's own `detect_skewers` A/B
+precedent.** `nu_plugin_chessdb/scripts/play/shakmaty_compose.nu` was built first
+(`attacks-to`, `attacks-from`, `swap-list`, `board-probe`, each composed from the new leaf
+commands), then diffed byte-for-byte against the rust command it was meant to replace,
+*before* that rust command was touched:
+- `attacks-to` vs. `square-attackers`: matched on the start position's `c3` (0 defenders
+  each, cross-checked earlier this session against a pre-existing Rust test) and on an
+  empty-target-square case.
+- `attacks-from` vs. `square-control`: matched on the start position's `c1` bishop
+  (`b2`/`d2`, the same fact `sliding_piece_control_stops_at_the_first_blocker` established).
+- `swap-list` vs. `square-swap-list`: matched exactly, including the ply-notation string,
+  on the dedicated x-ray test position (doubled rooks, `0ply n 1ply R 2ply R`) and on two
+  real Game 16 positions (one with an occupied target square, one with an empty one).
+- `board-probe` vs. `board-probe` (rust): matched on every field for a real Ruy Lopez
+  position, with one real (non-bug) discrepancy found and fixed along the way — the nu
+  composition and the rust command's internal bitboard iteration produced the same
+  attacker/defender *sets* in different *orders*. Not a correctness bug (order was never
+  part of the contract), but real enough to be worth catching properly rather than assuming
+  — confirmed by comparing every one of the 64 squares' records after sorting both sides,
+  then adding `sort` to the shipped nu functions so the difference doesn't recur for a
+  future comparison.
+- Performance sanity-checked, not just correctness: `swap-list` on a real midgame position
+  ran in ~15ms despite being many small plugin round trips instead of one rust loop;
+  `board-probe` (composed as O(pieces) round trips — compute what each piece attacks once,
+  then invert into "who attacks this square" per square in nu, rather than O(64 × pieces) —
+  re-querying attacks-to fresh at every one of the 64 squares) ran in ~52ms. Both fine for
+  interactive use.
+
+Only after every comparison matched were `square_control_cmd.rs`/`square_attackers_cmd.rs`/
+`square_swap_list_cmd.rs`/`board_probe_cmd.rs` and their `core.rs` structs/functions/tests
+deleted, and `control_map.nu`/`attackers_map.nu`/`square_swap_list.nu`/`board_probe.nu`
+(the only four scripts that had called the removed commands directly) rewired onto
+`shakmaty_compose.nu`. Every other script (`check_move.nu`, `calc_line.nu`,
+`forcing_moves.nu`, `material.nu`, `control_overlap.nu`) was unaffected — none of them ever
+called the four removed commands directly — and a full smoke test across all nine
+`scripts/play/*.nu` tools confirmed nothing else broke.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean throughout; 8 new
+leaf-layer unit tests, cross-verified against either an older pre-existing test's known
+fact (the knight-in-the-corner control fact, the `c1` bishop fact) or shakmaty's own doc
+examples (`between(B1,B7)` → b2..b6, `aligned(A1,B2,C3)` → true), never against this new
+code's own output in isolation; `cargo test` clean at 60 lib tests (down from 78 immediately
+before removal — 18 tests deleted alongside their four commands, matching exactly); release
+plugin rebuilt and re-registered; full byte-for-byte A/B verification (above) before any
+deletion; end-to-end smoke test across every `scripts/play/*.nu` script after the rewire.
+New memory: `chessdb_shakmaty_1to1` (the standing architecture); `chessdb_square_control`
+and `chessdb_board_probe` updated to point at it rather than describing stale rust commands.
+
+---
+
+## 2026-09-03 (continued): `full_report.nu` — one comprehensive report, and a real score-leak bug caught before it shipped
+
+Immediate follow-up, same session: "let's work on completeness of the report, the skill
+then becomes how to read the report, what is most important down to least important."
+Explicit priority order for this work, given directly: shakmaty-1:1 (done, above) first,
+compositing the report second, filtering third — "we can filter out scores if they have a
+similar identifier in their name" rather than a hand-audited per-field allowlist.
+
+**`shakmaty_compose.nu`'s `strip-scores`** — a generic, recursive record/list walker that
+drops any key matching `/score|_cp$|centipawn|consequence/i`, everything else passes
+through unchanged. Deliberately blunt, not exhaustive, per the stated priority (filtering
+is the lowest of the three). One known, accepted imprecision: `development_score_diff` (a
+legitimate structured fact this skill has always read, not a computed valuation) matches
+the `score` pattern and gets stripped too — not fixed, since the stated priority is speed
+over per-field precision here.
+
+**`shakmaty_compose.nu`'s `full-report`** merges `board-probe`'s geometric/structural
+report with `chessdb hugm-eval --verbose true`'s `sensor_report.tactical`/`.positional`
+(and `mate_in_1_exists`/`king_tropism_us`/`initiative_us`/`doubled_rooks_us`), filtered
+through `strip-scores`. `full_report.nu` wraps it — one call now returns everything a
+position evaluation needs: all 64 squares' geometry plus every tactical/positional
+detector fact, nothing computed-valuation left in it.
+
+**A real bug found building this, not incidental to it.** Checking what `strip-scores`
+would need to filter meant re-examining `check_move.nu`/`check_move_2ply.nu`/`calc_line.nu`'s
+own field access — and found that this same session's earlier nuon migration had silently
+reintroduced exactly the leak `check_move.nu`'s own header comment promises doesn't happen.
+The *old*, pre-nuon `check_move.nu` never leaked `consequence`/`see_cp` because it
+selectively `print`ed only specific fields (`attacker_count`, `defender_count`, ...) — the
+filtering was implicit in what got printed. The nuon rewrite switched to *returning whole
+filtered lists* (`$t.outnumbered | where {...}`) instead of selectively printing fields,
+which preserved every field on each surviving record, `consequence`/`see_cp` included.
+Confirmed directly: the same Game 16 position that had an `outnumbered` entry showed
+`consequence`/`see_cp` present in the raw `sensor_report.tactical.outnumbered` but no
+longer showed them after applying `strip-scores` in `check_move.nu`. A second, distinct
+instance of the same class: `calc_line.nu` returned `$s.material.balance` wholesale, which
+carries a `centipawns` field `material.nu` has always deliberately avoided — `centipawn`
+wasn't originally in `strip-scores`'s pattern (no literal `_cp` substring in the word
+"centipawns"), so it had to be added once this was found. Fixed by applying `strip-scores`
+to the tactical/sensor data pulled in `check_move.nu`, `check_move_2ply.nu`, and
+`calc_line.nu`; verified no `consequence`/`see_cp`/`centipawn` string appears anywhere in
+any of their output on the same real positions used to find the leak.
+
+**`.claude/skills/position-eval/SKILL.md` rewritten around `full_report.nu`.** The skill's
+substantive reasoning (the priority-ordered walk: tactics/safety first — can override
+everything below it — then material, king safety, pawn structure, piece activity last) is
+unchanged; what changed is the mechanical "how do you get this data" section, which used to
+say `"<FEN>" | chessdb hugm-eval --verbose true` and now says
+`nu scripts/play/full_report.nu '[<uci moves>]'` — one call, nuon list-of-moves input
+matching every other tool, no raw FEN. `material.balance.white`/`.black` references
+updated to `full_report.nu`'s flattened `material_white`/`material_black` fields. The
+"wide before deep" section's citation of the (now-removed) `chessdb square-attackers`
+command updated to note `full_report.nu`'s own `squares.<sq>.attacked_by_white/black` as an
+equally valid source once the report is already loaded, alongside `attackers_map.nu`.
+
+Verified: `strip-scores` tested against both a position with real `consequence`/`see_cp`
+values present (confirmed via the raw, unfiltered `sensor_report` first, then confirmed
+absent after filtering — not just "assumed the filter worked") and a clean position;
+`full_report.nu` smoke-tested end to end with a `grep -i "score|_cp|centipawn|consequence"`
+sweep across its full output on a real Game 16 position, zero matches; `check_move.nu`/
+`check_move_2ply.nu`/`calc_line.nu` re-verified the same way after their fix. No Rust
+changes this entry — all nu-side. New memory: `chessdb_full_report` (the comprehensive
+report and the `strip-scores` filter), and a note added to the general "nuon migration"
+lesson that switching from selective-print to whole-record-return is a real, easy-to-miss
+way to un-filter something a print statement used to filter implicitly.

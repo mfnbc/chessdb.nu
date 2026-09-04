@@ -165,8 +165,19 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chessdb attack-summary` | Every square attacked by White and by Black, plus per-side attack counts |
 | `chessdb checker-summary` | is_check/is_checkmate and the named checking square(s) |
 | `chessdb is-legal` | Cheap yes/no legality check for a move (SAN or UCI) in a given FEN |
-| `chessdb square-control` | Every square the piece on `--square` geometrically controls (occupancy-aware, independent of whose turn it is) — the primitive behind a spatial "what does this piece see" render |
-| `chessdb square-attackers` | Every white/black piece that attacks `--square` (occupancy-aware, independent of whose turn it is, works on an empty square) — the reverse question: "is it safe to move a piece here" |
+| `chessdb geom-attacks` | `shakmaty::attacks::attacks(square, piece, occupied)` — pure geometry, no board or position, one dispatcher for every role, `occupied` always an explicit input |
+| `chessdb geom-ray` | `shakmaty::attacks::ray(a, b)` — every square on the rank/file/diagonal through both, no board needed |
+| `chessdb geom-between` | `shakmaty::attacks::between(a, b)` — squares strictly between two aligned squares, no board needed |
+| `chessdb geom-aligned` | `shakmaty::attacks::aligned(a, b, c)` — true if three squares share a rank/file/diagonal, no board needed |
+| `chessdb board-pieces` | `Board::occupied`/`by_color`/`by_role`/`by_piece` for a FEN, filtered by optional `--color`/`--role` |
+| `chessdb board-piece-at` | `Board::piece_at(--square)` for a FEN — `{color, role}` or null |
+| `chessdb square-is-light` | `Square::is_light(--square)` — a pure square fact, no FEN needed at all |
+
+These are the leaf layer (2026-09-03) — chessdb exposes shakmaty's own
+functions close to 1:1 here; composition ("what attacks this square,"
+whole-board probes, x-ray swap lists) lives in nushell now
+(`nu_plugin_chessdb/scripts/play/shakmaty_compose.nu`), not in this plugin.
+See that directory's README for the composed reports built on these.
 
 ## Database
 

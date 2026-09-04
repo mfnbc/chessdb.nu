@@ -1,5 +1,6 @@
 pub mod apply_uci_cmd;
 pub mod attack_summary_cmd;
+pub mod board_pieces_cmd;
 pub mod canonical;
 pub mod canonicalize_fen_cmd;
 pub mod checker_summary_cmd;
@@ -15,13 +16,20 @@ pub mod legal_moves_cmd;
 pub mod pgn_to_fens;
 pub mod process_corpus;
 pub mod game_parse;
+pub mod geometry_cmd;
 pub mod stockfish_eval_cmd;
 pub mod coach_derive_cmd;
-pub mod square_attackers_cmd;
-pub mod square_control_cmd;
+pub mod square_is_light_cmd;
 pub mod stockfish;
 pub mod utils;
 pub mod zobrist;
+// square_control_cmd / square_attackers_cmd / square_swap_list_cmd /
+// board_probe_cmd removed 2026-09-03 — rust-side composition over shakmaty
+// replaced by the geom-attacks/board-pieces/board-piece-at/square-is-light
+// leaf commands above, composed in nushell instead
+// (scripts/play/shakmaty_compose.nu). Every nu-composed replacement was
+// A/B-verified byte-identical against these before removal — see
+// FINDINGS.md and the `chessdb_shakmaty_1to1` memory.
 
 use nu_plugin::Plugin;
 
@@ -66,8 +74,13 @@ impl Plugin for ChessdbPlugin {
             Box::new(attack_summary_cmd::AttackSummaryCmd),
             Box::new(checker_summary_cmd::CheckerSummaryCmd),
             Box::new(is_legal_cmd::IsLegal),
-            Box::new(square_control_cmd::SquareControlCmd),
-            Box::new(square_attackers_cmd::SquareAttackersCmd),
+            Box::new(geometry_cmd::GeomAttacksCmd),
+            Box::new(geometry_cmd::GeomRayCmd),
+            Box::new(geometry_cmd::GeomBetweenCmd),
+            Box::new(geometry_cmd::GeomAlignedCmd),
+            Box::new(board_pieces_cmd::BoardPiecesCmd),
+            Box::new(board_pieces_cmd::BoardPieceAtCmd),
+            Box::new(square_is_light_cmd::SquareIsLightCmd),
         ]
     }
 }

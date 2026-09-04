@@ -1,9 +1,9 @@
 ---
 name: position-eval
-description: Produce a reasoned, commentary-style chess position evaluation from chessdb's structured positional/tactical reports — deliberately without relying on hugm-eval's aggregate numeric score, which is an untested hand-tuned formula.
+description: Produce a reasoned, commentary-style chess position evaluation by reading `full_report.nu`'s comprehensive nuon report in priority order — deliberately without relying on hugm-eval's aggregate numeric score, which is an untested hand-tuned formula.
 ---
 
-# Position evaluation (no score-trusting)
+# Position evaluation (read the report, don't trust a score)
 
 ## Why this exists
 
@@ -19,42 +19,49 @@ untested number, not a real engine's output despite the name.
 score as the basis for a verdict" and then still having it print in the output wasn't
 enough in practice: over a single game (2026-09-02, FINDINGS.md) the habit of scanning
 several candidates for the highest number crept straight back in, even with that intent
-stated. Strip `final_score`/`aggregated.*_cp`/`engine_score` out of whatever tool output you
-read *before* looking at it (see `check_move.nu`'s own fix, same date) rather than reading
-past it by discipline each time — a number sitting right there is a standing invitation to
-shortcut past the actual reasoning below, every single time, regardless of what you decided
-last time.
+stated. `scripts/play/full_report.nu` (2026-09-03) strips every computed-valuation field
+(`final_score`/`aggregated.*_cp`/`engine_score`/per-fact `consequence`/`see_cp`/
+`centipawns`) out of the report *before it's ever printed* — a generic name-pattern filter
+(`shakmaty_compose.nu`'s `strip-scores`), not a promise to look past a number sitting right
+there. That's the fix that actually holds: a number that was never in the output can't be a
+standing invitation to shortcut past the reasoning below, regardless of what was decided
+last time it came up.
 
-What **is** trustworthy: the individual structured facts underneath that formula —
-`sensor_report.tactical.*` and `sensor_report.positional.*`. Each of those lists (hanging
-pieces, forks, pins, outposts, isolated pawns, ...) is independently regression-tested
-against real, hand-verified positions (`nu_plugin_chessdb/tests/`) and does not depend on
-the aggregate formula at all. This skill's job is to take that structured, individually-solid
-data and do the part a fixed linear formula structurally cannot: weigh which facts actually
-matter *in this position*, the way a strong player or commentator does, and write the
-reasoning down — not compute a fake-precise number.
+What **is** trustworthy: the individual structured facts the filtered report is built
+from — `tactical.*` and `positional.*`. Each of those lists (hanging pieces, forks, pins,
+outposts, isolated pawns, ...) is independently regression-tested against real,
+hand-verified positions (`nu_plugin_chessdb/tests/`) and does not depend on the aggregate
+formula at all. This skill's job is to take that structured, individually-solid data and do
+the part a fixed linear formula structurally cannot: weigh which facts actually matter *in
+this position*, the way a strong player or commentator does, and write the reasoning
+down — not compute a fake-precise number.
 
 ## Input
 
-A FEN string, passed as `args`. If you're screening a candidate move mid-game (the
-`check_move.nu` workflow), apply the move first via `chessdb apply-uci` to get the resulting
-FEN, then invoke this skill with that FEN — this skill evaluates one static position, it
-doesn't replay moves itself.
+A move history, passed as `args` — a nuon list literal of uci moves (e.g. `[e2e4 e7e5]`),
+matching every other tool in `scripts/play/`. If you're screening a candidate move mid-game
+(the `check_move.nu` workflow), apply the move first via `chessdb apply-uci`, then pull the
+resulting position's full report — this skill evaluates one static position, it doesn't
+replay moves itself.
 
 ## Method
 
-### 1. Pull the full structured report, once
+### 1. Pull the one comprehensive report, once
 
-```nu
-use chessdb *
-let ev = ("<FEN>" | chessdb hugm-eval --verbose true)
-let s = $ev.sensor_report
+```
+nu scripts/play/full_report.nu '[<uci moves>]'
 ```
 
-Read `$ev.side_to_move` and `$s.*` — `tactical.*`, `positional.*`, `material.balance`,
-`mate_in_1_exists`, `in_check`, `king_tropism_us`, `initiative_us`,
-`development_score_diff`. Ignore `$ev.final_score`, `$ev.engine_score`, `$ev.groups`,
-`$s.aggregated.*` per the note above — don't even read them into the reasoning below.
+This single nuon record — `shakmaty_compose.nu`'s `full-report`, `board_probe.nu`'s
+shakmaty-derived geometric/structural facts merged with the tactical/positional detector
+layer — has everything below. Read `side_to_move`, `tactical.*`, `positional.*`,
+`material_white`/`material_black`, `mate_in_1_exists`, `in_check`, `king_tropism_us`,
+`initiative_us`, and `squares` (every one of the 64 squares' occupant/controls/
+attacked_by_white/attacked_by_black — reach into this directly for "what attacks/defends
+this specific square" instead of a separate `attackers_map.nu`/`control_map.nu` call when
+the report is already loaded). There is no score field left to ignore — `strip-scores`
+already removed `final_score`/`engine_score`/`aggregated.*`/every per-fact `consequence`/
+`see_cp`/`centipawns` before this report was ever generated.
 
 ### 2. Walk every category, in priority order — this order is itself the reasoning
 
@@ -85,13 +92,14 @@ pre-computed verdict. A real hanging piece (`safe_to_capture: true`) or a mate-i
 everything below this section close to irrelevant; that field stays trustworthy because
 it's a direct legality/capture fact, not a valuation.
 
-**b. Material** — count it yourself from `material.balance.white`/`.black`
-(pawns=1, knights/bishops=3, rooks=5, queens=9 — standard values, not a computed score) and
-note `bishop_pair_white`/`bishop_pair_black`. State the raw imbalance in plain terms ("White
-is up a clean pawn," "material is level but Black has the bishop pair"). Use
-`scripts/play/material.nu` for a quick check mid-game — it prints only the raw piece
-counts, deliberately never `material.balance.centipawns`, so there's nothing to glance at
-and no reflex to trigger.
+**b. Material** — count it yourself from `full_report.nu`'s `material_white`/
+`material_black` (each `{pawns, knights, bishops, rooks, queens, bishop_pair}` — pawns=1,
+knights/bishops=3, rooks=5, queens=9, standard values, not a computed score). State the raw
+imbalance in plain terms ("White is up a clean pawn," "material is level but Black has the
+bishop pair"). `scripts/play/material.nu` still exists for a quick standalone check
+mid-game without pulling the whole report — it prints only the raw piece counts,
+deliberately never a centipawn sum, so there's nothing to glance at and no reflex to
+trigger.
 
 **c. King safety** — `positional.king_exposure` (`attacker_count`, `shelter_files`,
 `king_file_open`, whichever king it's reported for) and `in_check`. A king with real
@@ -244,8 +252,9 @@ move, not assumed away because the plan already existed.
 Game 13's `23...Qxf2+` (FINDINGS.md, 2026-09-02) wasn't a missing-tool problem, and it
 wasn't really a missing-calculation problem either — `calc_line.nu` correctly verified the
 *knight's* `Nxf2` fork before that move was played. The actual failure: `f2` was attacked
-by *two* black pieces at once (`Qb6` and `Ng4`), `attackers_map.nu`/`square-attackers`
-would have shown both side by side in one call, and it was never run — attention went
+by *two* black pieces at once (`Qb6` and `Ng4`), `attackers_map.nu` (or `full_report.nu`'s
+own `squares.f2.attacked_by_black` if the report was already loaded) would have shown both
+side by side in one call, and it was never run — attention went
 straight from "a fork was flagged" into verifying that one specific piece's threat, never
 back out to the more basic question of what, in total, attacks the square in play. This is
 the general failure pattern behind more than one incident this session (also see the
@@ -254,8 +263,9 @@ the first specific threat presented, instead of surveying the square/piece widel
 and only then going deep on whichever of the (possibly several) real threats it turns up.
 
 **The fix: whenever a square becomes contested — named in a fork's target list, a hanging
-entry, or anywhere else — run `attackers_map.nu`/`square-attackers` on *that square*
-first, before calculating any single piece's specific line.** Not "does the piece I'm
+entry, or anywhere else — check *that square's* full attacker/defender picture (`attackers_map.nu`,
+or `squares.<sq>` in an already-loaded `full_report.nu`) first, before calculating any
+single piece's specific line.** Not "does the piece I'm
 already worried about actually threaten this" — "what, in total, attacks or defends this
 square, from every piece on the board." Only once that full picture exists does it make
 sense to calculate any one of the threats it reveals in depth with `calc_line.nu`. Going
@@ -277,3 +287,31 @@ line itself says — before reading anything else in that output, full stop, reg
 what else the output also contains.** A skill section being written down once does not
 make the underlying tendency stop on its own; it has to actually change which line gets
 read first, every time, including the next time it's tempting not to.
+
+## Over-defended is not the same as safe — check the attacker's value against the defended piece's, not just the count
+
+Game 16 (2026-09-03, FINDINGS.md) lost a bishop for a pawn (move 14) and then the exchange
+(move 22, rook for bishop) via the exact same unrecognized gap, twice in the same game.
+`check_move.nu`'s `MOVER_FAVORED ... 1v3` and `... 1v2` flags were both read as "more
+defenders than attackers, therefore safe" — literally true by count, and wrong in effect,
+because in both cases the single attacker (a pawn attacking a bishop; a bishop attacking a
+rook) was worth *less* than the piece it was attacking. Defender count only governs what
+happens if the exchange *continues past the first capture* — it says nothing about whether
+the first capture already favors the attacker. A pawn (100) capturing a bishop (330) nets
+the attacker +230 the instant it happens, before any recapture; three defenders recapturing
+afterward only ever win back the *pawn's* value (100), leaving the net at -230 regardless of
+how many pieces line up to retake. The identical arithmetic makes a minor piece capturing a
+rook ("winning the exchange", ~+170 for the attacker) favor the attacker independent of
+defender count, for the same reason: rook(500) is a higher denomination than bishop(330).
+
+**The fix: before reading any `attacker_count`/`defender_count` pair as safe because
+defenders ≥ attackers, check whether *any single attacker* is worth less than the piece
+being defended.** If so, that attacker can capture and already come out ahead on the very
+first exchange — the position is not safe regardless of how many defenders queue up behind
+it. This is the same "verify the value, not the count" discipline as the Game 15 Qc5/Rd1
+cases above, but sharper: those were about misreading *which* piece a flag named or trusting
+a `consequence` verdict outright; this is about correctly reading the attacker and defender
+counts and *still* concluding "safe," because a count comparison by itself is the wrong test
+whenever the two sides' piece values aren't already close (pawn vs. minor, minor vs. rook).
+A defender-count majority only protects against a losing *continuation* — it does not
+protect against a favorable *first* capture.
