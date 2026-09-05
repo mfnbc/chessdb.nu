@@ -75,19 +75,6 @@ pub struct BatchSummary {
     pub unique_positions: Vec<UniquePositionRow>,
 }
 
-pub fn encode_move(mv: &shakmaty::Move) -> u16 {
-    let from = mv.from().map(|s| s as u16).unwrap_or(0);
-    let to = mv.to() as u16;
-    let promo = match mv.promotion() {
-        Some(shakmaty::Role::Knight) => 1,
-        Some(shakmaty::Role::Bishop) => 2,
-        Some(shakmaty::Role::Rook) => 3,
-        Some(shakmaty::Role::Queen) => 4,
-        _ => 0,
-    };
-    (from & 0x3F) | ((to & 0x3F) << 6) | ((promo & 0x07) << 12)
-}
-
 fn get_canonical_hash(pos: &Chess) -> String {
     let hash: Zobrist64 = pos.zobrist_hash(EnPassantMode::Legal);
     format!("{:016x}", hash.0)
@@ -333,33 +320,34 @@ fn material_score(pos: &Chess, color: Color) -> i64 {
         + count(Role::Queen) * 9
 }
 
-pub fn apply_san(fen_str: &str, san_str: &str, span: Span) -> Result<String, LabeledError> {
+/// Would this candidate move give check, directly, without the caller
+/// applying it first (previously only derivable indirectly: apply via
+/// `apply-uci`, then check `in_check` on the result). shakmaty *does* have
+/// a `Chess::gives_check` -- but it's a private inherent method gated
+/// behind `#[cfg(feature = "variant")]` (`position.rs:947-952`), a feature
+/// this project doesn't enable (default is just `std`+`magics`) and
+/// couldn't call even if it did (private). Caught by the compiler, not by
+/// re-reading the source carefully enough during planning -- a real miss:
+/// the earlier grep found the name but not its visibility/cfg-gate. Its
+/// own body is exactly `clone`, `play_unchecked`, `is_check` -- all
+/// genuinely public `Position` trait methods -- so this reproduces that
+/// exact composition using only what's actually accessible, rather than
+/// dropping the fact entirely.
+pub fn gives_check(fen_str: &str, uci_str: &str, span: Span) -> Result<bool, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
-    let san: San = san_str.parse().map_err(|e| {
-        LabeledError::new(format!("Invalid SAN: {e}")).with_label("failed to parse SAN move", span)
+    let uci: UciMove = uci_str.parse().map_err(|e| {
+        LabeledError::new(format!("Invalid UCI move: {e}"))
+            .with_label("failed to parse UCI move", span)
     })?;
 
-    let mv = san.to_move(&pos).map_err(|e| {
-        LabeledError::new(format!("Illegal move: {e}"))
+    let mv = uci.to_move(&pos).map_err(|e| {
+        LabeledError::new(format!("Illegal UCI move: {e}"))
             .with_label("move is not legal in this position", span)
     })?;
 
-    play_and_serialize(pos, &mv)
-}
-
-pub fn normalize_fen(fen_str: &str, span: Span) -> Result<String, LabeledError> {
-    let fen: Fen = fen_str.parse().map_err(|e| {
-        LabeledError::new(format!("Invalid FEN: {e}")).with_label("failed to parse FEN", span)
-    })?;
-
-    let pos: Chess = fen
-        .into_position(shakmaty::CastlingMode::Standard)
-        .map_err(|e| {
-            LabeledError::new(format!("Invalid position: {e}"))
-                .with_label("position is illegal", span)
-        })?;
-
-    Ok(Fen::from_position(&pos, EnPassantMode::Legal).to_string())
+    let mut after = pos.clone();
+    after.play_unchecked(mv);
+    Ok(after.is_check())
 }
 
 pub fn apply_uci(fen_str: &str, uci_str: &str, span: Span) -> Result<String, LabeledError> {
@@ -377,44 +365,27 @@ pub fn apply_uci(fen_str: &str, uci_str: &str, span: Span) -> Result<String, Lab
     play_and_serialize(pos, &mv)
 }
 
-pub fn uci_to_san(fen_str: &str, uci_str: &str, span: Span) -> Result<String, LabeledError> {
-    let pos = fen_to_chess(fen_str, span)?;
-    let uci: UciMove = uci_str.parse().map_err(|e| {
-        LabeledError::new(format!("Invalid UCI: {e}")).with_label("failed to parse UCI", span)
-    })?;
-
-    let mv = uci.to_move(&pos).map_err(|e| {
-        LabeledError::new(format!("Illegal move: {e}"))
-            .with_label("move is not legal in this position", span)
-    })?;
-
-    Ok(San::from_move(&pos, mv).to_string())
-}
-
-pub fn san_to_uci(fen_str: &str, san_str: &str, span: Span) -> Result<String, LabeledError> {
-    let pos = fen_to_chess(fen_str, span)?;
-    let san: San = san_str.parse().map_err(|e| {
-        LabeledError::new(format!("Invalid SAN: {e}")).with_label("failed to parse SAN", span)
-    })?;
-
-    let mv = san.to_move(&pos).map_err(|e| {
-        LabeledError::new(format!("Illegal move: {e}"))
-            .with_label("move is not legal in this position", span)
-    })?;
-
-    Ok(UciMove::from_move(mv, shakmaty::CastlingMode::Standard).to_string())
-}
-
+/// 2026-09-04 bugfix: the original short-circuited on which *parse*
+/// succeeded first (SAN, then UCI as a fallback only if SAN parsing
+/// itself failed) rather than on which *move* turned out to be real.
+/// Plain 4-character coordinate strings like "g1f3" apparently parse as
+/// *some* syntactically-valid-but-wrong SAN token more often than not (a
+/// real, live-demonstrated bug: `is-legal` returned `false` for `g1f3`,
+/// `b8c6`, `f1c4`, `d1h5` -- ordinary legal opening moves -- confirmed
+/// against `chessdb legal-moves` on the same positions; only plain pawn
+/// pushes like `e2e4` happened to survive). Found because `swap-list`'s
+/// new pin-legality filter (this same session) started rejecting every
+/// non-pawn attacker across the board, not just genuinely pinned ones.
+/// Fix: try both interpretations independently and accept either one
+/// that actually resolves to a real, legal move, instead of committing to
+/// whichever parse merely *succeeded* first.
 pub fn is_legal(fen_str: &str, move_str: &str, span: Span) -> Result<bool, LabeledError> {
     let pos = fen_to_chess(fen_str, span)?;
 
-    Ok(if let Ok(san) = move_str.parse::<San>() {
-        san.to_move(&pos).is_ok()
-    } else if let Ok(uci) = move_str.parse::<UciMove>() {
-        uci.to_move(&pos).is_ok()
-    } else {
-        false
-    })
+    let san_legal = move_str.parse::<San>().ok().is_some_and(|san| san.to_move(&pos).is_ok());
+    let uci_legal = move_str.parse::<UciMove>().ok().is_some_and(|uci| uci.to_move(&pos).is_ok());
+
+    Ok(san_legal || uci_legal)
 }
 
 pub fn fen_info(fen_str: &str, span: Span) -> Result<FenInfoData, LabeledError> {
@@ -585,6 +556,27 @@ fn parse_squares_to_bitboard(squares: &[String], span: Span) -> Result<Bitboard,
     squares.iter().map(|s| parse_square(s, span)).collect::<Result<Bitboard, _>>()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SquareDistanceResult {
+    pub a: String,
+    pub b: String,
+    pub distance: i64,
+}
+
+/// Nu-facing exposure of `Square::distance` (`square.rs:665`, doc-tested
+/// Chebyshev distance -- `max(file_dist, rank_dist)`) -- this is the exact
+/// primitive `CLAUDE.md`'s own "chessdb defers to shakmaty" section already
+/// cites (`chebyshev_distance`), previously only ever used buried inside
+/// tuned eval scoring, never exposed as an independent fact. No FEN --
+/// pure geometry, like `geom-attacks`. Result shape matches the established
+/// convention (`GeomAlignedResult`, echoing inputs alongside the fact)
+/// rather than a bare scalar.
+pub fn square_distance(a_str: &str, b_str: &str, span: Span) -> Result<SquareDistanceResult, LabeledError> {
+    let a = parse_square(a_str, span)?;
+    let b = parse_square(b_str, span)?;
+    Ok(SquareDistanceResult { a: a_str.to_string(), b: b_str.to_string(), distance: a.distance(b) as i64 })
+}
+
 fn color_name(color: Color) -> String {
     match color {
         Color::White => "white",
@@ -678,6 +670,30 @@ pub struct BoardPiecesResult {
     pub color: Option<String>,
     pub role: Option<String>,
     pub squares: Vec<String>,
+    // The raw `Bitboard` (`Bitboard(pub u64)`) this result was decoded
+    // from, exposed 1:1 rather than only ever handed out pre-decoded --
+    // 2026-09-04, so Nu-side callers can compose real bitwise AND/OR/XOR
+    // over shakmaty's own bitboards (Nu has native `bit-and`/`bit-or`/
+    // `bit-xor`/`bit-shl`/`bit-shr` on ints) instead of emulating a
+    // bitboard match via list-membership filtering, which looks similar
+    // but isn't the same operation and was the wrong substitute the first
+    // time this was attempted. `bitboard` is the u64 reinterpreted as i64
+    // (nuon/nu_protocol::Value has no unsigned 64-bit type) -- correct for
+    // bitwise composition since Nu's bit-* ops work on the same
+    // two's-complement pattern, but a board with the high bit set (h8)
+    // will show as negative, which is confusing on its own; `bitboard_hex`
+    // is the same value as an unambiguous, human-readable string.
+    pub bitboard: i64,
+    pub bitboard_hex: String,
+    pub popcount: usize,
+    // `Bitboard::first()`/`.last()`/`.more_than_one()` (`bitboard.rs:338-527`)
+    // -- 2026-09-04, additive. `first`/`last` are `None` when the selection
+    // is empty. `single_square()` is deliberately not a separate field: it's
+    // exactly `popcount == 1` (with `first` giving the square), so a second
+    // field would just carry the same fact twice.
+    pub first: Option<String>,
+    pub last: Option<String>,
+    pub more_than_one: bool,
 }
 
 /// `Board::occupied`/`by_color`/`by_role`/`by_piece` — the board's own
@@ -700,6 +716,145 @@ pub fn board_pieces(fen_str: &str, color_str: Option<&str>, role_str: Option<&st
         color: color_str.map(|s| s.to_string()),
         role: role_str.map(|s| s.to_string()),
         squares: bb.into_iter().map(|s| s.to_string()).collect(),
+        bitboard: bb.0 as i64,
+        bitboard_hex: format!("{:#018x}", bb.0),
+        popcount: bb.count(),
+        first: bb.first().map(|s| s.to_string()),
+        last: bb.last().map(|s| s.to_string()),
+        more_than_one: bb.more_than_one(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BitboardAsciiResult {
+    pub color: Option<String>,
+    pub role: Option<String>,
+    pub bitboard_hex: String,
+    pub popcount: usize,
+    // Rank 8 at the top, rank 1 at the bottom, matching every ASCII board
+    // convention already in use elsewhere in this codebase -- one line per
+    // rank, 'X'/'.' per square, no file/rank labels baked in (those are a
+    // presentation choice for whoever prints this, not a fact).
+    pub ascii: String,
+    // The same bitboard as a FEN-piece-placement-shaped string (run-length
+    // empty squares as digits, 'X' for a set square, '/' between ranks) --
+    // compact, diffable, and pastes straight into anything that already
+    // understands a FEN's board field, without being an actual position
+    // (no side-to-move/castling/etc, and 'X' is not a real piece letter).
+    pub fen_style: String,
+}
+
+/// 2026-09-04, direct request: a way to actually *see* a shakmaty
+/// `Bitboard` rather than only ever get a decoded square list or a raw
+/// (possibly negative) `i64` back. Deliberately computed entirely in Rust
+/// -- explicit user direction not to do bitwise/rendering work in Nu, only
+/// enough Nu-side handling to consume this pre-rendered text. Reuses
+/// `board_pieces`'s exact `(color, role)` -> `Bitboard` selection so the
+/// same filters mean the same thing in both commands.
+pub fn board_pieces_ascii(fen_str: &str, color_str: Option<&str>, role_str: Option<&str>, span: Span) -> Result<BitboardAsciiResult, LabeledError> {
+    let pos = fen_to_chess(fen_str, span)?;
+    let board = pos.board();
+    let color = color_str.map(|c| parse_color(c, span)).transpose()?;
+    let role = role_str.map(|r| parse_role(r, span)).transpose()?;
+
+    let bb = match (color, role) {
+        (Some(c), Some(r)) => board.by_piece(Piece { color: c, role: r }),
+        (Some(c), None) => board.by_color(c),
+        (None, Some(r)) => board.by_role(r),
+        (None, None) => board.occupied(),
+    };
+
+    let (ascii, fen_style) = render_bitboard(bb);
+
+    Ok(BitboardAsciiResult {
+        color: color_str.map(|s| s.to_string()),
+        role: role_str.map(|s| s.to_string()),
+        bitboard_hex: format!("{:#018x}", bb.0),
+        popcount: bb.count(),
+        ascii,
+        fen_style,
+    })
+}
+
+/// Shared by `board_pieces_ascii` and `bitboard_mask` (2026-09-04) -- one
+/// rendering path for any `Bitboard`, regardless of whether it came from a
+/// position query or a position-independent named constant, so the two
+/// commands' output always means the same thing for the same bits set.
+/// Rank 8 first, rank 1 last; 'X'/'.' per square in the ASCII grid, no
+/// file/rank labels (a presentation choice left to the caller); the
+/// FEN-style string run-length-encodes empty squares as digits, same
+/// convention any real FEN's board field already uses.
+fn render_bitboard(bb: Bitboard) -> (String, String) {
+    let mut ascii_lines = Vec::with_capacity(8);
+    let mut fen_ranks = Vec::with_capacity(8);
+    for rank in shakmaty::Rank::ALL.into_iter().rev() {
+        let mut line = String::with_capacity(15);
+        let mut fen_rank = String::new();
+        let mut empty_run = 0u8;
+        for file in shakmaty::File::ALL {
+            let set = bb.contains(Square::from_coords(file, rank));
+            line.push(if set { 'X' } else { '.' });
+            line.push(' ');
+            if set {
+                if empty_run > 0 {
+                    fen_rank.push_str(&empty_run.to_string());
+                    empty_run = 0;
+                }
+                fen_rank.push('X');
+            } else {
+                empty_run += 1;
+            }
+        }
+        if empty_run > 0 {
+            fen_rank.push_str(&empty_run.to_string());
+        }
+        ascii_lines.push(line.trim_end().to_string());
+        fen_ranks.push(fen_rank);
+    }
+    (ascii_lines.join("\n"), fen_ranks.join("/"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BitboardMaskResult {
+    pub name: String,
+    pub bitboard_hex: String,
+    pub popcount: usize,
+    pub ascii: String,
+    pub fen_style: String,
+}
+
+/// Nu-facing exposure of `Bitboard`'s named associated constants
+/// (`bitboard.rs:790-994` in shakmaty 0.30.1) -- position-independent
+/// geometric masks (`DARK_SQUARES`, `CENTER`, `CORNERS`, ...), rendered the
+/// same way `board_pieces_ascii` renders any other bitboard.
+pub fn bitboard_mask(name: &str, span: Span) -> Result<BitboardMaskResult, LabeledError> {
+    let bb = match name {
+        "dark-squares" => Bitboard::DARK_SQUARES,
+        "light-squares" => Bitboard::LIGHT_SQUARES,
+        "center" => Bitboard::CENTER,
+        "edges" => Bitboard::EDGES,
+        "corners" => Bitboard::CORNERS,
+        "backranks" => Bitboard::BACKRANKS,
+        "north" => Bitboard::NORTH,
+        "south" => Bitboard::SOUTH,
+        "west" => Bitboard::WEST,
+        "east" => Bitboard::EAST,
+        other => {
+            return Err(LabeledError::new(format!(
+                "unknown mask name '{other}' -- expected one of: dark-squares, light-squares, center, edges, corners, backranks, north, south, west, east"
+            ))
+            .with_label("invalid mask name", span))
+        }
+    };
+
+    let (ascii, fen_style) = render_bitboard(bb);
+
+    Ok(BitboardMaskResult {
+        name: name.to_string(),
+        bitboard_hex: format!("{:#018x}", bb.0),
+        popcount: bb.count(),
+        ascii,
+        fen_style,
     })
 }
 
@@ -815,6 +970,72 @@ mod leaf_layer_tests {
         // already established: b1 light, c1 dark.
         assert!(square_is_light("b1", Span::test_data()).expect("valid square"));
         assert!(!square_is_light("c1", Span::test_data()).expect("valid square"));
+    }
+}
+
+#[cfg(test)]
+mod is_legal_tests {
+    use super::*;
+
+    const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+    // 2026-09-04 regression: the original implementation short-circuited on
+    // which *parse* succeeded first (SAN, then UCI only as a fallback if
+    // SAN parsing itself failed), not on which move turned out to be real.
+    // Plain coordinate strings like "g1f3" apparently parse as *some*
+    // syntactically-valid-but-wrong SAN token, so `is_legal` returned
+    // `false` for ordinary legal opening moves on every piece except pawns
+    // -- found live because `swap-list`'s pin-legality filter (built the
+    // same session, using this exact function) started rejecting every
+    // non-pawn attacker on the board, not just genuinely pinned ones.
+
+    #[test]
+    fn pawn_push_was_already_correct_before_the_fix() {
+        assert!(is_legal(STARTPOS, "e2e4", Span::test_data()).expect("valid input"));
+    }
+
+    #[test]
+    fn knight_move_is_legal_uci_coordinate_notation() {
+        assert!(is_legal(STARTPOS, "g1f3", Span::test_data()).expect("valid input"));
+    }
+
+    #[test]
+    fn knight_move_is_legal_uci_coordinate_notation_black_side() {
+        // Black to move here (after 1.e4) -- STARTPOS itself has White to
+        // move, so a black knight move there would correctly be illegal
+        // for an unrelated reason (wrong side to move), not the bug this
+        // module exists to catch.
+        let after_e4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+        assert!(is_legal(after_e4, "b8c6", Span::test_data()).expect("valid input"));
+    }
+
+    #[test]
+    fn bishop_and_queen_moves_are_legal_uci_coordinate_notation() {
+        let fen = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2";
+        assert!(is_legal(fen, "f1c4", Span::test_data()).expect("valid input"), "Bc4");
+        assert!(is_legal(fen, "d1h5", Span::test_data()).expect("valid input"), "Qh5");
+    }
+
+    #[test]
+    fn legal_san_is_still_accepted() {
+        assert!(is_legal(STARTPOS, "Nf3", Span::test_data()).expect("valid input"));
+    }
+
+    #[test]
+    fn a_genuinely_illegal_move_is_still_rejected() {
+        // A knight can't reach e4 in one move from the start position --
+        // makes sure the fix didn't turn this into "always true".
+        assert!(!is_legal(STARTPOS, "g1e4", Span::test_data()).expect("valid input"));
+        assert!(!is_legal(STARTPOS, "Ne4", Span::test_data()).expect("valid input"));
+    }
+
+    #[test]
+    fn a_pinned_piece_cannot_legally_move_at_all() {
+        // The exact live-demonstrated case swap-list's pin filter exists
+        // for: a knight absolutely pinned to its own king by a bishop has
+        // zero legal moves, including the one that would capture on d5.
+        let fen = "4k3/8/8/3p4/1b6/2N5/8/4K3 w - - 0 1";
+        assert!(!is_legal(fen, "c3d5", Span::test_data()).expect("valid input"));
     }
 }
 

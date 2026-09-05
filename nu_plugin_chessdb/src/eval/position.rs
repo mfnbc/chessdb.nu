@@ -648,11 +648,7 @@ fn pawn_structure_score(
             };
         }
 
-        let support_rank = if color.is_white() {
-            rank.offset(-1)
-        } else {
-            rank.offset(1)
-        };
+        let support_rank = color.fold_wb(rank.offset(-1), rank.offset(1));
         let support = [file.offset(-1), file.offset(1)]
             .into_iter()
             .flatten()
@@ -774,7 +770,7 @@ fn pawn_structure_score(
         let file = sq.file();
         let rank = sq.rank();
         // push one
-        if let Some(next_rank) = if color.is_white() { rank.offset(1) } else { rank.offset(-1) } {
+        if let Some(next_rank) = color.fold_wb(rank.offset(1), rank.offset(-1)) {
             let to = Square::from_coords(file, next_rank);
             if (board.occupied() & Bitboard::from(to)) == Bitboard::EMPTY {
                 let front = in_front(color, to);
@@ -884,11 +880,7 @@ fn passed_pawn_score(
     for sq in passed_pawn_mask(board, color) {
         count += 1;
         let rank = sq.rank();
-        let advance = if color.is_white() {
-            u32::from(rank)
-        } else {
-            7 - u32::from(rank)
-        };
+        let advance = u32::from(color.relative_rank(rank));
         score += 20 + i64::from(advance) * 12;
         if advance >= 4 {
             score += 18;
@@ -1011,19 +1003,15 @@ fn development_space_score(board: &shakmaty::Board, graph: &ThreatGraph, color: 
     // Same primitive attackers_to is built from, read from the graph already
     // built for this position instead of two more separate shakmaty calls.
     let enemy_attacks = graph.attackers(
-        board.king_of(color).unwrap_or(if color.is_white() {
-            Square::E1
-        } else {
-            Square::E8
-        }),
+        board
+            .king_of(color)
+            .unwrap_or(Square::from_coords(File::E, color.backrank())),
         color.other(),
     );
     let own_attacks = graph.attackers(
-        board.king_of(color.other()).unwrap_or(if color.is_white() {
-            Square::E8
-        } else {
-            Square::E1
-        }),
+        board
+            .king_of(color.other())
+            .unwrap_or(Square::from_coords(File::E, color.other().backrank())),
         color,
     );
 
@@ -1052,11 +1040,7 @@ fn development_space_score(board: &shakmaty::Board, graph: &ThreatGraph, color: 
 
 fn in_front(color: Color, sq: Square) -> Bitboard {
     let sq_bb = Bitboard::from(sq);
-    let (s1, s2, s4) = if color.is_white() {
-        (8_i32, 16, 32)
-    } else {
-        (-8_i32, -16, -32)
-    };
+    let (s1, s2, s4) = color.fold_wb((8_i32, 16, 32), (-8_i32, -16, -32));
     let mut bb = sq_bb;
     bb |= bb.shift(s1);
     bb |= bb.shift(s2);
@@ -1122,11 +1106,7 @@ fn piece_activity_score(
         if (atk & board.by_color(color).intersect(board.by_role(Role::Pawn))).count() == 0 {
             local -= 18;
         }
-        if color.is_white() {
-            if sq.rank() == Rank::First {
-                local -= 10;
-            }
-        } else if sq.rank() == Rank::Eighth {
+        if sq.rank() == color.backrank() {
             local -= 10;
         }
         knight_score += local;
@@ -1175,11 +1155,7 @@ fn piece_activity_score(
         {
             local -= 13;
         }
-        if color.is_white() {
-            if sq.rank() == Rank::First {
-                local -= 13;
-            }
-        } else if sq.rank() == Rank::Eighth {
+        if sq.rank() == color.backrank() {
             local -= 13;
         }
         bishop_score += local;
@@ -1231,16 +1207,10 @@ fn piece_activity_score(
         }
         // Critter-style rook rank bonus: only if enemy has king or pawns there
         let rook_rank = sq.rank();
-        let (seventh, eighth, sixth) = if color.is_white() {
-            (Rank::Seventh, Rank::Eighth, Rank::Sixth)
-        } else {
-            (Rank::Second, Rank::First, Rank::Third)
-        };
-        let enemy_back_ranks = if color.is_white() {
-            Bitboard::from(Rank::Seventh) | Bitboard::from(Rank::Eighth)
-        } else {
-            Bitboard::from(Rank::First) | Bitboard::from(Rank::Second)
-        };
+        let seventh = color.relative_rank(Rank::Seventh);
+        let eighth = color.relative_rank(Rank::Eighth);
+        let sixth = color.relative_rank(Rank::Sixth);
+        let enemy_back_ranks = Bitboard::from(seventh) | Bitboard::from(eighth);
         let enemy_king_or_pawns = enemy & (board.by_role(Role::King) | board.by_role(Role::Pawn));
         if rook_rank == seventh {
             if (enemy_king_or_pawns & enemy_back_ranks).any() {
@@ -1276,11 +1246,7 @@ fn piece_activity_score(
         if (atk & king_ring_bb) != Bitboard::EMPTY {
             local += 13;
         }
-        if color.is_white() {
-            if sq.rank() == Rank::Seventh {
-                local += 13;
-            }
-        } else if sq.rank() == Rank::Second {
+        if sq.rank() == color.relative_rank(Rank::Seventh) {
             local += 13;
         }
         if let Some(ksq) = enemy_king {
@@ -1320,7 +1286,7 @@ fn piece_activity_score(
         let mut m = 0_i64;
         let file = sq.file();
         let rank = sq.rank();
-        if let Some(nrank) = if color.is_white() { rank.offset(1) } else { rank.offset(-1) } {
+        if let Some(nrank) = color.fold_wb(rank.offset(1), rank.offset(-1)) {
             let to = Square::from_coords(file, nrank);
             if (board.occupied() & Bitboard::from(to)) == Bitboard::EMPTY {
                 m += 1;
@@ -1730,8 +1696,7 @@ fn extract_passed_pawns(board: &shakmaty::Board) -> Vec<PassedPawn> {
     let mut results = Vec::new();
     for color in [Color::White, Color::Black] {
         for sq in passed_pawn_mask(board, color) {
-            let rank_idx = u32::from(sq.rank());
-            let advance = if color.is_white() { rank_idx } else { 7 - rank_idx };
+            let advance = u32::from(color.relative_rank(sq.rank()));
             let protected = board.attacks_to(sq, color, board.occupied()).any();
             results.push(PassedPawn {
                 square: sq.to_string(), rank: advance as u8 + 2,
@@ -1973,7 +1938,7 @@ fn extract_development_info(board: &shakmaty::Board, graph: &ThreatGraph) -> Vec
             results.push(DevelopmentInfo {
                 color: Side::from(color),
                 undeveloped_pieces: pieces,
-                space_advantage: if color.is_white() { space } else { -space },
+                space_advantage: color.fold_wb(space, -space),
             });
         }
     }

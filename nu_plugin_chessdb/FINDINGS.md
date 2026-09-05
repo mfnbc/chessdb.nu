@@ -5409,3 +5409,1023 @@ changes this entry — all nu-side. New memory: `chessdb_full_report` (the compr
 report and the `strip-scores` filter), and a note added to the general "nuon migration"
 lesson that switching from selective-print to whole-record-return is a real, easy-to-miss
 way to un-filter something a print statement used to filter implicitly.
+
+---
+
+## 2026-09-03 (continued): a detector-catalog gap audit against `positional_chess`, and three real bugs Nu syntax quirks hid until tested
+
+Following the `full_report.nu` work, the user asked about `dev-arcturus/positional_chess`
+(a browser/wasm chess-analysis tool surfaced during the same session's research into
+whether the "verbose fact-layer over a raw engine" architecture matches wider practice —
+confirmed real via direct fetch, README lists ~70 named motifs: fork/pin/skewer, battery,
+fianchetto, backward pawn, knight-on-rim, and many more, alongside some inherently
+judgment-based ones like `sacrifice`/`tempo`/`bad_bishop`/a win-rate-sigmoid move
+classifier). Explicit direction: "let's see what we can reproduce from the detector
+catalog, sticking to facts rather and avoiding objectivity ... use shakmaty as
+resourcefully and cleverly as possible."
+
+**Triage before building.** Cross-referenced their ~70 motifs against chessdb's existing
+`tactical.*`/`positional.*` (~20 categories) and sorted the gap into: already covered;
+cheap to expose from data already computed (`double_check` from `checkers.length >= 2`,
+`fifty_move_rule` from `halfmove_clock >= 100` — not built as separate fields, just
+noted as already derivable); a batch of genuinely new, purely structural facts worth
+building now; judgment-requiring motifs explicitly declined (`sacrifice`,
+`threatens`/`creates_threat`, `decisive_combination`, `simplifies`, `tempo`,
+`prophylaxis`, `restricts`, `bad_bishop` as a label — all reframed as "not a fact, would
+need a value judgment," matching the user's "avoiding objectivity" instruction); and two
+categories deferred as separate, bigger pieces of work (move-diffing facts like
+`queen_trade`/`develops`, which need calc_line.nu's per-ply shape rather than a static
+report; `threefold_repetition`, which needs full-game canonical-position tracking, not a
+single-FEN fact).
+
+**Built, all composed in nu from the existing leaf commands (`shakmaty_compose.nu`),
+no new rust:**
+- `battery` — 2+ same-color sliding pieces aligned on a shared rank/file/diagonal with
+  nothing between them (axis-and-role-compatibility checked, then `geom-between`
+  emptiness against `board-pieces`' full occupancy). Subsumes the classic "connected
+  rooks" motif as one instance (role=rook on both sides of the pair) rather than a
+  separate detector — verified directly: a constructed back-rank-clear position showed
+  exactly the two expected rook pairs and nothing else.
+- `piece-mobility-safety [fen, square]` — every legal destination for one piece with its
+  real attacker list, the raw fact behind game 15's `Qxa7` queen trap
+  (`chessdb_verify_retreat_before_grabbing`), formalized as a standing tool instead of a
+  one-off manual `chessdb legal-moves` walk.
+- `king-mobility [fen]` — the side-to-move's king's own legal destinations (scoped to the
+  side to move only, since legal-move generation isn't well-defined for the other side).
+- `knights-on-rim`, `fianchettoed-bishops`, `long-diagonal-pieces`, `semi-open-files`,
+  `supported-pawns`, `backward-pawns` — straightforward `board-pieces`/`geom-attacks`
+  compositions, bundled into `full-report`'s new `detectors` field.
+
+**Three real Nu bugs found by testing every detector against a real position before
+trusting it, each independently instructive:**
+1. `knights-on-rim`'s first draft flagged file a/h *or* rank 1/8 — caught immediately by
+   testing against the start position, where it flagged all four starting knights
+   (b1/g1/b8/g8) as "on the rim" simply because every knight starts on rank 1/8. "A
+   knight on the rim is dim" means the edge *files* specifically; rank was never part of
+   the concept. Fixed by dropping the rank condition.
+2. `[$f_idx - 1, $f_idx + 1]` (bare arithmetic, comma-separated, inside a nu list
+   literal) silently parses as six separate list items (`$f_idx`, `-`, `1`, `$f_idx`,
+   `+`, `1`) rather than two computed integers — nu list literals need arithmetic
+   expressions wrapped in parens and space-separated: `[($f_idx - 1) ($f_idx + 1)]`.
+   Surfaced as a `CantConvert { to_type: "cell-path" }` error several calls downstream
+   (inside `$FILES | get $i` once `$i` bound to a malformed value), not at the point of
+   the actual mistake — reproduced in isolation (`nu -c 'let x = 3; print [$x - 1, $x +
+   1]'`) before fixing, to confirm the root cause rather than patching the symptom.
+3. `board-piece-at`'s `.role` field comes back capitalized (`"Pawn"`, matching rust's
+   `role_name`) — distinct from the lowercase `--role` a caller passes *in* to
+   `board-pieces`/`geom-attacks` (case-insensitive on the rust side via
+   `to_ascii_lowercase()`). A direct nu string comparison (`.role == "pawn"`) inside
+   `backward-pawns` is not case-insensitive the way the rust-side flag parsing is, so it
+   silently matched nothing — confirmed directly (`board-piece-at --square c4` on a
+   position with a known white pawn there returned `role: Pawn`, not `pawn`) before
+   fixing. `attacks-to`/`attacks-from` (built earlier the same session) pass
+   `$piece.role` *into* a `--role` flag, which stayed correct throughout since that
+   direction of the case mismatch never mattered — only comparing `.role` as an output
+   value was ever a risk. Worth remembering as a general shape: fields that flow rust
+   output *into* a flag are protected by the rust-side normalization; fields compared
+   directly in nu are not.
+
+Verified: every new function checked against a hand-picked or real-game-derived position
+before being trusted (a real back-rank battery via a legal move sequence, an a4-knight via
+`b1c3` `c3a4`, a genuine backward `d6` pawn via a real Benoni-shaped sequence, cross-checked
+against `attacks-to` independently for the advance-square-attacked condition rather than
+assumed); `full-report`'s score-leak sweep re-run and still clean (0 matches for
+`score|_cp|centipawn|consequence`) with `detectors` now included; full 11-script smoke test
+across `scripts/play/*.nu` after wiring `detectors` into `full-report`. No rust changes —
+all nu-side, in `shakmaty_compose.nu`.
+
+---
+
+## 2026-09-03 (continued): testing `full_report.nu` against four real historical blunders — three confirmations, one honest nuance, and a real transcription error caught in this file's own archive
+
+User direction: test the new report against a compiled list of blunders from previous
+games, building the list from `FINDINGS.md` itself if needed. Compiled four, spanning the
+project's history, each reconstructed from the exact move list already recorded here (via
+`chessdb pgn-to-fens` where the recorded text was SAN, `history-to-fen`/`apply-uci` where
+it was already UCI) rather than re-describing the positions from memory.
+
+**Game 11's `11.Bd3` (the bishop that hangs outright, "a reading error, not a visibility
+gap").** `full-report`'s `tactical.hanging` at the post-`Bd3` position shows exactly what
+`check_move.nu` showed live at the time: `Bishop@d3, safe_to_capture: true, value: 330`,
+alongside black's mutually-attacked `Bishop@e4`. Confirms the migration preserved the
+signal — this was never a missing-fact problem, and still isn't.
+
+**Game 15's `19.Qxa7` queen trap.** `piece-mobility-safety` on the queen at the position
+right after `19...Ra8` (queen attacked, White to move) reproduces the entire historical
+finding in one call: all 8 real legal retreats, each with its actual attacker(s) named —
+`a4:[a8]`, `a5:[a8,c7]`, `c5:[d6]`, `a6:[a8,b7]`, `b6:[c7]`, `b7:[c7]`, `a8:[e8]`,
+`b8:[a8,c7,e8]`. This is the exact fact set that took a manual `chessdb legal-moves`
+enumeration plus per-square checking to assemble live; now one function call.
+
+**Game 16's `14...Bxe5` "1v3 looked safe" misread.** `full-report`'s
+`tactical.mover_favored` at this position shows the *identical* misleading count that
+caused the original error: `attacker_count: 1, defender_count: 3` for `Bishop@e5` — the
+report alone does not fix this, by design (`strip-scores` deliberately doesn't add a
+"safe" verdict). But `swap-list` on the same square, run alongside it, immediately shows
+`0ply b 1ply Pnrq` — the cheap pawn attacker (`P`, value 100) sorted first by value,
+visually impossible to miss the way a bare `1v3` ratio was. Confirms
+`chessdb_defender_count_vs_attacker_value`'s fix (check the swap-list, not the count)
+actually resolves the specific historical failure when applied to the real position that
+caused it, not just in the abstract.
+
+**Game 13's `25.Rg1` — the most honest result, not a clean catch.** The original entry
+says plainly: "`check_move.nu` correctly reported nothing hanging — genuinely true, no
+single-ply tactic existed," and diagnoses the miss as needing forcing-line calculation
+several plies deep. Running `full-report` at the exact position before `25.Rg1`: `hanging`
+and `forks` are indeed empty, matching that finding. But `tactical.pins` is *not* empty —
+it shows an **absolute pin**, `Queen@h4` pinning `Pawn@h3` to `King@h1`, directly down the
+h-file — a real, severe structural fact that was sitting in the same `sensor_report` this
+whole time, just not the one the original postmortem's attention landed on. This is not
+one of today's new detectors; `pins` already existed and was already read by
+`check_move.nu`. The honest reading: the position-eval skill's own priority order puts
+`tactical.pins` in category (a) — "immediate tactics/safety, read first" — and a king
+absolutely pinned to its only remaining flank pawn by the enemy queen, one move before
+abandoning the only other file of defense, is exactly the kind of fact that section exists
+to surface. Whether reading it explicitly would have changed the move choice is a
+different, unanswerable question (the original diagnosis — a sharp position needing
+forcing-line calculation, not a single static fact — likely still the primary cause), but
+this is a real instance of a structured fact carrying more warning weight than the
+postmortem credited it with, worth remembering the next time a "nothing hangs" read feels
+too comfortable.
+
+**A genuine, previously-uncaught error in this file's own archive, found by the act of
+testing rather than looked for.** Reconstructing game 13's position via `chessdb
+pgn-to-fens` (chosen specifically to avoid hand-transcribing SAN to UCI by eye, the exact
+risk class this whole project's tooling exists to route around) failed to parse: `24.Kh2`
+is illegal in the position reached after `23...Qxf2+` — the only legal white reply is
+`Kh1`. The game was played and verified live, move by move, at the time; this file's own
+*written record* of it was never mechanically replayed end-to-end until this exercise, and
+carried a transcription error for two-plus weeks undetected. Not corrected in place (this
+file's own convention is an honest archive, not a rewritten one) — noted here instead,
+with the working FEN (`3r2k1/pp1r1pp1/4p2p/8/1PP3nq/2QB3P/6P1/2RR3K w - - 2 25`, the
+position right before `25.Rg1`, reached via `1.Kh1` instead of the written `1.Kh2`) as the
+one to use for any future work referencing this exact position.
+
+**Scope:** four blunders across sixteen games — a representative sample chosen for
+variety (a clean hang, a multi-ply trap, a value-misread, a structurally-subtle collapse),
+not an exhaustive sweep of every game's every mistake.
+
+Verified: every position reconstructed from this file's own already-published move list,
+via `chessdb pgn-to-fens` (game 13, SAN) or `history-to-fen`/`apply-uci` (games 11/15/16,
+UCI already recorded) — never hand-typed as a FEN. `chessdb pgn-to-fens`'s own legality
+checking is what surfaced the `Kh2`/`Kh1` error, not a separate audit step. No rust or
+script changes — pure verification against `full_report.nu`/`shakmaty_compose.nu` as
+already built.
+
+---
+
+## 2026-09-03 (continued): `blunder_corpus.nuon` — the ad-hoc blunder testing above, compiled into a reusable regression corpus, plus a second transcription error found trying to add one more entry
+
+User direction, immediate follow-up: "make a blunder list of suspect moves and why they
+failed so we can retest fixes." The four positions from the entry above became the first
+four of a proper `nu_plugin_chessdb/scripts/play/blunder_corpus.nuon` — a nuon list of
+records (`game`, `move`, `history`/`fen`, `failure`, `expected_field`,
+`verified_2026_09_03`) — extended with three more games mined the same way (exact position
+reconstructed from this file's own already-published move list, never re-described from
+memory):
+
+- **Game 6, `17...Qxh2#`** — `mate_in_1_exists` fully computed but unreachable from
+  `.explanations` at the time, the original visibility-gap fixed at the source that same
+  entry. `full-report.mate_in_1_exists` at the exact recorded FEN: `true`, confirming the
+  fix still holds through today's whole rewrite.
+- **Game 10, `28...Bxh3`** — `check_move.nu` correctly flagged both `Bishop@h3` and
+  `Rook@e1` as independently hanging in one block, read as one connected story instead of
+  two (`chessdb_hanging_lines_independent`). `full-report.tactical.hanging` at the position
+  reproduces both entries exactly.
+
+Both confirmations plus the four from the entry above (game 6 duplicated the mate-in-1
+case now formally in the corpus) are wired into a companion runner,
+`test_blunder_corpus.nu`, which re-derives the relevant fact for each entry and prints it
+next to what was recorded when the corpus was built — no computed pass/fail, the reader
+compares, matching this whole project's standing refusal to print a verdict instead of a
+fact.
+
+**A second real transcription error, found trying to add an eighth entry (game 14, move
+28 `Rc5`).** `chessdb pgn-to-fens` on the SAN already recorded in this file's own game-14
+entry rejects it: `18.Nd4` is ambiguous between White's two knights (`Nb5` and `Nf3` both
+legally reach `d4`), and *neither* disambiguation (`Nbd4` or `Nfd4`) makes the later
+`20...Bxe4` legal — something in the archived move list is missing or mis-transcribed,
+predating this session's move-replay verification discipline. Not guessed at or silently
+patched: the corpus entry for game 14 is present with `verified_2026_09_03: null` and an
+explicit `note` explaining exactly what's inconsistent and why it wasn't reconstructed,
+rather than forcing a plausible-looking but unverified fix the way an earlier draft of
+this same exercise almost did with game 13's `Kh2`/`Kh1` (that one *was* resolvable — a
+single illegal move with only one legal replacement; this one has no such unique fix).
+**The pattern across both errors, worth naming as its own standing risk:** every position
+in `FINDINGS.md` before this week was verified live, move by move, during actual play —
+but the *written prose record* of those games was never itself mechanically replayed
+end-to-end until this corpus-building exercise, so transcription slips in the archive
+itself could sit undetected indefinitely. Building `blunder_corpus.nuon` is, among other
+things, a standing mechanism that will keep re-surfacing this exact class of error for any
+future entry added to it.
+
+Verified: `test_blunder_corpus.nu` run end to end, all six reconstructable entries showing
+the recorded fact reproduced by the current code; two real Nu bugs fixed while writing the
+runner itself — a bare identifier in call position (`piece-mobility-safety $fen a7`, `a7`
+parsed as an external command rather than a string, needed `"a7"`) and a literal
+parenthesized date-shaped string in an interpolated print (`"(2026-09-03)"` inside `$"..."`
+parsed as a date expression, not literal text) — both caught by actually running the
+script rather than assuming it worked from reading it. No rust changes — all nu-side.
+
+---
+
+## 2026-09-03 (continued): Game 17 — live play on the rebuilt shakmaty-1:1 toolkit, abandoned lost at move 25
+
+User direction: "okay give it a run in a game" — exercise `full_report.nu`,
+`check_move.nu`, `shakmaty_compose.nu`'s functions, and the blunder-corpus lessons in
+actual live play (White vs Fruit). Opening: 1.e4 d5 2.exd5 Nf6 3.d4 Nxd5 4.Nf3 e6 5.c4
+Bb4+ 6.Nc3 Nxc3 7.bxc3 Bxc3+ 8.Bd2 Bxa1 9.Qxa1 c5 — a Scandinavian gone wrong, White down
+the exchange plus a pawn by move 9 from a forced sequence, never recovered, and the game
+was abandoned (not played to mate) once reduced to a trivially lost K+3P vs K+3P+B+R
+endgame at move 25 — continuing move by move added nothing further to verify.
+
+**Two pre-existing-session errors, both self-caught, neither re-explained here in full
+(see this file's live commentary at the time) — named only for the record:** a missed
+`in_check` read at move 7 (only noticed because the legal-moves list came back
+suspiciously short), and a hand-typed FEN at move 10 while checking castling legality
+(wrong on two independent details — a knight that had already been traded off, and `KQ`
+rights when the a1 rook was already gone) — caught only by re-deriving the same position
+properly via `history-to-fen` and comparing. **The a1-rook loss point is itself worth
+naming: queenside castling rights don't just depend on the king/rook never having moved —
+they're gone the instant that specific rook is captured, and reasoning about "can I still
+castle queenside" without checking whether the rook is literally still on the board is a
+category error the tooling can't catch for you (it correctly reflected `K`-only rights in
+the real FEN; the mistake was upstream, in not reasoning about *why* before hand-typing a
+wrong guess).**
+
+**A real, live confirmation of the game-16 lesson (`chessdb_blunder_corpus`), this time
+caught proactively before playing rather than reconstructed after the fact.** At move 13,
+`check_move.nu` on candidate `Qa1-d4` reported `mover_favored: [{attacker_count: 1,
+defender_count: 1, piece: Queen@d4}]` — a clean 1v1 count. Read at face value that looks
+safe. It was not: the one attacker was Black's `c5` pawn, the one "defender" was a knight
+recapture — meaning the real sequence was `cxd4` (Black wins the queen for a pawn), `Nxd4`
+(White's only recapture, of the pawn, not of anything that returns the queen). The count
+alone can't distinguish "1 attacker, 1 defender, comparable value" from "1 attacker, 1
+defender, catastrophically mismatched value" — exactly the mechanism `chessdb_blunder_corpus`
+already named from game 16, now caught *before* the blunder instead of diagnosed after.
+Verified by hand-checking which piece the pawn actually was before playing it, not by
+trusting the count.
+
+**A concrete case of the `find_forks` `hangs` field being a false positive, confirming the
+skill's own standing warning not to trust it (`position-eval/SKILL.md`, "Do not read
+`consequence`/`see_cp`... `find_forks` is still backed by the known-buggy `see_chain`").**
+At move 14, `full-report.tactical.forks` reported Black's queen forking three White pieces
+with `hangs: {Knight@f3}` — naming the knight as the one that actually falls. Direct
+verification (`attacks-to $fen "f3" "black" $occ` vs `... "white" ...`) showed 1 attacker
+(the queen) and 2 defenders (`Be2`, `g2` pawn) — not hanging at all; capturing it would
+have lost Black's queen for a knight. Caught by going around `find_forks`'s own `hangs`
+label entirely and asking `shakmaty_compose.nu`'s `attacks-to` directly, per the skill's
+prescribed workaround.
+
+**A new, real tooling gap, not previously named: a forced recapture can silently drop the
+defense of an unrelated piece, and nothing in the current toolkit flags this before you're
+committed to the recapture.** At move 19, Black played `Rxd1`; the only legal recapture was
+`Bxd1` (bishop from `e2`). `check_move.nu` on the candidate correctly showed the *resulting*
+position's own new hanging list — `{Knight@c4, attacker_count: 1, safe_to_capture: true}` —
+because moving the bishop off `e2` removed its only defender of a knight sitting on `c4`
+three files away, on a completely different diagonal, with no geometric relationship to the
+rook trade itself. This was caught (the move was still correct — declining an even rook
+trade to save the knight would have been a full rook down instead of a knight down two
+moves later) but only *while checking the recapture itself*, not as an advance warning
+before entering a position where the only legal response has this side effect. Every check
+this session ran `check_move.nu` on the actual candidate before playing it, so nothing was
+ever missed live — but there is currently no tool that answers "if I'm forced into this
+exchange, what does the position look like two moves from now, before I have to find out
+the hard way." `calc_line.nu` can answer this if pointed at the specific forced sequence by
+hand; nothing surfaces it automatically. Worth a future look, not fixed today.
+
+**Result:** White (this session) reduced from a roughly-even opening to down the exchange
+by move 9, and down to bare king + 3 pawns against king + 3 pawns + bishop + rook by move
+25 (`r5k1/pp4pp/5p2/8/8/3b4/5PPP/7K w - - 0 25`) — a technically hopeless endgame with no
+realistic swindle chances given the material gap and lack of any fortress-relevant pawn
+structure. Abandoned rather than played to mate: every remaining move from here is
+mechanical, not instructive. **The toolkit itself performed correctly throughout** — no
+tool gave a wrong verdict when actually consulted (the near-misses above were all reasoning
+lapses or known-and-warned-about fields, each caught by the verification discipline this
+session's own tools and skill sections already prescribe, not by a tool failing silently).**
+
+Verified: every position derived via `history-to-fen` on the real move sequence, never
+hand-typed except the one caught-and-discarded error noted above. No rust or nu changes —
+pure live-play exercise of the existing toolkit, surfacing one new gap (the
+forced-recapture side-effect blind spot) for a future session to consider.
+
+---
+
+## 2026-09-03 (continued): Game 18 — a new skill step (goal-grounding), a real swap-list gap, and a loss by checkmate
+
+User direction: after the Game 17 write-up, discussed extending `position-eval/SKILL.md`'s
+"have a plan" section so a positional plan is grounded in a specific `full_report.nu` field
+(an outpost square, an isolated/backward pawn, an open file) rather than staying an
+abstract theme, then verified with `calc_line.nu` the same way a forcing line already is.
+Added that section, then "okay try it." — played Game 18 live (White vs Fruit) to exercise
+it in real play.
+
+**The new skill step worked as designed, more than once.** Move 21: `full_report.nu`
+flagged `open_files: [{color: black, file: d, rook_count: 1}]` — a goal already achieved
+from an earlier plan (clearing `d8` via `Qe7`, then `Rfd8`), verified in advance with
+`calc_line.nu` on the full 3-ply sequence (`d8e7`, a plausible white reply, `f8d8`) before
+either move was played, confirming nothing hangs and king exposure stays clear at every
+node. This is the intended shape: name a goal from a real field, verify the path to it,
+then play the first move with the rest of the plan already checked.
+
+**A real, costly gap found the same game: `swap-list` on a contested square should be
+checked *before* initiating a trade there, not just `check_move.nu` on the move itself.**
+At move 21 (`21...Rc8`, opposing White's rook on the newly-opened c-file), `check_move.nu`
+on the candidate showed nothing hanging — correctly, since the move itself doesn't lose
+material. What it doesn't show is what the *whole exchange chain* on that square looks
+like if contact continues: `swap-list` on `c8`, run retroactively afterward, reads
+`1ply rRQ 2ply q` — my rook, then White's rook, then **White's queen**, then my queen last.
+White's queen was already lined up behind their rook on the c-file this whole time, one
+capture chain deep, in a way `check_move.nu`'s single-move safety check has no reason to
+surface (the queen isn't the piece being moved, and isn't itself hanging or forking
+anything at the moment `Rc8` is played). The exchange played out exactly as the chain
+predicted: `Rxc8` `Qxc8`? — no: `Rxc8` (White captures my rook), and the only recapture
+was `Qxc8` (nothing else reaches c8), landing my queen on a square White's queen already
+attacked down the same file, with zero recapture available. Net material from the whole
+sequence: I lost a rook and, effectively, my queen's safety for the rest of the game — a
+disaster `swap-list` on `c8` would have named in one call, *before* `Rc8` was ever played,
+if it had been run on the target square instead of only on the move.
+
+**A second real near-miss, later the same game, caught correctly by reading `mate_in_1`
+first as the skill's own priority order says to.** Down material and playing on, two
+candidate queen moves (`Qxd4`, `Qe7`) each came back from `check_move.nu` with
+`mate_in_1: {exists: true, side_to_move: white}` — the queen, sitting on `f6`, was quietly
+the one piece preventing a forced `Rh8#` against a king that had been left on `h7` for many
+moves while attention was on material. The *raw current position* (no candidate move
+applied) showed `mate_in_1_exists: false` — the danger was entirely latent, contingent on
+which move got played, and only `check_move.nu`'s per-candidate check surfaced it. Both
+losing candidates were rejected on sight; `Kh6` (mate_in_1 false, nothing hanging) was
+played instead. This is exactly the failure class
+[`position-eval/SKILL.md`](../.claude/skills/position-eval/SKILL.md)'s priority order
+exists to prevent, and it worked — but only because the field was actually read for every
+candidate tried, not skipped after the first one looked plausible.
+
+**The `Kh6` fix was real but insufficient — the mating net closed two moves later anyway.**
+`31...Kg5` was forced (the only legal move, already in check from `Rh8+`), then `32.h4#` —
+checkmate, no legal moves remaining. The king had been marched into open space with no
+defenders nearby (a bare king on `g5` next to a piece deficit this large has no cover to
+retreat into), and by the time `mate_in_1` first flagged true, the position was already
+past the point where any single move could fix it — `Kh6` bought one move, not safety.
+**The standing lesson, distinct from the swap-list gap above: `mate_in_1`/king-safety
+checks need to run early enough to change the *plan*, not just screen the next move once a
+mating net is already one or two moves from closing.** A king sitting on `h7` for a dozen
+moves while material issues dominate attention is itself the moment to check
+`king_exposure`/`king-mobility` proactively — by the time `check_move.nu` starts returning
+`mate_in_1: true` on ordinary-looking candidates, the position has usually already crossed
+from "needs monitoring" to "already lost," as it had here.
+
+**Root cause of the whole collapse, one level up: the `Rc8`/`swap-list` gap directly
+created the material deficit that removed any defensive resource for the king hunt that
+followed.** These are not two unrelated mistakes in the same game — losing the queen's
+safety at move 21 is what left nothing on the board to help the king by move 31.
+
+Verified: every position derived via `history-to-fen` on the actual move sequence, no
+hand-typed FEN. No rust or nu changes this entry — the `swap-list`-on-target-square gap and
+the "check king safety proactively, not just per-candidate" lesson are both process
+findings, not tooling bugs; both are recorded in memory
+(`chessdb_swap_list_before_trading`, `chessdb_king_safety_early_not_late`) for future
+sessions.
+
+---
+
+## 2026-09-03 (continued): `check_move.nu` now surfaces the destination square's swap-list by default, closing the Game 18 gap at the source
+
+The `Rc8` postmortem above named a real process fix ("run `swap-list` on the target square
+before initiating a trade") but a process fix that depends on remembering to run a second
+command every time is fragile — this session's own history is full of exactly this shape of
+lapse (the "wide before deep" and "MY PIECES AT RISK gets read first" sections both exist
+because a correct tool output sitting one call away from where attention already was still
+got missed). Closed it at the source instead: `check_move.nu` now computes
+`swap-list $fen $dest_square` on the **pre-move** FEN — before the candidate is applied —
+and returns it as `destination_square_swap_list`, a new top-level field alongside
+`my_pieces_at_risk`. No separate call, no discipline to remember: every future
+`check_move.nu` invocation already has the full exchange-chain picture for wherever the
+candidate lands, for free.
+
+Verified directly against the exact Game 18 position: `check_move.nu` on `d8c8` (the
+`21...Rc8` candidate) now returns `destination_square_swap_list.notation: "1ply rRQ 2ply
+q"` — my rook and queen, White's rook *and queen*, in the standard output, before the move
+is ever played. This is the same chain `swap-list` showed only in hindsight during the
+postmortem; it would have been visible live, unprompted, if this change had existed a
+session earlier.
+
+Regression: `nu test_blunder_corpus.nu` re-run end to end — all six reconstructable
+entries reproduce their recorded facts unchanged (the new field is additive, nothing
+existing was touched). A quiet opening move (`e2e4` from the start position) returns an
+empty `plies`/`null` `notation`, confirming the field degrades cleanly when nothing is
+contested. No rust changes — pure `scripts/play/check_move.nu` addition, ~10 lines plus a
+header-comment update explaining why.
+
+---
+
+## 2026-09-04: Game 19 — lost by checkmate despite catching every individual trap; a real move-history bookkeeping error found live
+
+User direction: continue playing (White vs Fruit), applying the `destination_square_swap_list`
+fix and the "verify excitement, not just danger" discipline
+([[chessdb_verify_excitement_not_just_danger]]) throughout. User also gave explicit standing
+feedback mid-game: "Remember I'm evaluating you and your ability to learn and fashion tools
+... to improve your game ... you still hang pieces sometimes by missing a signal detail,
+sometimes by simply miscalculating and being happy to find a tactical opportunity" —
+directly shaping how this game was played and reviewed.
+
+**The discipline worked, repeatedly, and precisely.** Black sacrificed a knight with
+`7...Nxf2` and ran a long combination (`Nxf2-d3-f2-g4-f2-h3-f2-g4` interleaved with
+`Qb6-c7-d7-h3` and `Bc5/Be3` repositioning) that offered the knight as "hanging" no fewer
+than *nine separate times* across the game (`Rxf2`, `Nd4`, `Be3`, `Qe3+`, `Rxf7`, `Qxc5`,
+`d4`, `Qxf2` twice, `Bxe3`) — every single one verified with `check_move.nu`'s
+`destination_square_swap_list` and/or direct `attacks-to` calls *before* playing, and every
+single one turned out to be a real trap: a bishop or queen sitting one ply further back on
+the same diagonal/file that `my_pieces_at_risk` alone would never have surfaced. Not one of
+these nine was played. This is the clearest live confirmation yet that the "verify the
+square, not just the move" discipline from Game 18 actually changes outcomes when applied
+consistently under real pressure, not just in isolated demonstration.
+
+**And it still wasn't enough — a genuinely important, sobering finding.** Despite never
+falling for a single individual trap, the position was lost by checkmate anyway. The
+knight's mere *presence* on f2/g4/h3, cycling through squares that were never capturable,
+repeatedly forced king moves and pawn pushes (`h3`, `g3`) that quietly opened lines toward
+the king queenside-uncastled-adjacent long diagonal (`c5`/`e3`-`g1`) and the newly-weakened
+`g3`/`h3` complex. Material was ground down not by any single blunder but by the *cost of
+correct defense itself* — each accurate move (`Qb3`→`Qd3` fork-split, `Bd3`, `Kh1`→`Kh2`,
+`h3`, `g3`) was locally sound and still left the position structurally worse, because the
+opponent's minor-piece sacrifice had already banked long-term compensation (open lines to
+an uncastled-side-adjacent king, a permanently displaced defender) that no single reactive
+move could give back. **The standing lesson: verifying every move correctly prevents
+*blunders*, it does not prevent a sound long-term sacrifice from succeeding — that requires
+recognizing the sacrifice's real point (what lines it opens, what it's worth structurally,
+not just materially) at the moment it's offered, and responding to the plan, not just each
+tactical wave.** This is a different, harder problem than anything the swap-list/mate_in_1
+tooling addresses, and it's the actual reason this game was lost.
+
+**A real, separate process failure, caught mid-game: confusing a hypothetical
+`check_move.nu` test with an actually-played move.** At move 31, `a1e1` was tested via
+`check_move.nu` (still showed `mate_in_1: true`, so never played) — but the move history
+string used for the *next* `fruit_move.sh` call was copy-edited from that test and
+accidentally included `a1e1` as if it had been played. The very next `history-to-fen` call
+on that corrupted string failed outright with "Illegal UCI move" (the real board never had
+a rook on e1), which is what caught it — a hard failure, not a silent one, this time. A
+second, more dangerous instance followed immediately: the *next* `fruit_move.sh` call used
+a history string with two real moves (`f3e3 e8e3`) missing entirely — and this one did
+*not* error, because the truncated 33-move-shorter position was still a legal, playable
+position in isolation. `fruit_move.sh` is stateless per call, driven entirely by the move
+list handed to it — it has no way to know the list is wrong, so a wrong-but-legal history
+silently gets Fruit's best move for the *wrong position*, with no error to catch it, ever.
+Caught here only by manually reconstructing and cross-checking the full history against
+memory before proceeding, not by any tool. **This is a materially worse risk than the
+already-documented "never hand-type a FEN" rule — it's the same class of error (acting on
+an unverified position) but harder to catch, because the position is often still legal, so
+nothing errors.**
+
+Verified: the corrected, complete history was reconstructed and re-verified via
+`history-to-fen` before any further `fruit_move.sh` call; final position confirmed
+checkmate (`in_check: true`, `legal_moves_san: []`) via `full-report`. No rust or nu
+changes — this entry names two process findings, one already strong (swap-list discipline
+under pressure) and one newly surfaced (move-history integrity between `check_move.nu`
+tests and the real played-move list), the latter saved to memory
+(`chessdb_history_string_integrity`) since it's a durable, tool-workflow risk distinct from
+anything about chess itself.
+
+---
+
+## 2026-09-04: `board-pieces` now exposes the raw `Bitboard`, not just decoded squares — real bitwise composition reaches Nu for the first time
+
+User direction, following a discussion of classical bitboard pattern-matching (the "wash one
+bitboard mask against another" technique, e.g. AND-ing a pawn's attack bitboard against a
+bishop's own bitboard to find "wooden gate" pairs): "work from the 1:1 principle first to
+expose this to our nu reporting." A first attempt at a "wooden gate" detector
+(`shakmaty_compose.nu`) got this wrong — it used Nu list-membership filtering
+(`sq in list`) to *emulate* the result a bitboard AND would produce, which is semantically
+similar but not the same operation, and not what was asked (user: "I know Nu isn't the
+place for bitwise operations" — meaning the actual match needs to be genuine bitwise work
+against real bitboards, not a Nu-side approximation). That attempt was reverted from
+`extra-detectors`; `wooden-gate`/its wiring were not kept.
+
+**Verified first, before building anything:** `shakmaty`'s own `Cargo.toml` has
+`default = ["std", "magics"]` — this project's plain `shakmaty = "0.30"` dependency line
+takes that default, so every leaf command already built here (`geom-attacks`, `attacks-to`,
+`attacks-from`, `swap-list`, all of it) has been running on real fixed-shift magic
+bitboard tables the whole time, not naive ray-walking — the *speed* was never the gap.
+`Bitboard` (`bitboard.rs`) implements real `BitAnd`/`BitOr`/`BitXor`/`Not` operators and
+wraps a `pub u64` directly. `docs.rs`'s `attacks` module confirms (matching a direct source
+read) that every attack function — `pawn_attacks`, `knight_attacks`, `bishop_attacks`,
+`rook_attacks`, `queen_attacks`, `king_attacks` — is single-square only; there is no
+batch/whole-bitboard attack primitive anywhere in shakmaty's public API. So the classic
+one-shift-expression "everywhere any pawn defends" trick isn't something shakmaty ships;
+building it means either looping per-piece and OR-ing individual `pawn_attacks` results, or
+hand-writing a raw shift+file-mask against the now-known-public `u64` — a decision for
+whichever specific pattern gets built next, not resolved in this entry.
+
+**What got built, exactly matching the 1:1 principle rather than a new command:**
+`core.rs`'s `board_pieces` already computed the exact `Bitboard` value (via
+`Board::occupied`/`by_color`/`by_role`/`by_piece`, mirroring shakmaty's own 4-method API)
+before decoding it into a `Vec<String>` of square names and discarding it. `BoardPiecesResult`
+now keeps that value instead of throwing it away: `bitboard: i64` (the `u64` reinterpreted
+as signed, since nuon/`nu_protocol::Value` has no unsigned 64-bit type — correct for Nu's
+`bit-and`/`bit-or`/`bit-xor`, which operate on the same two's-complement pattern, but reads
+as negative for any board with the high bit — h8 — set) and `bitboard_hex` (the same value
+as an unambiguous `0x...` string) alongside the existing `squares`/`popcount`. No new
+command — `chessdb board-pieces` already existed, already computed this, and already ships
+to Nu; it just wasn't keeping the one field being asked about.
+
+**Verified end to end, both the raw exposure and real bitwise composition in Nu:**
+- `board-pieces --color white --role pawn` on the start position: `bitboard: 65280`,
+  `bitboard_hex: 0x000000000000ff00` — exactly bits 8-15 (rank 2), matching all 8 pawns.
+- `board-pieces --color black --role rook` on the start position: `bitboard_hex:
+  0x8100000000000000` (a8/h8), `bitboard: -9151314442816847872` — the high-bit/negative
+  case the design anticipated, confirmed to read correctly via the hex field rather than
+  erroring.
+- Two algebraic identities checked with Nu's own `bit-and` (not a list operation): 
+  `white_pawns bit-and black_pawns == 0` (disjoint sets), and
+  `all_white bit-and all_pawns == white_pawns` exactly (same value obtained two different
+  ways — once via `by_piece` directly, once via a live `bit-and` of `by_color`/`by_role`
+  results). Both passed, confirming the values crossing into Nu are real, correct
+  bitboards, not just numbers that happen to look right.
+
+`cargo check --all-targets`/`cargo clippy --all-targets` clean; release binary rebuilt and
+re-registered (`plugin add`/`plugin use`) before any of the above was tested live. No test
+suite additions yet — this entry is the raw-exposure milestone; the next step (which
+specific patterns to compose from these bitboards, and whether that composition happens as
+a Nu `bit-and` chain or a new Rust leaf command) is intentionally left open, not decided
+here.
+
+---
+
+## 2026-09-04 (continued): the open question above got resolved — `board-pieces-ascii`, all bitwise/rendering work in Rust, Nu only ever consumes finished text
+
+User direction, closing out the previous entry's open question: "not interested in the
+scores, only the facts... I would rather only enough [Nu bitboard handling] to translate it
+to ascii board, or fen... The rest can be done in rust explicitly, I don't trust Nu's
+bitwise functions." This settles where composition lives: Rust, not a Nu `bit-and` chain —
+the opposite of what the previous entry left open, and worth recording explicitly so it
+isn't re-litigated later. Also explicit: not interested in cross-checking `hugm-eval`'s
+tuned scoring functions with this (a real option raised and declined) — this stays a
+facts-only extension, same as everything else in this codebase.
+
+**Built**: `chessdb board-pieces-ascii` (`board_pieces_cmd.rs`, backed by
+`core::board_pieces_ascii`) — same `--color`/`--role` selection as `board-pieces`, same
+`Bitboard` value, but rendered entirely in Rust into two text forms: an 8-line ASCII grid
+(rank 8 at top, `X`/`.` per square, no baked-in file/rank labels — a presentation choice
+left to the caller) and a compact FEN-piece-placement-shaped string (`8/8/8/8/8/8/XXXXXXXX/8`
+for the white pawns' starting rank) using the same run-length-empty-square convention every
+other FEN in this codebase already uses. No bitwise operation happens in Nu anywhere in
+this path — Rust selects the bitboard (reusing `board_pieces`'s exact selection logic, so
+the same filters mean the same thing in both commands) and does every bit test
+(`Bitboard::contains`) before anything crosses into Nu; Nu's only job is printing the
+already-finished string.
+
+Verified live against known shapes, not just "it doesn't error": white pawns on the start
+position render as all-`X` on the second line from the bottom (rank 2), matching
+`8/8/8/8/8/8/XXXXXXXX/8` exactly; black rooks render as `X` at both ends of the top line
+(a8/h8) with `X6X` in the FEN-style string, confirming the run-length edge case (six empty
+squares between two set ones) encodes correctly. `cargo check --all-targets`/`cargo clippy
+--all-targets` clean; release binary rebuilt and re-registered; full blunder-corpus
+regression still passes (8/8 entries process without error) after both this addition and
+the `board-pieces` bitboard-exposure change from the entry above.
+
+This is explicitly scoped as the visibility/pipeline step, not a pattern-detection step —
+user: "for now let's just make sure we are building a pipeline to give shakmaty visibility
+... that sets the agent up for success." No actual pattern combination (wooden gate, king
+shelter, or anything else) has been built on top of this yet; that's still open, and now
+has a settled answer for where it will live when it happens (Rust).
+
+---
+
+## 2026-09-04 (continued): five pass-through-simple exposures of shakmaty's non-scoring
+surface, plus two real pre-existing bugs found while wiring the fifth one up
+
+Planned (`/home/mjfarnbach/.claude/plans/snug-popping-turtle.md`) and executed as five
+independent, additive items per the audit in the entry above. `cargo check --all-targets`/
+`cargo clippy --all-targets` clean after each item individually; full `cargo test` green
+throughout (67 passed at the end, up from 60 — the 7 new `is_legal_tests`, see below); full
+`nu test_blunder_corpus.nu` regression clean (8/8) after all five.
+
+**1. `chessdb bitboard-mask --name <center|corners|...>`** — the ten named `Bitboard`
+associated constants (`bitboard.rs:790-994`), position-independent, rendered via a shared
+`render_bitboard` helper factored out of `board_pieces_ascii` (no duplicated rank/file
+loop). Verified: `center` shows exactly d4/d5/e4/e5; `corners` shows exactly a1/a8/h1/h8
+(`X6X/8/8/8/8/8/8/X6X`).
+
+**2. `chessdb square-distance --a --b`** — `Square::distance`, the literal example
+`CLAUDE.md`'s own "chessdb defers to shakmaty" section cites (`chebyshev_distance`), never
+previously exposed independently of the tuned eval scoring it's buried inside. Result shape
+matches the established convention (`GeomAlignedResult`-style, echoing inputs) rather than
+a bare scalar, once actually checked against precedent instead of assumed. Verified:
+`a1`↔`h8` = 7 (Chebyshev, not Euclidean — would be non-integer if it were); `e4`↔`e5` = 1.
+
+**3. `board-pieces` gains `first`/`last`/`more_than_one`** — `Bitboard::first()`/`.last()`/
+`.more_than_one()`, computed from the exact same `Bitboard` the command already held.
+`single_square()` deliberately not added as a separate field (redundant with
+`popcount == 1` plus `first`). Verified: white rooks on the start position give
+`first: "a1"`, `last: "h1"`, `more_than_one: true`, matching `Bitboard::first()`'s own
+doc-test (`Bitboard::FULL.first() == Some(Square::A1)`) confirmed during planning.
+
+**4. `chessdb gives-check --uci`** — real correction found *during implementation*, not
+planning: the plan cited `Position::gives_check` (`position.rs:950`) as a public trait
+method; it's actually `Chess::gives_check` (`position.rs:947-952`), a **private** inherent
+method gated behind `#[cfg(feature = "variant")]` — a feature this project doesn't enable.
+Caught by `cargo check` (`E0599`), not by re-reading the source carefully enough while
+planning — the earlier grep found the name but not its visibility or cfg-gate. Its own body
+is exactly `clone`/`play_unchecked`/`is_check`, all genuinely public `Position` trait
+methods, so `core::gives_check` reproduces that composition directly. Verified against a
+real, mechanically-derived position (not hand-typed — an earlier live-test attempt used a
+fabricated FEN and had to be redone via `history-to-fen [f2f3 e7e5 g2g4]`): `Qh4#`
+(fool's-mate delivering move) → `true`; a quiet `Bc5` from the same position → `false`.
+
+**5. `swap-list`'s pin-legality gap, fixed — and a real, more significant bug found while
+fixing it.** The plan: filter ply-1 attackers through the already-registered `chessdb
+is-legal`, dropping any that are actually pinned (the demonstrated case: a knight
+absolutely pinned to its own king, zero legal moves, still listed as a real defender).
+First attempt caused an immediate, severe regression against the blunder corpus: game 16's
+`swap-list` notation on `e5` dropped from `0ply b 1ply Pnrq` (4 real attackers) to
+`0ply b` (only 1) — not a correction, a bug. Root cause, found by testing `is-legal`
+directly rather than trusting the corpus diff alone: **`core::is_legal` was already broken
+for almost every move that isn't a pawn push**, entirely unrelated to anything built this
+session. Its logic short-circuited on which *parse* succeeded first (try SAN, only fall
+back to UCI if the SAN *parse itself* failed) rather than on which *move* turned out to be
+real — plain coordinate strings like `g1f3`/`b8c6`/`f1c4`/`d1h5` apparently parse as *some*
+syntactically-valid-but-wrong SAN token, so `to_move` failed on that wrong interpretation
+and the function returned `false` without ever trying the correct UCI parse. Confirmed
+directly: `chessdb is-legal --move g1f3` on the start position returned `false` even though
+`chessdb legal-moves` lists it plainly. **This command was never actually relied on for a
+single live-play decision before today** (checked: only ever appears in FINDINGS.md's own
+command inventories, never called from any `scripts/play/*.nu` file before this session's
+`swap-list` edit) — so no past game's analysis was corrupted by it, but it's been a
+registered, documented, silently-broken command the whole time. Fixed: try both
+interpretations independently, accept either one that actually resolves to a real move
+(`san_legal || uci_legal`), rather than committing to whichever parse merely succeeded
+first. Seven new regression tests added (`core::is_legal_tests` — previously this function
+had *zero* test coverage, plausibly why the bug went unnoticed): pawn push (already
+correct), knight/bishop/queen UCI coordinate notation (all previously broken), legal SAN
+still accepted, a genuinely illegal move still rejected, and the exact pinned-knight case.
+
+**Second narrowing needed after the first bug was fixed**: game 16's `e5` notation was
+still incomplete (`0ply b 1ply P` — White's own pawn restored, but Black's queen/knight/
+rook still missing). Not a bug this time — `is-legal` correctly (if unhelpfully) reports
+`false` for a move by whichever color *isn't* the FEN's actual side-to-move, since that's a
+different, legitimate question ("is this legal for whoever's turn it really is") than the
+one `swap-list` needs answered for the opponent's ply-1 attackers ("if it *were* their
+turn, could they legally capture here"). Resolving that properly would need a turn-flipped
+variant of the position, with a real risk of "impossible check" rejection at the boundary —
+judged out of scope for this pass. Final, correctly-scoped fix: only filter attackers whose
+color matches `$mover` (the position's actual side-to-move); the opponent's ply-1 attackers
+stay geometric-only, unfiltered, exactly as before. This still fully covers `swap-list`'s
+primary use case (verifying a piece of *my own* is actually free to move before committing
+to a trade) and is honestly narrower than "fixes pin-legality everywhere," not silently
+overclaimed as such.
+
+Verified end to end after both fixes: game 16's `e5` notation fully restored to
+`0ply b 1ply Pnrq`, byte-identical to the corpus's recorded value; the original pinned-knight
+case still correctly shows `0ply p` with no knight; full blunder-corpus regression (8/8) and
+full `cargo test` (67/67) both green; release binary rebuilt and re-registered before any of
+the above live checks. Two memory entries saved
+(`chessdb_is_legal_short_circuit_bug`, `chessdb_swap_list_pin_fix_scope`) since both are
+durable findings — one a real bug with zero prior test coverage, the other a scoping
+decision (mover-color-only) that a future session could otherwise plausibly "fix" further
+without knowing the turn-flip risk was already considered and deliberately deferred.
+
+## 2026-09-04 (continued): dead-code and FEN-extraction dedup pass, plus a deliberate
+## "ground up" rewrite mid-execution after the minimal patch was rejected
+
+Directly after the five-item shakmaty-exposure pass above, asked to do a dedup/cleanup
+pass on `nu_plugin_chessdb/src/`: remove genuinely unused code, and consolidate any
+duplicated logic into a shared helper. Audited `core.rs`'s `pub fn`/`pub struct`
+definitions against `lib.rs`'s command registry and every other source file (grepping each
+candidate individually, explicitly checking for false-positive substring matches like
+`encode_move` vs `encode_move_states` before deciding something was actually dead).
+
+**Dead code removed** — five functions in `core.rs` with zero references anywhere in the
+codebase: `encode_move` (a u16 move-encoding scheme nothing ever called), `apply_san`,
+`normalize_fen`, `uci_to_san`, `san_to_uci`. All five predate the current
+FEN-via-pipeline/`fen_to_chess` conventions and had been fully superseded without ever
+being deleted.
+
+**FEN-extraction duplication consolidated** — the same inline block,
+```rust
+match input.into_value(span)? {
+    Value::String { val, .. } => val,
+    _ => return Err(LabeledError::new("expected a FEN string")...),
+}
+```
+was independently copy-pasted across 9 command files (10 counting one instance that had
+already been locally factored into a private helper in `board_pieces_cmd.rs`). Extracted
+once into `utils::fen_from_input(input: PipelineData, span: Span) -> Result<String,
+LabeledError>` and every call site (`board_pieces_cmd.rs`, `fen_info_cmd.rs`,
+`attack_summary_cmd.rs`, `checker_summary_cmd.rs`, `legal_moves_cmd.rs`,
+`apply_uci_cmd.rs`, `is_legal_cmd.rs`'s `IsLegal` and `GivesCheckCmd`,
+`collapse_criticality_cmd.rs`) switched to calling it. Confirmed complete via
+`grep -c "Value::String { val, .. } => val" src/*.rs | grep -v ":0"` returning nothing —
+zero remaining copies anywhere.
+
+**Mid-execution correction, worth recording as its own finding.** The first edit to
+`collapse_criticality_cmd.rs` was the minimal version of the above: add the
+`fen_from_input` call for the pipeline-extraction step, but leave its existing bespoke
+`Fen::from_ascii(...).into_position(CastlingMode::Standard)` FEN-to-`Chess` conversion
+untouched, since that half wasn't literally the duplicated block being consolidated. This
+edit was rejected outright. Clarified direction: "build as if from the ground up clean
+slate for resourcefullness and clarity and simplicity" — i.e. the dedup shouldn't stop at
+the one literal duplicate pattern if the file also duplicates something the rest of the
+codebase already has a shared, battle-tested answer for. `core::fen_to_chess` is exactly
+that answer (used throughout the rest of the plugin for FEN→`Chess` conversion); rewrote
+`collapse_criticality_cmd.rs` to drop its bespoke `Fen`/`CastlingMode`/`Chess` imports and
+inline parsing entirely, replacing both steps with `fen_from_input` + `fen_to_chess`. The
+lesson for future dedup passes on this codebase: "consolidate the duplicate" and "rebuild
+the file's surrounding logic onto the project's existing shared primitives" are different
+requests, and a minimal patch answering only the first can undershoot what was actually
+asked for.
+
+Verified throughout: `cargo check --all-targets` and `cargo clippy --all-targets` clean
+after each file (one stray unused `Value` import in `board_pieces_cmd.rs`, left over from
+removing its local `fen_from_input` helper, caught and fixed this way); `cargo test`
+67/67 green (unchanged count — confirms no tested behavior was accidentally removed
+alongside the dead code); release binary rebuilt and re-registered; live smoke test of
+every touched command (`is-legal`, `gives-check`, `collapse-criticality`, `board-pieces`,
+`apply-uci`, `fen-info`, `attack-summary`, `checker-summary`, `legal-moves`) against a
+freshly-derived start-position FEN; full blunder-corpus regression re-run, unchanged from
+its last recorded state.
+
+## 2026-09-04 (continued): `piece_activity_score`'s rook/queen rank bonuses swapped onto
+## `Color::relative_rank` — a third "defer to shakmaty" instance, exhaustively verified
+
+Discussion of the DB's canonical (White-always-to-move) storage convention raised a
+related but distinct question: could a live-play *function* internally simplify its own
+logic with a "mover is White" convention, without touching stored data at all? Answer:
+shakmaty already has exactly this as a small, per-call, non-persisted primitive —
+`Color::relative_rank(rank) -> Rank` (`color.rs:90`: `White => rank, Black =>
+rank.flip_vertical()`), already used internally by shakmaty's own en-passant validation
+(`setup.rs:393`). The critical distinction from the DB's canonical mirroring: this is
+computed fresh from the real position at every call site, never stored or serialized —
+so unlike `positions.fen`/`moves.canonical_san` (two real historical bugs from a stored
+canonical artifact drifting out of sync with real-game context, see "Canonical position
+identity" section and `CLAUDE.md`), there's no persisted representation that can ever
+disagree with "real."
+
+Found two real, matching instances in `eval/position.rs`'s `piece_activity_score` (feeds
+the tuned, deliberately-unread `final_score` — same caution class as `detect_skewers`/
+Tier 3 items above): the rook-rank bonus (`position.rs:1233-1243`, originally) picked
+`(Rank::Seventh, Rank::Eighth, Rank::Sixth)` vs `(Rank::Second, Rank::First, Rank::Third)`
+by hand-branching on `color.is_white()`; the queen-on-seventh bonus
+(`position.rs:1279-1284`, originally) did the identical `if/else` for a single rank. Both
+are exactly what `relative_rank` exists for.
+
+**Verification approach, chosen deliberately over sampling real positions**: since the
+branch's only inputs are `Color` (2 values) and a handful of literal `Rank` constants —
+no board state, no position dependency at all — an exhaustive check over both colors is a
+complete proof of equivalence, not an approximation the way sampling real FENs would be
+(unlike `detect_skewers`, which is genuinely position-dependent and needs real-position
+A/B diffs). Added a temporary test asserting `color.relative_rank(Rank::Seventh) ==
+old_branch_seventh` etc. for both `Color::White` and `Color::Black`, confirmed green, then
+applied the swap and deleted the temporary test (nothing further to compare once the
+production code only has the one implementation). Rook rank bonus:
+```rust
+let seventh = color.relative_rank(Rank::Seventh);
+let eighth = color.relative_rank(Rank::Eighth);
+let sixth = color.relative_rank(Rank::Sixth);
+let enemy_back_ranks = Bitboard::from(seventh) | Bitboard::from(eighth);
+```
+Queen bonus: `if sq.rank() == color.relative_rank(Rank::Seventh) { local += 13; }`.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean; `cargo test`
+67/67 (same count as before — pure refactor, no behavior change, confirmed by the
+exhaustive proof above rather than merely inferred from the count); `cargo test --test
+sts_positional -- --ignored` green (the STS smoke suite, since this touches the tuned
+scoring table); release binary rebuilt and re-registered; full blunder-corpus regression
+unchanged from its last recorded state. `CLAUDE.md`'s "Chessdb defers to shakmaty"
+section updated with this as a third concrete instance, noting explicitly why exhaustive
+verification was correct here where the other two examples needed real-position A/B
+diffs instead.
+
+## 2026-09-04 (continued): a second shakmaty-vs-chessdb audit pass — `Color::fold_wb`/
+## `Color::backrank`, plus one more `relative_rank` instance missed the first time
+
+Ran another full audit (source-vs-usage diff of shakmaty 0.30.1 against `nu_plugin_chessdb`,
+same discipline as the earlier "five pass-through-simple exposures" pass and the
+`relative_rank` swap above: read shakmaty's actual source, don't assume; check visibility/
+feature-gating before claiming a method usable; check whether a candidate loop is
+sequential before touching it). Confirmed `Cargo.toml` still uses default features only
+(`std`, `magics`) — no `variant`, so `Chess::gives_check` stays correctly unused
+(re-confirmed private + feature-gated, matching the earlier finding).
+
+Three more real, provably-safe swaps found, all in `eval/position.rs`, all — like
+`relative_rank` above — pure functions of `Color` and a handful of static inputs, so
+verifiable exhaustively rather than by real-position sampling:
+
+- **`Color::fold_wb(white, black)`** (`color.rs:53`, body is exactly `match self { White
+  => white, Black => black }`) replaced 5 `if color.is_white() { A } else { B }` branches
+  that were picking a plain value rather than a rank: the pawn-break support-rank lookup
+  (was ~line 651), the pawn-break push-direction lookup (~777), the `in_front` shift-tuple
+  (~1055), the pawn-mobility push-direction lookup (~1313, same shape as 777), and
+  `DevelopmentInfo.space_advantage`'s sign flip (~1966 — this one's real output, not
+  internal-score-only, since `space_advantage` is reported in
+  `SensorReport.positional.development`).
+- **`Color::backrank()`** (`color.rs:82`, `White => Rank::First, Black => Rank::Eighth`)
+  replaced the knight and bishop back-rank penalty checks (`if color.is_white() { sq.rank()
+  == Rank::First } else { sq.rank() == Rank::Eighth }`, ~1125 and ~1178 — same one-line
+  collapse shape as the earlier rook/queen `relative_rank` fix) and the king-square
+  fallback in `development_space_score` (`Square::from_coords(File::E, color.backrank())`
+  in place of a hand-picked `Square::E1`/`Square::E8` literal, ~1014/1022).
+- **A second `relative_rank` instance the first pass missed**: `extract_passed_pawns`
+  (~1699, was `if color.is_white() { rank_idx } else { 7 - rank_idx }`) is exactly
+  `u32::from(color.relative_rank(rank))` — `Rank::flip_vertical` is literally `Rank::new(7
+  - self.to_u32())` (confirmed by reading `square.rs:275-277`, not assumed). This one
+  feeds `PassedPawn.rank`, real output in `SensorReport.positional.passed_pawns` — spot-
+  checked live post-swap on `8/8/8/4P3/8/8/p7/4K2k w - - 0 1`: white pawn e5 → rank 6,
+  black pawn a2 → rank 8, both hand-verified against the formula before trusting the
+  output.
+
+Explicitly ruled out this pass (see the fork audit's own report for the full reasoning):
+`king_safety_score`'s shield/storm loop (already documented as deliberately sequential,
+not touched — same loop `CLAUDE.md` already warns about); `Position::outcome()` (redundant
+with facts already separately exposed); `castles()`/`ep_square()` (already used);
+`Bitboard::is_subset`/`is_superset`/`intersects`/`is_disjoint` and `san_candidates` (real,
+unused, but no identified chessdb need — not pursued speculatively).
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean; `cargo test`
+67/67 (unchanged count, pure refactor); `cargo test --test sts_positional -- --ignored`
+green; release binary rebuilt and re-registered; full blunder-corpus regression unchanged;
+the `PassedPawn.rank` live spot-check above. `CLAUDE.md`'s "Chessdb defers to shakmaty"
+section updated to name `fold_wb`/`backrank` alongside `relative_rank` as the same pattern.
+
+## 2026-09-04 (continued): a third audit pass finds the big one — `canonical::flip_colors`
+## was hand-rolling `Setup::mirror()`, shakmaty's own position-mirror primitive
+
+A third "meet shakmaty and chessdb" pass, this time looking beyond `eval/position.rs`'s
+internal scoring code at the architecturally central `canonical.rs` — the single
+implementation behind the whole canonical (White-always-to-move) position-identity
+convention (`positions.zobrist`/`.fen`, `openings.fen`; see `CLAUDE.md`'s "Canonical
+position identity" section). Its own doc comment made a specific, checkable claim:
+"`shakmaty` has no single 'swap a position's colors' call — `Board`'s `flip_vertical`
+only repositions pieces, it doesn't recolor them — so this rebuilds the board from its
+role/color bitboards." Read `board.rs` directly to check the claim rather than trust it:
+**it was wrong.** `Board::swap_colors()` (`board.rs:516-518`, `self.by_color.swap()`)
+does exactly the missing half, and `Board::mirror()` (`board.rs:530-533`) is already
+`flip_vertical()` + `swap_colors()` — the exact composition `flip_colors` was hand-building.
+Going one level up, `Setup::mirror()` (`setup.rs:124-136`) composes the *whole* thing this
+function needs in one call: `board.mirror()`, turn flip (`self.turn = !self.turn`),
+castling-rights vertical flip, and en-passant-square vertical flip — field-for-field the
+same transform `flip_colors` was hand-assembling from `ByRole`/`ByColor`/
+`Board::try_from_bitboards`. Neither `Setup` nor `Board::swap_colors`/`mirror` carry any
+`#[cfg(feature = ...)]` gate (checked directly, not assumed, after the `gives_check`
+lesson from earlier this session) — fully public, always available.
+
+**Given this is the one function backing DB position identity — a correctness bug here
+doesn't just skew an internal score, it could corrupt or misclassify stored positions —
+verification went well beyond the exhaustive-proof treatment used for the smaller
+`Color`-branch swaps above.** Built a temporary twin, `flip_colors_via_setup_mirror`
+(`#[cfg(test)]`-gated, `canonical.rs`), and A/B-diffed it against the existing
+`flip_colors` across a 6-position real battery deliberately chosen to cover every field
+the transform touches: full castling rights both sides, no castling rights at all, a
+constructed partial-rights case (`r3k2r/8/8/8/8/8/8/R3K2R w Kk - 0 1`, verified legal via
+`chessdb fen-info` first), an active en passant square (derived live via
+`chessdb apply-uci` chaining `e4`/`a6`/`e5`/`d5` — not hand-typed, and only after
+confirming by hand *why* the naive first attempt at this, `e4 a6 d4 d5`, correctly
+produced no ep square: en passant requires the capturing pawn already on the double-pushed
+pawn's own rank, not one rank behind, which the first attempt didn't satisfy), and both
+white-to-move/black-to-move inputs. Asserted resulting FEN (`EnPassantMode::Legal`)
+byte-identical, plus the involution property (double-flip recovers the original) for both
+implementations. All green on the first run — the two implementations, byte-identical
+across the whole battery.
+
+Applied the swap: `flip_colors` now reads
+```rust
+pub fn flip_colors(chess: &Chess) -> Result<Chess> {
+    let setup = chess.clone().to_setup(shakmaty::EnPassantMode::Legal).into_mirrored();
+    Chess::from_setup(setup, shakmaty::CastlingMode::Standard)
+        .context("could not build color-flipped position")
+}
+```
+in place of ~25 lines of hand-rolled `ByRole`/`ByColor`/`Board::try_from_bitboards`
+reconstruction, and the doc comment's now-corrected claim credits `Setup::mirror()`
+directly. Removed the temporary twin function; folded its 6-position battery into a
+permanent standing test (`canonical::ab_diff::flip_colors_is_an_involution_across_a_real_battery`)
+covering cases `tests/canonical_identity.rs`'s existing 5 tests don't (partial castling
+rights, active en passant) — kept rather than deleted, since it's real coverage the
+integration-test file didn't have before.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean (one stray
+`Board`/`Setup` unused-import warning after the swap, fixed); `cargo test` 68/68 (67 + the
+new standing battery test), including all 5 of `tests/canonical_identity.rs`'s existing
+canonical-identity tests unchanged; `cargo test --test sts_positional -- --ignored` green;
+release binary rebuilt and re-registered; full blunder-corpus regression unchanged; live
+smoke test of `chessdb canonicalize-fen` on both the exact Black-to-move position
+`tests/canonical_identity.rs` already hand-verifies (byte-identical to its recorded
+expected output) and the constructed active-en-passant FEN (correctly a no-op, already
+White-to-move). `CLAUDE.md`'s "Chessdb defers to shakmaty" section updated with this as
+the most architecturally significant instance of the principle found so far — not a
+scoring-table nuance, but the actual DB-identity transform.
+
+## 2026-09-04 (continued): a fourth audit pass, plus a fifth-pass batch of small
+## `eval/threat_graph.rs` fixes — genuine diminishing returns reached
+
+Ran a fourth full audit pass. First, its own doc-comment check turned up a real stale
+comment: `eval/threat_graph.rs`'s top-of-file module doc still described `detect_skewers`
+as hand-rolling a ray walk that "doesn't yet reuse" shakmaty's occupancy-aware sliding
+attacks — but `detect_skewers` was already rewritten onto `attacks::rook_attacks`/
+`bishop_attacks` back on 2026-09-02 (`CLAUDE.md` already documents this correctly). The
+comment simply never got updated after that rewrite. Corrected it to describe the actual
+current state and point at `CLAUDE.md`/`FINDINGS.md` for the rewrite's history — a
+reminder that a stale doc comment making an unverified "shakmaty can't do X" claim is
+itself worth auditing, not just the code.
+
+The fourth pass's full audit (re-reading `core.rs` in full, `eval/concepts.rs`,
+`eval/concept_types.rs`, `eval/sensor.rs`, `threat_graph.rs`'s actual `find_*`/`control`/
+`attackers` bodies, and the remaining unchecked shakmaty modules — `m.rs`, `uci.rs`,
+`san.rs`, `zobrist.rs`, `packed.rs`, `role.rs`, `castling_side.rs`) found only small
+residual gaps, all in `threat_graph.rs`, applied this same pass:
+
+- **`checkers` (`threat_graph.rs:258`, was)** `if color.is_white() { self.kings.0 } else
+  { self.kings.1 }` and **`delivers_check` (`~301`, was)** the mirrored `if
+  side.is_white() { self.kings.1 } else { self.kings.0 }` — both replaced by restructuring
+  the underlying field itself rather than just swapping the branch: `ThreatGraph.kings`
+  was a hand-rolled `(Option<Square>, Option<Square>)` white/black tuple, exactly what
+  shakmaty's own `ByColor<Option<Square>>` models, with `.get(color)` replacing the
+  branch entirely. Confirmed via grep that `kings` — despite being a `pub` field — has
+  zero call sites outside this one file (including its own test module) before touching
+  it, so the wider type change carried no hidden-caller risk. Now `ByColor::new_with(|c|
+  board.king_of(c))` at construction, `*self.kings.get(color)` and `*self.kings.get(side.other())`
+  at the two call sites, `graph.kings.black.unwrap()` in the one test that read it
+  directly (previously `.kings.1`).
+- **`see_chain`'s `winner` field (`~992-994`)** — a pair of `if initiator.is_white() {
+  "white" } else { "black" }` / mirrored-order variants, replaced with
+  `initiator.fold_wb("white", "black")` / `.fold_wb("black", "white")`. Purely notational
+  (this code path is part of the already-known-buggy SEE chain pricing this file's own
+  module doc flags as unverified — the swap doesn't touch or fix that bug, just the
+  string-selection mechanism around it).
+
+All four are pure functions of `Color`/a 2-value domain — exhaustively verifiable, same
+class as the earlier `piece_activity_score` swaps, no A/B diffing needed.
+
+**Everything else came back clean**, explicitly ruled out rather than left unchecked:
+`core.rs` (no hand-rolled offset/adjacency arithmetic anywhere, no `if color.is_white()`
+branches at all — already uses `attacks::`/`Board::by_piece`/`Square::distance`/
+`Square::is_light` throughout); `eval/concepts.rs`/`concept_types.rs`/`sensor.rs` (pure
+type-mapping/reporting, no geometry or color-branching worth touching); `m.rs`/`uci.rs`/
+`san.rs`/`role.rs`/`castling_side.rs`/`zobrist.rs` (full public surface read; only
+`Move`/`UciMove`/`San` convenience predicates like `is_capture`/`is_castle` remain
+unused, with no current chessdb consumer asking that question — not built ahead of a
+demonstrated need); `packed.rs` (a compact position-encoding format, confirmed via
+reading it, not relevant to this project's FEN/zobrist-based identity model).
+
+**This is a genuine, stated diminishing-returns point, not a paused search**: four
+consecutive audit passes this session (five pass-through exposures → `relative_rank` →
+`fold_wb`/`backrank` → the big `canonical::flip_colors` find → this pass's small
+`threat_graph.rs` batch) have progressively smaller yields, and the fourth pass's own
+full re-read of `core.rs` and the `eval/concepts*`/`sensor.rs` layer found nothing at
+all. Further passes should wait for a new consumer need to surface (e.g., a command
+wanting move-capture/castle/promotion flags) rather than re-sweeping the same surface.
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean (first try, no
+stray warnings this time); `cargo test` 68/68 unchanged; `cargo test --test sts_positional
+-- --ignored` green; release binary rebuilt and re-registered; full blunder-corpus
+regression unchanged; live smoke test of `chessdb checker-summary`/`chessdb
+collapse-criticality` against a real fool's-mate position (derived via chained
+`chessdb apply-uci`, not hand-typed) — `is_check`/`is_checkmate` both `true`, one checker,
+one collapse-criticality candidate — confirming the `checkers`/`kings` restructuring
+didn't disturb the check-detection path it feeds.
+
+## 2026-09-04 (continued): a code-level cleaning/dedup pass — `utils::to_pipeline_data`
+## consolidates 14 identical serialize-then-convert blocks across 7 command files
+
+Requested directly: a general code-cleaning/dedup pass, not another shakmaty-specific
+sweep. Grepped for the exact 2-line pattern every result-returning command was ending
+with — `serde_json::to_value(&result).map_err(...).with_label("serialization error",
+span)` followed by `Ok(PipelineData::Value(json_to_nu_value(json, span), None))` — and
+found it copy-pasted **14 times across 7 files** (`attack_summary_cmd.rs`,
+`checker_summary_cmd.rs`, `legal_moves_cmd.rs`, `fen_info_cmd.rs`, `board_pieces_cmd.rs`
+×4, `geometry_cmd.rs` ×5, `collapse_criticality_cmd.rs`), the same shape as the
+`fen_from_input` consolidation from earlier this session, just on the output side
+instead of the input side. `hugm_eval_cmd.rs`'s own `serde_json::to_value` call was
+checked and correctly left alone — it mutates the JSON value afterward (injecting
+`gated_issues`) before converting, so it isn't the same shape and can't be collapsed
+into a single-call helper without losing that step.
+
+Added `utils::to_pipeline_data<T: serde::Serialize>(value: &T, span: Span) ->
+Result<PipelineData, LabeledError>`, wrapping exactly those two lines, and replaced all
+14 call sites with a single `to_pipeline_data(&result, span)` (or `&results` for
+`collapse_criticality_cmd.rs`), removing the now-unused `json_to_nu_value` import from
+each of the 7 files (it's still imported directly by `hugm_eval_cmd.rs` and internally
+by the new helper itself in `utils.rs`).
+
+Also ran a fresh dead-code cross-reference audit (same methodology as the earlier
+2026-09-04 dedup: grep every `pub fn`/`pub struct` in `core.rs`, `canonical.rs`,
+`chess.rs`, `utils.rs`, `eval/threat_graph.rs` and count real usages elsewhere, watching
+for false-positive substring matches) given how much churn the five shakmaty-merging
+passes since the last dedup introduced. Result: **nothing dead found** — every function
+and struct in those five files has real callers. `canonical::unflip_square` looked
+suspicious at first glance (only 1 hit besides its own definition), but that one hit is
+its sibling `unflip_square_str` calling it internally, itself used 7 times elsewhere —
+legitimately factored, not dead. Also checked for a second near-duplicate: `canonical.rs`'s
+own `#[cfg(test)]` FEN-parsing helper (`fn fen(s: &str) -> Chess`, added earlier this
+session for the `flip_colors` A/B battery) versus `eval/threat_graph.rs`'s pre-existing
+`fn pos(fen: &str) -> Chess` test helper — structurally identical, but only 2 occurrences
+of a 3-line test-only helper in two different test modules; left alone rather than
+extracted into a shared `pub(crate)` test-utils location, matching `CLAUDE.md`'s
+anti-premature-abstraction guidance (two small, module-local instances don't clear the
+bar a cross-module helper would need to justify itself).
+
+Verified: `cargo check --all-targets`/`cargo clippy --all-targets` clean (no unused-import
+warnings from any of the 7 files after the `json_to_nu_value` → `to_pipeline_data` import
+swap); `cargo test` 68/68 unchanged; `cargo test --test sts_positional -- --ignored`
+green; release binary rebuilt and re-registered; live smoke test of every consolidated
+command (`fen-info`, `attack-summary`, `legal-moves`, `geom-attacks`, `board-pieces`,
+`bitboard-mask`, `square-distance`, `collapse-criticality`, `checker-summary`) against a
+fresh start-position FEN, all correct; full blunder-corpus regression unchanged.

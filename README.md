@@ -165,11 +165,15 @@ All commands accept `--db <path>` to override the default `./chess.db`.
 | `chessdb attack-summary` | Every square attacked by White and by Black, plus per-side attack counts |
 | `chessdb checker-summary` | is_check/is_checkmate and the named checking square(s) |
 | `chessdb is-legal` | Cheap yes/no legality check for a move (SAN or UCI) in a given FEN |
+| `chessdb gives-check` | `Chess::gives_check`-equivalent (`clone`/`play_unchecked`/`is_check`, since the real method is private and feature-gated) — would `--uci` give check in this FEN? |
 | `chessdb geom-attacks` | `shakmaty::attacks::attacks(square, piece, occupied)` — pure geometry, no board or position, one dispatcher for every role, `occupied` always an explicit input |
 | `chessdb geom-ray` | `shakmaty::attacks::ray(a, b)` — every square on the rank/file/diagonal through both, no board needed |
 | `chessdb geom-between` | `shakmaty::attacks::between(a, b)` — squares strictly between two aligned squares, no board needed |
 | `chessdb geom-aligned` | `shakmaty::attacks::aligned(a, b, c)` — true if three squares share a rank/file/diagonal, no board needed |
-| `chessdb board-pieces` | `Board::occupied`/`by_color`/`by_role`/`by_piece` for a FEN, filtered by optional `--color`/`--role` |
+| `chessdb square-distance` | `Square::distance(a, b)` — Chebyshev distance (`max(file_dist, rank_dist)`), no board needed |
+| `chessdb board-pieces` | `Board::occupied`/`by_color`/`by_role`/`by_piece` for a FEN, filtered by optional `--color`/`--role`; also returns the raw `Bitboard` (`bitboard`/`bitboard_hex`/`popcount`) and set-scalar facts (`first`/`last`/`more_than_one`) |
+| `chessdb board-pieces-ascii` | Same selection as `board-pieces`, rendered as an 8-line ASCII grid and a compact FEN-piece-placement-shaped string — all rendering done in Rust, nothing bitwise in Nu |
+| `chessdb bitboard-mask` | A named `Bitboard` associated constant (`dark-squares`/`light-squares`/`center`/`edges`/`corners`/`backranks`/`north`/`south`/`west`/`east`), rendered the same way as `board-pieces-ascii` — no FEN, position-independent |
 | `chessdb board-piece-at` | `Board::piece_at(--square)` for a FEN — `{color, role}` or null |
 | `chessdb square-is-light` | `Square::is_light(--square)` — a pure square fact, no FEN needed at all |
 

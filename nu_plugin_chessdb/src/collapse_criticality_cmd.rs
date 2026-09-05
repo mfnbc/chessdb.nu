@@ -1,9 +1,10 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
-use nu_protocol::{Category, LabeledError, PipelineData, Signature, SyntaxShape, Type, Value};
-use shakmaty::{fen::Fen, CastlingMode, Chess, Square};
+use nu_protocol::{Category, LabeledError, PipelineData, Signature, SyntaxShape, Type};
+use shakmaty::Square;
 
+use crate::chess::fen_to_chess;
 use crate::eval::threat_graph::ThreatGraph;
-use crate::utils::json_to_nu_value;
+use crate::utils::{fen_from_input, to_pipeline_data};
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -51,20 +52,11 @@ impl PluginCommand for CollapseCriticalityCmd {
         let sq = Square::from_ascii(square_str.as_bytes())
             .map_err(|_| LabeledError::new(format!("invalid square: {square_str}")).with_label("expected a square like 'f5'", span))?;
 
-        let fen = match input.into_value(span)? {
-            Value::String { val, .. } => val,
-            _ => return Err(LabeledError::new("expected a FEN string").with_label("invalid input type", span)),
-        };
-        let parsed = Fen::from_ascii(fen.as_bytes())
-            .map_err(|e| LabeledError::new(e.to_string()).with_label("invalid FEN", span))?;
-        let chess: Chess = parsed
-            .into_position(CastlingMode::Standard)
-            .map_err(|e| LabeledError::new(e.to_string()).with_label("could not convert FEN to a chess position", span))?;
+        let fen = fen_from_input(input, span)?;
+        let chess = fen_to_chess(&fen, span)?;
 
         let graph = ThreatGraph::build(&chess);
         let results = graph.collapse_criticality(sq);
-        let json = serde_json::to_value(&results)
-            .map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-        Ok(PipelineData::Value(json_to_nu_value(json, span), None))
+        to_pipeline_data(&results, span)
     }
 }

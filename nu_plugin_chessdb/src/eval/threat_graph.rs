@@ -55,10 +55,13 @@
 //! **Not built from this graph at all**: pins, skewers, and discovered
 //! attacks are detected independently in `position.rs` (`detect_pins`,
 //! `detect_skewers`, `detect_discovered`) using shakmaty's own
-//! occupancy-aware sliding-attack primitives directly — `detect_pins` calls
-//! `attacks::rook_attacks`/`bishop_attacks` itself; `detect_skewers` instead
-//! hand-rolls a ray walk that doesn't yet reuse them (a known, deferred gap,
-//! FINDINGS.md). Forks *are* graph-derived (`find_forks` below), but through a
+//! occupancy-aware sliding-attack primitives directly — both `detect_pins`
+//! and `detect_skewers` call `attacks::rook_attacks`/`bishop_attacks`
+//! themselves (`detect_skewers` was rewritten off its original hand-rolled
+//! ray walk on 2026-09-02, A/B-verified byte-identical — see `CLAUDE.md`'s
+//! "Chessdb defers to shakmaty" section and `FINDINGS.md`; this comment
+//! previously described the pre-rewrite state and was corrected 2026-09-04).
+//! Forks *are* graph-derived (`find_forks` below), but through a
 //! second, independent `detect_forks` also exists in `position.rs` purely
 //! for the legacy scoring engine, with a threshold that can disagree with
 //! this one (FINDINGS.md).
@@ -112,7 +115,7 @@
 //!    (center, flanks, king-safety-as-a-zone) are the next tier above this
 //!    one, not yet built — this lattice stays purely material/tactical.
 
-use shakmaty::{attacks, Bitboard, Board, CastlingMode, Chess, Color, FromSetup, Piece, Position, Role, Setup, Square};
+use shakmaty::{attacks, Bitboard, Board, ByColor, CastlingMode, Chess, Color, FromSetup, Piece, Position, Role, Setup, Square};
 use crate::eval::concept_types::*;
 
 /// Feed a hypothetical board into shakmaty for the one thing the graph
@@ -158,8 +161,9 @@ pub struct ThreatGraph {
     pub pieces: [Option<Piece>; 64],
     /// Side to move
     pub turn: Color,
-    /// King squares: (white_king, black_king)
-    pub kings: (Option<Square>, Option<Square>),
+    /// King squares, indexed by `ByColor::get(color)` instead of a hand-rolled
+    /// white/black tuple.
+    pub kings: ByColor<Option<Square>>,
     /// Full board for SEE context
     pub board: Board,
 }
@@ -196,7 +200,7 @@ impl ThreatGraph {
                                  | board.attacks_to(sq, Color::Black, occupied);
         }
 
-        let kings = (board.king_of(Color::White), board.king_of(Color::Black));
+        let kings = ByColor::new_with(|c| board.king_of(c));
         ThreatGraph { attacks_from, attackers_to, pieces, turn, kings, board }
     }
 
@@ -252,7 +256,7 @@ impl ThreatGraph {
     /// these — a king that was part of the cleared cluster and isn't the
     /// candidate being tested).
     pub fn checkers(&self, color: Color) -> Vec<PieceRef> {
-        let king_sq = if color.is_white() { self.kings.0 } else { self.kings.1 };
+        let king_sq = *self.kings.get(color);
         let Some(king_sq) = king_sq else { return Vec::new() };
         self.attackers(king_sq, color.other()).into_iter().filter_map(|sq| {
             self.pieces[Self::idx(sq)].map(|p| PieceRef {
@@ -295,7 +299,7 @@ impl ThreatGraph {
 
     /// After a capture on `sq` by `side`, check if this delivers check.
     fn delivers_check(&self, board: &Board, cap_sq: Square, side: Color) -> bool {
-        let opp_king = if side.is_white() { self.kings.1 } else { self.kings.0 };
+        let opp_king = *self.kings.get(side.other());
         let Some(king_sq) = opp_king else { return false };
         let occupied = board.occupied();
         // Direct: the capture square attacks the king (piece now sits there)
@@ -986,9 +990,9 @@ impl ThreatGraph {
                 steps: captures,
                 net_cp: net,
                 winner: if net > 0 {
-                    (if initiator.is_white() { "white" } else { "black" }).to_string()
+                    initiator.fold_wb("white", "black").to_string()
                 } else if net < 0 {
-                    (if initiator.is_white() { "black" } else { "white" }).to_string()
+                    initiator.fold_wb("black", "white").to_string()
                 } else { "even".to_string() },
             })
         } else {
@@ -1095,7 +1099,7 @@ mod tests {
     fn zone_control_sums_control_over_every_square_in_the_zone() {
         let chess = pos("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1");
         let graph = ThreatGraph::build(&chess);
-        let king_sq = graph.kings.1.unwrap(); // black king, e8
+        let king_sq = graph.kings.black.unwrap(); // black king, e8
         let zone = attacks::king_attacks(king_sq) | Bitboard::from(king_sq);
 
         let independent_sum: i32 = zone.into_iter().map(|sq| graph.control(sq, Color::Black)).sum();

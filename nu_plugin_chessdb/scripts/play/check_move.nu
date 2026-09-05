@@ -36,6 +36,19 @@
 # 2026-09-03: converted to nuon in/out (move-history nuon string in, never
 # a hand-typed FEN; one nuon record out, no print, no ascii grid) per the
 # same-date nuon-everything decision -- see `board_overlay.nu`.
+#
+# 2026-09-03 (Game 18 postmortem): added `destination_square_swap_list`,
+# computed on the PRE-move FEN before the candidate is applied at all. A
+# single-move safety check (my_pieces_at_risk) can only ever say "does THIS
+# move hang something" -- it has no reason to surface a piece that isn't
+# attacking or forking anything yet but is lined up behind whatever's about
+# to be traded with on the destination square (chessdb_swap_list_before_
+# trading: a queen backed up behind a rook on an open file, invisible to
+# check_move.nu, cost a queen in Game 18 when `Rc8` looked completely clean
+# here but the full exchange chain on `c8` -- run only in hindsight -- had
+# named the danger the whole time). Reading this field is now free every
+# time this tool is already being run, closing that gap at the source
+# instead of relying on remembering to run `swap-list` separately.
 use ./board_overlay.nu *
 use ./shakmaty_compose.nu *
 
@@ -68,6 +81,13 @@ def main [moves: string, candidate: string] {
     let my_mover_favored = ($t.mover_favored | where { |m| $m.piece.color == $my_color })
 
     let dest_square = ($candidate | str substring 2..3)
+    # Computed on $fen -- the position BEFORE this candidate is applied --
+    # so it shows what already covers the destination square, including
+    # pieces lined up behind whatever's sitting there now that aren't
+    # attacking/forking anything yet and so wouldn't show up in
+    # my_pieces_at_risk. See the header comment: this is what would have
+    # caught the Game 18 queen loss before Rc8 was ever played.
+    let destination_square_swap_list = (swap-list $fen $dest_square)
 
     {
         legal: true,
@@ -75,6 +95,7 @@ def main [moves: string, candidate: string] {
         mate_in_1: $mate_in_1,
         my_pieces_at_risk: {hanging: $my_hanging, outnumbered: $my_outnumbered, mover_favored: $my_mover_favored},
         destination_square: $dest_square,
+        destination_square_swap_list: $destination_square_swap_list,
         board: (fen-to-board $ok),
         counts: {
             hanging: ($t.hanging | length), forks: ($t.forks | length), pins: ($t.pins | length),

@@ -221,6 +221,26 @@ A concrete plan generates and ranks candidates on its own; without one, move sel
 degrades back into "pick whatever doesn't lose material," which is the exact failure this
 section exists to name.
 
+**Ground the theme in a specific field, then verify the path actually gets there — don't
+stop at naming a plan in the abstract.** "Improve the bad bishop" or "target the isolated
+pawn" is still vague enough that nothing checks whether it's really happening.
+`full_report.nu`'s `positional.*` facts are each already a concrete, named goal, not just
+descriptive color: an `outposts` entry names the exact square to post a piece on, an
+`isolated_pawns`/`backward_pawns`/`doubled_pawns` entry names the exact pawn to target, an
+`open_files`/`semi_open_files` entry names the exact file to occupy, a `passed_pawns` entry
+(check `is_protected`) names the exact pawn to push or blockade. Read these the same way
+section 2 already reads `tactical.*` — as a menu of candidate goals grounded in the current
+position, not abstractions to invent from scratch. Pick whichever matters most given
+section 2's priority order (only after tactics/material/king-safety are settled, same as
+the rest of (d)/(e)), then pick a concrete move sequence by judgment that plausibly reaches
+or exploits that target, and verify it with `calc_line.nu` the same way a forcing line gets
+verified above: walk the sequence node by node and confirm nothing hangs *and* the goal is
+actually achieved (the piece lands safely on the outpost square, the pawn is actually
+captured or permanently fixed, the file is actually occupied uncontested) — not just that
+the moves are legal. Same division of labor as everywhere else in this skill: the tool
+never picks the goal or the sequence for you, it only verifies that the one you picked
+survives contact with the position instead of collapsing on move three.
+
 ## Re-evaluate the plan every move — don't just state it once and coast
 
 Game 13 (2026-09-02, FINDINGS.md) got checkmated after playing every individual move

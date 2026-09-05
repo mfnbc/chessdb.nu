@@ -1,0 +1,106 @@
+#!/usr/bin/env nu
+# A reusable regression corpus of real historical blunders, mined from
+# FINDINGS.md, for retesting `full_report.nu`/`shakmaty_compose.nu` (or any
+# future report/detector) against real positions that actually caused real
+# losses -- not invented test cases. Built 2026-09-03 per explicit user
+# direction: "make a blunder list of suspect moves and why they failed so
+# we can retest fixes."
+#
+# Every `history`/`fen` below was reconstructed mechanically (`chessdb
+# pgn-to-fens` for SAN-recorded games, `history-to-fen`/`apply-uci` for
+# UCI-recorded ones) from FINDINGS.md's own already-published move lists --
+# never hand-typed. Two real transcription errors in FINDINGS.md's own
+# archive were found doing this (game 13's move 24 and game 14's move
+# 18-20 span) -- see the `note` field on each affected entry and the
+# 2026-09-03 FINDINGS.md entries for the full account.
+#
+# Usage: `open blunder_corpus.nuon | each {|b| ...}` -- each entry gives
+# either `history` (a uci move list to feed `history-to-fen`) or `fen`
+# directly (when FINDINGS.md already recorded the exact FEN), plus
+# `failure`, `expected_field`, and `verified_2026_09_03` describing what
+# was checked and what it showed.
+
+[
+  {
+    game: 6
+    date: "2026-09-01"
+    move: "17...Qxh2#"
+    blunder_move: "17.Qa5"
+    fen: "r3k2r/2p2ppp/p2bp3/Qp6/3P4/2P1B2q/P1P2P2/1R3RK1 b kq - 1 17"
+    failure: "mate_in_1_exists was fully computed but unreachable from .explanations, the only field being read at the time -- a pure visibility gap, not a calculation error"
+    expected_field: "mate_in_1_exists"
+    verified_2026_09_03: {result: true, matches_history: true, note: "full-report.mate_in_1_exists correctly true -- confirms the fix (surfacing this field directly, no longer buried behind explanations text) still holds"}
+  }
+  {
+    game: 10
+    date: "2026-09-02"
+    move: "28...Bxh3 (candidate, then actually played)"
+    blunder_move: null
+    history: [g1f3 b8c6 c2c4 g8f6 g2g3 e7e5 f1g2 f8c5 e1g1 d7d6 d2d3 e8g8 b1c3 c8g4 h2h3 g4e6 d1b3 a8b8 c1e3 c5e3 f2e3 h7h6 d3d4 c6a5 b3b5 c7c6 b5a4 a5c4 a4b3 c4e3 b3a3 e3f1 a1f1 d8b6 f1d1 e5e4 f3e1 d6d5 e1c2 b6c7 c2e3 c7g3 e3f1 g3g5 g1h1 g5h4 h1h2 f6g4 h2g1 g4f2 d1e1 f2h3 g2h3]
+    failure: "check_move.nu correctly flagged BOTH Bishop@h3 and Rook@e1 as independently hanging in one MY PIECES AT RISK block -- read as one connected story (the rook was already lost to an unrelated fork) instead of two separate facts each needing its own why"
+    expected_field: "tactical.hanging"
+    verified_2026_09_03: {result: "2 entries: Bishop@h3 (white) and Rook@e1 (white)", matches_history: true, note: "full-report reproduces both hanging entries exactly as check_move.nu showed live -- the tool was never the gap, reading each line independently is"}
+  }
+  {
+    game: 11
+    date: "2026-09-02"
+    move: "11.Bd3"
+    blunder_move: "11.Bd3"
+    history: [e2e4 d7d5 e4d5 g8f6 c2c4 c7c6 b1c3 c6d5 c4d5 f6d5 c3d5 d8d5 g1f3 b8c6 d2d4 c8f5 d1b3 d5b3 a2b3 f5e4 f1d3]
+    failure: "hung the bishop outright, misread by wrong analogy to an earlier, structurally different mutual-attack position (9.Qb3) that DID have a real third defender -- a reading error, not a visibility gap; check_move.nu already showed safe_to_capture:true correctly at the time"
+    expected_field: "tactical.hanging"
+    verified_2026_09_03: {result: "Bishop@d3 (white), safe_to_capture:true, value:330, plus black's mutually-attacked Bishop@e4", matches_history: true, note: "full-report preserves the exact same signal check_move.nu showed live"}
+  }
+  {
+    game: 13
+    date: "2026-09-02"
+    move: "25.Rg1 (abandoned the only file contesting the attack)"
+    blunder_move: "25.Rg1"
+    fen_before_move: "3r2k1/pp1r1pp1/4p2p/8/1PP3nq/2QB3P/6P1/2RR3K w - - 2 25"
+    note: "FINDINGS.md's written move list has a real transcription error at move 24 -- '24.Kh2' is illegal (chessdb pgn-to-fens refused to parse it); the only legal reply to 23...Qxf2+ was Kh1. This fen uses the corrected Kh1. Not fixed in the original FINDINGS.md prose (honest-archive convention), just noted here and in the 2026-09-03 entry."
+    failure: "no single-ply tactic existed (hanging/forks both empty) -- the original diagnosis was a sharp position needing several-ply forcing-line calculation, not a static fact. Retested 2026-09-03: tactical.pins was NOT empty (an absolute pin, Qh4 pinning Ph3 to Kh1) -- a real severe fact present in the report but not what the original postmortem's attention landed on"
+    expected_field: "tactical.pins (an honest, non-clean result -- the danger sign was present but under-weighted, not missing)"
+    verified_2026_09_03: {result: "hanging=[] forks=[] pins=[absolute pin: Qh4 -> Ph3 -> Kh1], king-mobility destinations=[g1] (only one legal king move)", matches_history: "partially -- confirms 'nothing hangs' was true, but reveals a real warning (the pin) that was in the data all along"}
+  }
+  {
+    game: 15
+    date: "2026-09-02"
+    move: "19.Qxa7 (into 19...Ra8, trapping the queen)"
+    blunder_move: "19.Qxa7"
+    history: [e2e4 d7d5 e4d5 g8f6 d2d4 f6d5 g1f3 e7e6 f1d3 b8c6 e1g1 f8e7 b1c3 c6b4 c3d5 e6d5 a2a3 b4d3 d1d3 e8g8 c1f4 f8e8 f1e1 c8e6 f3e5 e7d6 a1d1 f7f6 c2c4 c7c6 d3b3 a8b8 c4d5 e6d5 b3a4 d8c7 a4a7 b8a8]
+    failure: "checked that a7/b7 were undefended before capturing, correctly -- but never checked whether the queen would have anywhere safe to retreat if attacked back next move. Distinct from wide-before-deep: this is about not checking one ply further than the capture itself"
+    expected_field: "piece-mobility-safety (a tool built 2026-09-03, specifically to formalize this exact check)"
+    verified_2026_09_03: {result: "all 8 real legal queen retreats each show a real attacker: a4:[a8] a5:[a8,c7] c5:[d6] a6:[a8,b7] b6:[c7] b7:[c7] a8:[e8] b8:[a8,c7,e8]", matches_history: true, note: "exact reproduction of the manual chessdb legal-moves enumeration done live at the time, now one function call"}
+  }
+  {
+    game: 16
+    date: "2026-09-03"
+    move: "14...Bxe5"
+    blunder_move: "14...Bxe5"
+    history: [g1f3 d7d5 b1c3 g8f6 e2e3 c8f5 f1b5 c7c6 b5e2 e7e6 f3h4 f5g6 e1g1 f8d6 f2f4 b8d7 h4g6 h7g6 d2d4 e8g8 c1d2 d8c7 e2d3 a8e8 d1f3 e6e5 f4e5 d6e5]
+    failure: "MOVER_FAVORED 1v3 read as safe by count alone -- the single attacker (a pawn, value 100) was cheaper than the defended bishop (330), so the FIRST capture alone already won material regardless of the 3 defenders. The count doesn't carry piece values"
+    expected_field: "tactical.mover_favored (shows the same misleading count by design) vs swap-list (shows the fix)"
+    verified_2026_09_03: {result: "mover_favored: attacker_count=1 defender_count=3 for Bishop@e5 (the SAME misleading count) -- but swap-list on e5 shows notation '0ply b 1ply Pnrq', the cheap pawn sorted first by value", matches_history: true, note: "full-report alone reproduces the historical trap; swap-list run alongside it is what actually would have prevented it"}
+  }
+  {
+    game: 14
+    date: "2026-09-02"
+    move: "28.Rc5 (captured for free 4 moves later by a pawn already identified as defending c5 earlier in the same game)"
+    blunder_move: "28.Rc5"
+    history: null
+    failure: "check_move.nu's MY PIECES AT RISK correctly printed 'MOVER_FAVORED: Rook@c5 1v1 -- verify with calc_line.nu' -- attention went to a more interesting-looking fact (Bf5 hanging) in the same output instead. The tool had already surfaced the exact warning, unread."
+    expected_field: "tactical.mover_favored (not retested -- see note)"
+    verified_2026_09_03: null
+    note: "COULD NOT RECONSTRUCT: FINDINGS.md's own move list has an unresolved inconsistency around moves 18-20 (18.Nd4 is ambiguous between two white knights, and neither disambiguation makes 20...Bxe4 legal -- something is missing or mis-transcribed in the archived text that predates this session's verification discipline). Flagged rather than guessed at. If ever needed, replay the game live via fruit_move.sh instead of trusting this written record."
+  }
+  {
+    game: 19
+    date: "2026-09-04"
+    move: "7...Nxf2 (knight sacrifice offered, run through 9 squares across the whole game, never once captured -- lost by checkmate anyway)"
+    blunder_move: null
+    history: [e2e4 d7d5 e4d5 g8f6 c2c4 c7c6 d5c6 b8c6 b1c3 e7e5 g1f3 f8c5 f1e2 e5e4 c3e4 f6e4 e1g1 d8b6 d2d3 e4f2]
+    failure: "no single tactical blunder anywhere in the game -- every one of 9 separate 'the knight is hanging' offers (Rxf2, Nd4, Be3, Qe3+, Rxf7, Qxc5, d4, Qxf2 x2) was correctly verified with check_move.nu's destination_square_swap_list and rejected. Lost anyway: the sacrifice's real point was never assessed as a whole -- forcing a long sequence of only-technically-safe reactive king/pawn moves (Kh1, Kh2, h3, g3) that each individually passed verification while cumulatively opening the exact lines (long diagonal to the king, kingside pawn shield) the sacrifice was aiming at from the start"
+    expected_field: "positional.king_exposure (should have been checked proactively at move 7, right after the sacrifice, not just reactively per-candidate for the rest of the game)"
+    verified_2026_09_04: {result: "king_exposure at the position right after 7...Nxf2 (fen derivable via history-to-fen on the history above): not separately re-derived here -- this entry records the STRATEGIC finding (see chessdb_sound_sacrifice_beats_verification memory), not a single re-testable tactical fact the way other corpus entries do", note: "left intentionally without a single re-testable field: the actual lesson is a judgment-call discipline (assess a repeated sacrifice's structural point once, at the start, rather than re-verifying its tactical debris move by move), not a fact any current tool computes -- test_blunder_corpus.nu should skip this entry's re-derivation the same way it skips game 14"}
+  }
+]

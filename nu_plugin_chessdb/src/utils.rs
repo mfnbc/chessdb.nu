@@ -1,5 +1,19 @@
 use nu_protocol::{LabeledError, PipelineData, Record, Span, Value};
 
+/// Extract a single FEN string from pipeline input — every plugin command
+/// that takes a FEN via the pipeline used to duplicate this exact 4-line
+/// match arm inline (or, in one case, as its own private copy of this same
+/// helper). Deduplicated 2026-09-04: one shared version here, matching
+/// `json_to_nu_value`/`map_string_or_list`'s existing convention of
+/// keeping cross-cutting plugin-command boilerplate in this module rather
+/// than copied per command file.
+pub fn fen_from_input(input: PipelineData, span: Span) -> Result<String, LabeledError> {
+    match input.into_value(span)? {
+        Value::String { val, .. } => Ok(val),
+        _ => Err(LabeledError::new("expected a FEN string").with_label("invalid input type", span)),
+    }
+}
+
 /// Recursively convert a `serde_json::Value` into a `nu_protocol::Value`.
 pub fn json_to_nu_value(val: serde_json::Value, span: nu_protocol::Span) -> Value {
     match val {
@@ -27,6 +41,17 @@ pub fn json_to_nu_value(val: serde_json::Value, span: nu_protocol::Span) -> Valu
             Value::record(rec, span)
         }
     }
+}
+
+/// Serialize a typed result struct to `PipelineData` — every plugin command
+/// returning a record/list-of-records used to duplicate this exact
+/// serialize-then-convert pair inline (14 occurrences across 7 command
+/// files as of 2026-09-04). Deduplicated the same way `fen_from_input` was:
+/// one shared version here rather than copied per command file.
+pub fn to_pipeline_data<T: serde::Serialize>(value: &T, span: Span) -> Result<PipelineData, LabeledError> {
+    let json = serde_json::to_value(value)
+        .map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
+    Ok(PipelineData::Value(json_to_nu_value(json, span), None))
 }
 
 /// Shared by every plugin command whose input is "a string, or a list of

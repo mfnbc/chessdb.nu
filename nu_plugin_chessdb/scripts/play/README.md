@@ -182,14 +182,42 @@ flowchart BT
   (hanging/forks/pins/skewers/discovered/outnumbered/mover_favored/
   overloaded/false_defense/false_safety, outposts/open_files/passed_pawns/
   doubled_pawns/isolated_pawns/pawn_islands/pawn_breaks/pawn_majority/
-  rook_on_seventh/king_exposure), every computed-valuation field stripped
-  (`shakmaty_compose.nu`'s `strip-scores` — no `final_score`, no
-  `aggregated.*_cp`, no `engine_score`, no per-fact
-  `consequence`/`see_cp`/`centipawns`, by a generic name-pattern filter, not
-  a hand-audited allowlist). This is what `.claude/skills/position-eval/
-  SKILL.md` reads from now — one call, then read the report in priority
-  order (tactics/safety first, down to piece activity last), rather than
-  deciding which of several narrow tools answers which question.
+  rook_on_seventh/king_exposure) plus a `detectors` field (see below),
+  every computed-valuation field stripped (`shakmaty_compose.nu`'s
+  `strip-scores` — no `final_score`, no `aggregated.*_cp`, no
+  `engine_score`, no per-fact `consequence`/`see_cp`/`centipawns`, by a
+  generic name-pattern filter, not a hand-audited allowlist). This is what
+  `.claude/skills/position-eval/SKILL.md` reads from now — one call, then
+  read the report in priority order (tactics/safety first, down to piece
+  activity last), rather than deciding which of several narrow tools
+  answers which question.
+
+  **`detectors`** (2026-09-03) — a gap audit against
+  [dev-arcturus/positional_chess](https://github.com/dev-arcturus/positional_chess),
+  a comparable browser/wasm chess-analysis tool with the same
+  raw-engine-plus-structured-fact-layer shape, whose README lists ~70
+  named motifs. Deliberately excludes anything requiring a judgment call
+  (their `sacrifice`, `tempo`, `prophylaxis`, `bad_bishop`, move-quality
+  classification via a win-rate sigmoid, ...) — those are computed
+  valuations by another name, the exact thing `strip-scores` exists to
+  keep out. What's in `detectors`, all pure structural facts composed
+  entirely from the leaf commands: `battery` (2+ same-color sliding
+  pieces aligned on one ray with nothing between — subsumes the classic
+  "connected rooks" as one instance, not a separate detector),
+  `knights_on_rim` (file a/h specifically, not rank 1/8 — a real bug
+  caught by testing against the start position, where every knight starts
+  on rank 1/8 and isn't rim), `fianchettoed_bishops`,
+  `long_diagonal_pieces`, `semi_open_files` (distinct from
+  `positional.open_files` — one side absent, not both), `supported_pawns`
+  (defended by another own pawn specifically), `backward_pawns` (distinct
+  from `isolated_pawns` — can have adjacent-file pawns, just none still
+  behind or level to defend it). Two more live as standalone,
+  square-scoped functions rather than whole-board sweeps (not part of the
+  bundled `detectors` field): `piece-mobility-safety [fen, square]` — the
+  raw fact behind game 15's Qxa7 queen trap, every legal destination for
+  one piece with its real attacker list, formalized instead of a one-off
+  manual check — and `king-mobility [fen]` (side to move's king only,
+  legal move generation isn't defined for the non-moving side).
 
 - **`board_probe.nu <history>`** — every geometric/positional fact shakmaty
   can answer about one position, compiled into one comprehensive record:
@@ -213,7 +241,14 @@ flowchart BT
   fast, mechanical, always-run-first filter. No server-generated prose
   (`.explanations`) — that text embeds `see_cp`/`consequence`/tropism/
   initiative scores by construction; the structured record covers the same
-  ground without a number attached.
+  ground without a number attached. Also returns
+  `destination_square_swap_list` — `swap-list` on the destination square,
+  computed on the position *before* the candidate is applied — for free on
+  every call, so a piece backed up behind whatever's being traded with
+  (invisible to `my_pieces_at_risk`, which only checks the move's own
+  immediate safety) is never missed for lack of a second command (Game 18,
+  `FINDINGS.md`, 2026-09-03: a queen lined up behind a rook on an open file
+  cost a queen this exact way before this field existed).
 
 - **`material.nu <history>`** — raw material by piece count for both sides,
   nothing else. Deliberately never touches `material.balance.centipawns` —
@@ -303,11 +338,37 @@ flowchart BT
 
 - **`shakmaty_compose.nu`** — not run directly; the shared nu-composition
   module `control_map.nu`/`attackers_map.nu`/`square_swap_list.nu`/
-  `board_probe.nu` all `use`. Exports `attacks-to`, `attacks-from`,
-  `swap-list`, `board-probe` — each built from the `geom-attacks`/
-  `board-pieces`/`board-piece-at`/`square-is-light` leaf commands, each
-  A/B-verified byte-identical against the rust-composed command it
-  replaced before that command was removed.
+  `board_probe.nu`/`full_report.nu` all `use`. Exports `attacks-to`,
+  `attacks-from`, `swap-list`, `board-probe`, `full-report`, `strip-scores`
+  — plus the detector batch (`battery`, `piece-mobility-safety`,
+  `king-mobility`, `knights-on-rim`, `fianchettoed-bishops`,
+  `long-diagonal-pieces`, `semi-open-files`, `supported-pawns`,
+  `backward-pawns`) — each built from the `geom-attacks`/`board-pieces`/
+  `board-piece-at`/`square-is-light` leaf commands, each A/B-verified
+  byte-identical against the rust-composed command it replaced before
+  that command was removed (`attacks-to`/`attacks-from`/`swap-list`/
+  `board-probe`), or checked against a real/known position before being
+  trusted (the detector batch).
+
+- **`blunder_corpus.nuon`** — a reusable regression corpus of real
+  historical blunders mined from `FINDINGS.md` (2026-09-03), each with the
+  exact position (reconstructed via `chessdb pgn-to-fens`/`history-to-fen`,
+  never hand-typed), what actually went wrong, and which report field
+  should show it. Not a script — `open blunder_corpus.nuon` for the raw
+  data. Building it caught two real transcription errors in `FINDINGS.md`'s
+  own archive (games 13 and 14's written move lists each had an
+  inconsistency nobody had mechanically replayed until now) — see the
+  entry's own `note` fields and the 2026-09-03 `FINDINGS.md` entries.
+
+- **`test_blunder_corpus.nu`** — re-runs `full_report.nu`/
+  `shakmaty_compose.nu` against every position in `blunder_corpus.nuon`
+  and prints the current raw fact next to what was recorded when the
+  corpus was built, for direct comparison — deliberately no computed
+  pass/fail verdict, matching this whole project's standing discipline.
+  Re-run after any change that could plausibly touch tactical detection,
+  x-ray/swap-list logic, or the leaf commands: these are real historical
+  positions that caused real losses, so a regression here is a real
+  regression.
 
 ## A real bug found while migrating (2026-09-03)
 

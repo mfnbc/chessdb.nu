@@ -133,7 +133,50 @@ solved an analogous problem correctly via shakmaty's occupancy-aware
 rewritten onto the same primitives (2026-09-02, A/B-verified byte-identical against real
 positions before the old implementation was removed — see `FINDINGS.md`). `chebyshev_distance`
 similarly used to hand-compute exactly what shakmaty's own `Square::distance` already
-computes. Both are now the pattern to follow, not a violation currently being fixed.
+computes. `piece_activity_score`'s rook and queen rank bonuses used to hand-branch
+`if color.is_white() { Rank::Seventh } else { Rank::Second }` (and the same for the
+eighth/sixth/first/third ranks) to find "the enemy's back ranks relative to me" — exactly
+what shakmaty's own `Color::relative_rank(rank)` already computes (`Color::White => rank,
+Color::Black => rank.flip_vertical()`), swapped 2026-09-04, verified exhaustively rather
+than sampled (the branch's only inputs are `Color` and a handful of literal `Rank`
+constants — a closed, 2-value domain, so proving `color.relative_rank(r) == old_branch(r)`
+for both colors is a complete proof, not an approximation, unlike `detect_skewers`/
+`king_safety_score` below which are genuinely position-dependent and need real-position
+A/B diffs). The same file also had ~8 more `if color.is_white() { A } else { B }`
+branches picking a plain value (not a rank) — `Color::fold_wb(white, black)` is the
+generic form of exactly that (`match self { White => white, Black => black }`), and
+`Color::backrank()` is the same idea specialized to "my own back rank" (used for the
+knight/bishop back-rank penalty and the king-square fallback in
+`development_space_score`) — both swapped in alongside `relative_rank` on 2026-09-04,
+same exhaustive-proof verification (see `FINDINGS.md`). All five are now the pattern to
+follow, not a violation currently being fixed.
+
+The most architecturally significant instance found so far isn't in the scoring code at
+all: `nu_plugin_chessdb/src/canonical.rs`'s `flip_colors` — the transform backing the
+entire canonical (White-always-to-move) position-identity convention above — used to
+hand-rebuild a position's mirrored/recolored board from its role/color bitboards via
+`ByRole`/`ByColor`/`Board::try_from_bitboards`, on the explicit (and wrong) belief that
+"shakmaty has no single 'swap a position's colors' call." It does: `Board::swap_colors()`
+plus `flip_vertical()` is exactly `Board::mirror()`, and `Setup::mirror()` composes the
+*whole* transform this function needs (board mirror, turn swap, castling-rights flip,
+en-passant-square flip) in one call. Swapped 2026-09-04, verified with the project's real-
+position A/B discipline (not exhaustive proof, since board state isn't a small domain) —
+a 6-position battery covering full/no/partial castling rights, an active en passant
+square, and both colors to move, byte-identical before and after — because this function
+backs stored DB identity, not an internal score, so a subtle bug here has a materially
+different (and worse) blast radius than the scoring-table items above. See `FINDINGS.md`
+for the full verification.
+
+A fourth pass found the same `fold_wb`/`ByColor` pattern in `eval/threat_graph.rs`:
+`checkers`/`delivers_check` hand-branched on `color.is_white()` to pick between a
+`(white_king, black_king)` tuple field (`ThreatGraph.kings`) — restructured the field
+itself onto `ByColor<Option<Square>>` (confirmed zero call sites outside the one file
+first, despite it being `pub`) so `.get(color)` replaces the branch outright, not just
+relabels it; and `see_chain`'s `winner` string picked via the same pattern, swapped onto
+`fold_wb` directly. That pass's own full re-read of `core.rs` and the `eval/concepts*`/
+`sensor.rs` layer found nothing further — this is the point of diminishing returns for
+this sweep (see `FINDINGS.md`'s 2026-09-04 entries for the complete four-pass history);
+further finds should come from a new consumer need, not another blind resweep.
 
 Not every hand-rolled-looking loop is actually a violation, though — check whether the
 computation is a genuinely *sequential* one (state carried and short-circuited across
@@ -163,9 +206,12 @@ chess endgame tablebases use to collapse a position and its exact color-mirror
 (reached by a different game, or by the other side of the same game) onto one
 stored entity, evaluated and looked up once instead of twice. It's mechanical:
 mirror the board vertically, swap piece colors, swap castling rights, mirror
-the en passant square — the one implementation is
-`nu_plugin_chessdb/src/canonical.rs`, used by both `core.rs` (position/move
-identity) and `eval::position` (evaluation normalization).
+the en passant square — exactly shakmaty's own `Setup::mirror()`, which
+`nu_plugin_chessdb/src/canonical.rs`'s `flip_colors` calls directly (2026-09-04;
+originally hand-rebuilt the same transform from `ByRole`/`ByColor` bitboards
+before this was found and swapped — see "Chessdb defers to shakmaty" below and
+`FINDINGS.md`). `canonical.rs` is the one implementation, used by both `core.rs`
+(position/move identity) and `eval::position` (evaluation normalization).
 
 **The corollary the name implies but is easy to forget: nothing in that
 canonical form tells you who is actually White or Black in a real game.** A

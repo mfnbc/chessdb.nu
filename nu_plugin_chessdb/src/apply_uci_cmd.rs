@@ -2,6 +2,7 @@ use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, SyntaxShape, Type, Value};
 
 use crate::core::apply_uci;
+use crate::utils::fen_from_input;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -45,10 +46,7 @@ impl PluginCommand for ApplyUci {
         let uci: String = call
             .get_flag("uci")?
             .ok_or_else(|| LabeledError::new("--uci is required").with_label("missing move", span))?;
-        let fen = match input.into_value(span)? {
-            Value::String { val, .. } => val,
-            _ => return Err(LabeledError::new("expected a FEN string").with_label("invalid input type", span)),
-        };
+        let fen = fen_from_input(input, span)?;
         let result = apply_uci(&fen, &uci, span)?;
         Ok(PipelineData::Value(Value::string(result, span), None))
     }

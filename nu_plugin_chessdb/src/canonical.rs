@@ -15,7 +15,7 @@
 //! once instead of twice.
 
 use anyhow::{Context, Result};
-use shakmaty::{Board, Chess, Color, FromSetup, Move, Position, Setup, Square};
+use shakmaty::{Chess, Color, FromSetup, Move, Position, Square};
 
 /// Unconditionally mirror a position: flip the board vertically, swap every
 /// piece's color, swap castling rights, and mirror the en passant square.
@@ -28,37 +28,22 @@ use shakmaty::{Board, Chess, Color, FromSetup, Move, Position, Setup, Square};
 /// since a canonical position always reads "White to move" and that
 /// function would see nothing to flip.
 ///
-/// `shakmaty` has no single "swap a position's colors" call — `Board`'s
-/// `flip_vertical` only repositions pieces, it doesn't recolor them — so
-/// this rebuilds the board from its role/color bitboards, applying the
-/// vertical flip to each one (position and color swap happen in the same
-/// pass: `by_color.white` becomes what `by_color.black` was, vertically
-/// mirrored, and vice versa). Applying it twice returns the original
-/// position — it's its own inverse.
+/// `Setup::mirror()` is shakmaty's own "swap a position's colors" call —
+/// composed internally from exactly this project's own hand-rolled version
+/// (`Board::mirror` for the board: vertical flip + `swap_colors`, plus the
+/// same castling-rights/en-passant-square vertical flips and turn swap)
+/// (2026-09-04, A/B-verified byte-identical across a real-position battery —
+/// full/no/partial castling rights, an active en passant square, both
+/// colors to move — before this hand-rolled version was replaced; see
+/// `FINDINGS.md`). Applying it twice returns the original position — it's
+/// its own inverse.
 pub fn flip_colors(chess: &Chess) -> Result<Chess> {
-    let setup = chess.clone().to_setup(shakmaty::EnPassantMode::Legal);
+    let setup = chess
+        .clone()
+        .to_setup(shakmaty::EnPassantMode::Legal)
+        .into_mirrored();
 
-    let by_role = shakmaty::ByRole::new_with(|role| setup.board.by_role(role).flip_vertical());
-    let by_color = shakmaty::ByColor {
-        white: setup.board.by_color(Color::Black).flip_vertical(),
-        black: setup.board.by_color(Color::White).flip_vertical(),
-    };
-    let normalized_board = Board::try_from_bitboards(by_role, by_color)
-        .expect("role/color bitboards built from a flip of a valid board are always consistent");
-
-    let normalized_setup = Setup {
-        board: normalized_board,
-        promoted: shakmaty::Bitboard::EMPTY,
-        pockets: None,
-        turn: chess.turn().other(),
-        castling_rights: setup.castling_rights.flip_vertical(),
-        ep_square: setup.ep_square.map(|sq| sq.flip_vertical()),
-        remaining_checks: None,
-        halfmoves: setup.halfmoves,
-        fullmoves: setup.fullmoves,
-    };
-
-    Chess::from_setup(normalized_setup, shakmaty::CastlingMode::Standard)
+    Chess::from_setup(setup, shakmaty::CastlingMode::Standard)
         .context("could not build color-flipped position")
 }
 
@@ -107,5 +92,51 @@ pub fn flip_move(mv: &Move) -> Move {
             rook: rook.flip_vertical(),
         },
         Move::Put { role, to } => Move::Put { role, to: to.flip_vertical() },
+    }
+}
+
+#[cfg(test)]
+mod ab_diff {
+    use super::flip_colors;
+    use shakmaty::fen::Fen;
+    use shakmaty::{EnPassantMode, Position};
+
+    fn fen(s: &str) -> shakmaty::Chess {
+        let setup = Fen::from_ascii(s.as_bytes()).expect("valid FEN");
+        setup
+            .into_position(shakmaty::CastlingMode::Standard)
+            .expect("legal position")
+    }
+
+    #[test]
+    fn flip_colors_is_an_involution_across_a_real_battery() {
+        // Battery deliberately covers cases `tests/canonical_identity.rs`
+        // doesn't: partial (one-side, one-flank) castling rights and an
+        // active en passant square, alongside the full/no-rights and
+        // both-colors-to-move cases already covered there. This battery was
+        // originally built to A/B-diff `flip_colors`'s hand-rolled
+        // bitboard-rebuild against `Setup::mirror()` before the swap to the
+        // latter (2026-09-04, see `FINDINGS.md`); kept as a standing
+        // involution regression now that only one implementation remains.
+        let battery = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+            "r1bqr1k1/ppp2p1p/2n5/3p2p1/3Pn3/P3BN2/1PQ1PPPP/2KR1B1R b - - 3 12",
+            "r2qkb1r/ppp1pppp/1n6/3PN3/2P3b1/2N5/PP3PPP/R1BQKB1R b KQkq - 0 8",
+            "r3k2r/8/8/8/8/8/8/R3K2R w Kk - 0 1",
+            "rnbqkbnr/1pp1pppp/p7/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",
+        ];
+
+        for fen_str in battery {
+            let pos = fen(fen_str);
+            let flipped = flip_colors(&pos).expect("flip should succeed");
+            assert_ne!(pos.turn(), flipped.turn(), "turn must swap for {fen_str}");
+            let twice = flip_colors(&flipped).expect("double-flip should succeed");
+            assert_eq!(
+                Fen::from_position(&pos, EnPassantMode::Legal).to_string(),
+                Fen::from_position(&twice, EnPassantMode::Legal).to_string(),
+                "flip_colors is not its own inverse for {fen_str}"
+            );
+        }
     }
 }

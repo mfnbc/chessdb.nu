@@ -1,8 +1,8 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
-use nu_protocol::{Category, LabeledError, PipelineData, Signature, Type, Value};
+use nu_protocol::{Category, LabeledError, PipelineData, Signature, Type};
 
 use crate::core::mobility_summary;
-use crate::utils::json_to_nu_value;
+use crate::utils::{fen_from_input, to_pipeline_data};
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -36,13 +36,8 @@ impl PluginCommand for LegalMoves {
         input: PipelineData,
     ) -> Result<PipelineData, LabeledError> {
         let span = call.head;
-        let fen = match input.into_value(span)? {
-            Value::String { val, .. } => val,
-            _ => return Err(LabeledError::new("expected a FEN string").with_label("invalid input type", span)),
-        };
+        let fen = fen_from_input(input, span)?;
         let result = mobility_summary(&fen, span)?;
-        let json = serde_json::to_value(&result)
-            .map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-        Ok(PipelineData::Value(json_to_nu_value(json, span), None))
+        to_pipeline_data(&result, span)
     }
 }

@@ -1,8 +1,8 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, PluginCommand};
 use nu_protocol::{Category, LabeledError, PipelineData, Signature, SyntaxShape, Type};
 
-use crate::core::{geom_aligned, geom_attacks, geom_between, geom_ray};
-use crate::utils::json_to_nu_value;
+use crate::core::{geom_aligned, geom_attacks, geom_between, geom_ray, square_distance};
+use crate::utils::to_pipeline_data;
 use crate::ChessdbPlugin;
 use crate::PLUGIN_CATEGORY;
 
@@ -45,8 +45,7 @@ impl PluginCommand for GeomAttacksCmd {
         let role: String = call.get_flag("role")?.ok_or_else(|| LabeledError::new("--role is required").with_label("missing role", span))?;
         let occupied: Vec<String> = call.get_flag("occupied")?.unwrap_or_default();
         let result = geom_attacks(&square, &color, &role, &occupied, span)?;
-        let json = serde_json::to_value(&result).map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-        Ok(PipelineData::Value(json_to_nu_value(json, span), None))
+        to_pipeline_data(&result, span)
     }
 }
 
@@ -88,8 +87,7 @@ impl PluginCommand for GeomRayCmd {
         let span = call.head;
         let (a, b) = two_square_flags(call, span, "a", "b")?;
         let result = geom_ray(&a, &b, span)?;
-        let json = serde_json::to_value(&result).map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-        Ok(PipelineData::Value(json_to_nu_value(json, span), None))
+        to_pipeline_data(&result, span)
     }
 }
 
@@ -125,8 +123,7 @@ impl PluginCommand for GeomBetweenCmd {
         let span = call.head;
         let (a, b) = two_square_flags(call, span, "a", "b")?;
         let result = geom_between(&a, &b, span)?;
-        let json = serde_json::to_value(&result).map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-        Ok(PipelineData::Value(json_to_nu_value(json, span), None))
+        to_pipeline_data(&result, span)
     }
 }
 
@@ -164,7 +161,45 @@ impl PluginCommand for GeomAlignedCmd {
         let (a, b) = two_square_flags(call, span, "a", "b")?;
         let c: String = call.get_flag("c")?.ok_or_else(|| LabeledError::new("--c is required").with_label("missing square", span))?;
         let result = geom_aligned(&a, &b, &c, span)?;
-        let json = serde_json::to_value(&result).map_err(|e| LabeledError::new(e.to_string()).with_label("serialization error", span))?;
-        Ok(PipelineData::Value(json_to_nu_value(json, span), None))
+        to_pipeline_data(&result, span)
+    }
+}
+
+/// Nu-facing exposure of `Square::distance` -- Chebyshev distance
+/// (`max(file_dist, rank_dist)`), the exact primitive `CLAUDE.md`'s own
+/// "chessdb defers to shakmaty" section cites (`chebyshev_distance`), never
+/// previously exposed as an independent fact. No FEN, no pipeline input.
+pub struct SquareDistanceCmd;
+
+impl PluginCommand for SquareDistanceCmd {
+    type Plugin = ChessdbPlugin;
+
+    fn name(&self) -> &str {
+        "chessdb square-distance"
+    }
+
+    fn description(&self) -> &str {
+        "Square::distance(a, b) -- Chebyshev distance (max of file/rank distance, not Euclidean). No FEN, no pipeline input -- entirely position-independent."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.name())
+            .named("a", SyntaxShape::String, "first square", None)
+            .named("b", SyntaxShape::String, "second square", None)
+            .input_output_types(vec![(Type::Nothing, Type::Record(vec![].into()))])
+            .category(Category::Custom(PLUGIN_CATEGORY.into()))
+    }
+
+    fn run(
+        &self,
+        _plugin: &Self::Plugin,
+        _engine: &EngineInterface,
+        call: &EvaluatedCall,
+        _input: PipelineData,
+    ) -> Result<PipelineData, LabeledError> {
+        let span = call.head;
+        let (a, b) = two_square_flags(call, span, "a", "b")?;
+        let result = square_distance(&a, &b, span)?;
+        to_pipeline_data(&result, span)
     }
 }
